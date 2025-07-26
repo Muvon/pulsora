@@ -1,0 +1,26 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pulsora data
+/data/
+*.db
+
+# Logs
+*.log
+
+# Config (optional - remove if you want to track config)
+# pulsora.toml
+
+# Benchmarks
+/target/criterion/

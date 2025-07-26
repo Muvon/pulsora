@@ -1,0 +1,33 @@
+# Pulsora Configuration
+# High-performance time series database optimized for market data
+
+[server]
+# Server binding configuration
+host = "0.0.0.0"
+port = 8080
+
+[storage]
+# RocksDB storage configuration
+data_dir = "./data"
+# Memory limit for write buffers (MB) - tune based on available RAM
+write_buffer_size_mb = 64
+# Maximum number of open files - increase for better performance
+max_open_files = 1000
+
+[ingestion]
+# CSV ingestion performance tuning
+# Maximum CSV file size to accept (MB)
+max_csv_size_mb = 512
+# Batch size for database writes - larger = faster but more memory
+batch_size = 10000
+
+[performance]
+# Storage engine optimizations
+# Compression: "none", "snappy", "lz4", "zstd" - lz4 best for speed
+compression = "lz4"
+# Block cache size (MB) - increase for better read performance
+cache_size_mb = 256
+
+[logging]
+# Logging configuration
+level = "info"
