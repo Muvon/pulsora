@@ -106,14 +106,13 @@ fn parse_timestamp(value: &str) -> Result<i64> {
         }
     }
 
+    // Try parsing as RFC3339 first (handles Z suffix)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.timestamp_millis());
+    }
+
     // Try common datetime formats
-    let formats = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S%.3fZ",
-        "%Y-%m-%d",
-    ];
+    let formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"];
 
     for format in &formats {
         if let Ok(dt) = DateTime::parse_from_str(value, format) {

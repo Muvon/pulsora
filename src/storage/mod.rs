@@ -19,9 +19,10 @@ pub struct IngestionStats {
     pub processing_time_ms: u64,
 }
 
+#[derive(Clone)]
 pub struct StorageEngine {
-    db: Arc<DB>,
-    schemas: Arc<RwLock<SchemaManager>>,
+    pub db: Arc<DB>,
+    pub schemas: Arc<RwLock<SchemaManager>>,
     config: Config,
 }
 

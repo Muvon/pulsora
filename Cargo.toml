@@ -55,10 +55,17 @@ rayon = "1.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.8"
 
-# Benchmarks will be added later
-# [[bench]]
-# name = "ingestion"
-# harness = false
+[[bench]]
+name = "ingestion"
+harness = false
+
+[[bench]]
+name = "query"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false
 
 [profile.release]
 lto = true

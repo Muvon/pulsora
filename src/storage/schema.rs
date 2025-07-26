@@ -53,6 +53,12 @@ pub struct SchemaManager {
     schemas: HashMap<String, Schema>,
 }
 
+impl Default for SchemaManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SchemaManager {
     pub fn new() -> Self {
         Self {
@@ -142,23 +148,35 @@ impl SchemaManager {
     }
 
     fn is_timestamp(&self, value: &str) -> bool {
-        // Try common timestamp formats
-        let formats = [
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%dT%H:%M:%S%.3fZ",
-            "%Y-%m-%d",
-            "%s", // Unix timestamp
-        ];
+        // Try RFC3339 formats first (with timezone)
+        let rfc3339_formats = ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%.3fZ"];
 
-        for format in &formats {
+        for format in &rfc3339_formats {
             if DateTime::parse_from_str(value, format).is_ok() {
                 return true;
             }
         }
 
-        // Check for Unix timestamp (seconds)
+        // Try parsing as RFC3339 directly
+        if DateTime::parse_from_rfc3339(value).is_ok() {
+            return true;
+        }
+
+        // Try naive datetime formats (without timezone)
+        let naive_formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"];
+
+        for format in &naive_formats {
+            if chrono::NaiveDateTime::parse_from_str(value, format).is_ok() {
+                return true;
+            }
+        }
+
+        // Try naive date format
+        if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
+            return true;
+        }
+
+        // Check for Unix timestamp (seconds) - must be reasonable range
         if let Ok(timestamp) = value.parse::<i64>() {
             if timestamp > 1_000_000_000 && timestamp < 4_000_000_000 {
                 return true;

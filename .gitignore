@@ -24,3 +24,4 @@ Thumbs.db
 
 # Benchmarks
 /target/criterion/
+/benchmark_results/
