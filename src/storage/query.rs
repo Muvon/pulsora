@@ -64,7 +64,7 @@ pub fn execute_query(
         }
 
         // Deserialize and convert to JSON
-        match deserialize_row(&value) {
+        match deserialize_row(&value, schema) {
             Ok(row) => {
                 let json_row = convert_row_to_json(&row, schema)?;
                 results.push(json_row);

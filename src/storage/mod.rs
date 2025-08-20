@@ -7,6 +7,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::error::{PulsoraError, Result};
 
+pub mod encoding;
 pub mod ingestion;
 pub mod query;
 pub mod schema;
@@ -78,10 +79,10 @@ impl StorageEngine {
             return Err(PulsoraError::Ingestion("No data rows found".to_string()));
         }
 
-        // Get or create schema
+        // Get or create schema (pass ALL rows for better type inference)
         let schema = {
             let mut schemas = self.schemas.write().await;
-            schemas.get_or_create_schema(table, &rows[0])?
+            schemas.get_or_create_schema(table, &rows)?
         };
 
         // Validate and insert data

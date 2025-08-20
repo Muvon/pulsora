@@ -35,9 +35,15 @@ impl From<serde_json::Error> for PulsoraError {
     }
 }
 
-impl From<bincode::Error> for PulsoraError {
-    fn from(err: bincode::Error) -> Self {
+impl From<anyhow::Error> for PulsoraError {
+    fn from(err: anyhow::Error) -> Self {
         PulsoraError::Serialization(err.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for PulsoraError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        PulsoraError::InvalidData(err.to_string())
     }
 }
 

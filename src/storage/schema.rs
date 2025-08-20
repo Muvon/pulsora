@@ -42,6 +42,8 @@ pub struct Schema {
     pub table_name: String,
     /// List of column definitions
     pub columns: Vec<Column>,
+    /// Ordered list of column names for consistent encoding/decoding
+    pub column_order: Vec<String>,
     /// Name of the primary timestamp column (if detected)
     pub timestamp_column: Option<String>,
     /// When this schema was created
@@ -73,28 +75,55 @@ impl SchemaManager {
     pub fn get_or_create_schema(
         &mut self,
         table: &str,
-        sample_row: &HashMap<String, String>,
+        sample_rows: &[HashMap<String, String>],
     ) -> Result<Schema> {
         if let Some(schema) = self.schemas.get(table) {
             return Ok(schema.clone());
         }
 
-        // Infer schema from sample row
-        let schema = self.infer_schema(table, sample_row)?;
+        // Infer schema from ALL sample rows for better accuracy
+        let schema = self.infer_schema_from_rows(table, sample_rows)?;
         self.schemas.insert(table.to_string(), schema.clone());
 
         Ok(schema)
     }
 
-    fn infer_schema(&self, table: &str, sample_row: &HashMap<String, String>) -> Result<Schema> {
-        let mut columns = Vec::new();
+    fn infer_schema_from_rows(
+        &self,
+        table: &str,
+        sample_rows: &[HashMap<String, String>],
+    ) -> Result<Schema> {
+        if sample_rows.is_empty() {
+            return Err(PulsoraError::Schema(
+                "Cannot infer schema from empty data".to_string(),
+            ));
+        }
+
+        // Get all column names from first row
+        let first_row = &sample_rows[0];
+        let mut column_types: HashMap<String, DataType> = HashMap::new();
         let mut timestamp_column = None;
 
-        for (name, value) in sample_row {
-            let data_type = self.infer_data_type(value);
+        // Initialize with column names
+        for name in first_row.keys() {
+            column_types.insert(name.clone(), DataType::String); // Start with most general type
+        }
 
+        // Analyze ALL rows to determine the most specific type for each column
+        for row in sample_rows {
+            for (name, value) in row {
+                if let Some(current_type) = column_types.get_mut(name) {
+                    let inferred_type = self.infer_data_type(value);
+                    *current_type = self.merge_types(current_type.clone(), inferred_type);
+                }
+            }
+        }
+
+        // Build columns with final types
+        let mut columns = Vec::new();
+        for (name, data_type) in &column_types {
             // Check if this could be a timestamp column
-            if (data_type == DataType::Timestamp
+            if (data_type == &DataType::Timestamp
                 || name.to_lowercase().contains("time")
                 || name.to_lowercase().contains("date"))
                 && timestamp_column.is_none()
@@ -104,7 +133,7 @@ impl SchemaManager {
 
             columns.push(Column {
                 name: name.clone(),
-                data_type,
+                data_type: data_type.clone(),
                 nullable: false, // For MVP, assume non-nullable
             });
         }
@@ -112,30 +141,69 @@ impl SchemaManager {
         // Sort columns to ensure consistent ordering
         columns.sort_by(|a, b| a.name.cmp(&b.name));
 
+        // Create column order list
+        let column_order = columns.iter().map(|c| c.name.clone()).collect();
+
         Ok(Schema {
             table_name: table.to_string(),
             columns,
+            column_order,
             timestamp_column,
             created_at: Utc::now(),
         })
     }
 
-    fn infer_data_type(&self, value: &str) -> DataType {
-        // Try to parse as different types in order of specificity
+    /// Merge two data types, returning the more general type that can hold both
+    fn merge_types(&self, type1: DataType, type2: DataType) -> DataType {
+        use DataType::*;
 
-        // Check for timestamp formats
+        match (type1, type2) {
+            // Same type - no change
+            (t1, t2) if t1 == t2 => t1,
+
+            // String is the most general - always wins
+            (String, _) | (_, String) => String,
+
+            // Timestamp is specific - only if both are timestamps
+            (Timestamp, Timestamp) => Timestamp,
+            (Timestamp, _) | (_, Timestamp) => String,
+
+            // Boolean is specific - only if both are booleans
+            (Boolean, Boolean) => Boolean,
+            (Boolean, _) | (_, Boolean) => String,
+
+            // Integer can be promoted to Float
+            (Integer, Float) | (Float, Integer) => Float,
+
+            // Everything else becomes String
+            _ => String,
+        }
+    }
+
+    fn infer_data_type(&self, value: &str) -> DataType {
+        // Empty or whitespace-only values are treated as String
+        if value.trim().is_empty() {
+            return DataType::String;
+        }
+
+        // Check for timestamp formats FIRST (most specific)
         if self.is_timestamp(value) {
             return DataType::Timestamp;
         }
 
-        // Check for boolean
-        if value.to_lowercase() == "true" || value.to_lowercase() == "false" {
+        // Check for boolean (case insensitive)
+        let lower = value.to_lowercase();
+        if lower == "true" || lower == "false" {
             return DataType::Boolean;
         }
 
-        // Check for integer
-        if value.parse::<i64>().is_ok() {
-            return DataType::Integer;
+        // Check for integer (including negative)
+        // Important: Check integer before float to avoid false positives
+        if let Ok(_) = value.parse::<i64>() {
+            // Double-check it's not a float with .0
+            if !value.contains('.') && !value.contains('e') && !value.contains('E') {
+                return DataType::Integer;
+            }
         }
 
         // Check for float

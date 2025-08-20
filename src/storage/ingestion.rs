@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::error::{PulsoraError, Result};
-use crate::storage::schema::Schema;
+use crate::storage::encoding::{self, EncodedValue};
+use crate::storage::schema::{DataType, Schema};
 
 pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
@@ -52,7 +53,7 @@ pub fn insert_rows(
 
         // Generate key and value
         let key = generate_key(table, schema, &row)?;
-        let value = serialize_row(&row)?;
+        let value = serialize_row(&row, schema)?;
 
         batch.put(&key, &value);
         batch_count += 1;
@@ -137,13 +138,70 @@ fn generate_row_id() -> u64 {
     COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
-fn serialize_row(row: &HashMap<String, String>) -> Result<Vec<u8>> {
-    // Use bincode for efficient serialization
-    Ok(bincode::serialize(row)?)
+fn serialize_row(row: &HashMap<String, String>, schema: &Schema) -> Result<Vec<u8>> {
+    // Convert string values to typed EncodedValues based on schema
+    let mut encoded_row = HashMap::new();
+
+    for column in &schema.columns {
+        if let Some(value) = row.get(&column.name) {
+            let encoded_value = match column.data_type {
+                DataType::Integer => {
+                    let parsed = value.parse::<i64>().map_err(|_| {
+                        PulsoraError::InvalidData(format!("Invalid integer: {}", value))
+                    })?;
+                    EncodedValue::Integer(parsed)
+                }
+                DataType::Float => {
+                    let parsed = value.parse::<f64>().map_err(|_| {
+                        PulsoraError::InvalidData(format!("Invalid float: {}", value))
+                    })?;
+                    EncodedValue::Float(parsed)
+                }
+                DataType::Boolean => {
+                    let parsed = match value.to_lowercase().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(PulsoraError::InvalidData(format!(
+                                "Invalid boolean: {}",
+                                value
+                            )))
+                        }
+                    };
+                    EncodedValue::Boolean(parsed)
+                }
+                DataType::Timestamp => {
+                    let parsed = parse_timestamp(value)?;
+                    EncodedValue::Timestamp(parsed)
+                }
+                DataType::String => EncodedValue::String(value.clone()),
+            };
+            encoded_row.insert(column.name.clone(), encoded_value);
+        }
+    }
+
+    // Use our efficient encoding
+    encoding::encode_row(&encoded_row, &schema.column_order)
 }
 
-pub fn deserialize_row(data: &[u8]) -> Result<HashMap<String, String>> {
-    Ok(bincode::deserialize(data)?)
+pub fn deserialize_row(data: &[u8], schema: &Schema) -> Result<HashMap<String, String>> {
+    // Decode using our efficient encoding
+    let encoded_row = encoding::decode_row(data, &schema.column_order)?;
+
+    // Convert EncodedValues back to strings for compatibility
+    let mut string_row = HashMap::new();
+    for (key, value) in encoded_row {
+        let string_value = match value {
+            EncodedValue::Integer(v) => v.to_string(),
+            EncodedValue::Float(v) => v.to_string(),
+            EncodedValue::Boolean(v) => v.to_string(),
+            EncodedValue::Timestamp(v) => v.to_string(),
+            EncodedValue::String(v) => v,
+        };
+        string_row.insert(key, string_value);
+    }
+
+    Ok(string_row)
 }
 
 #[cfg(test)]

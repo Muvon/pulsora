@@ -15,6 +15,7 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub max_body_size_mb: usize, // 0 means unlimited
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +48,7 @@ impl Default for Config {
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
+                max_body_size_mb: 0, // 0 means unlimited
             },
             storage: StorageConfig {
                 data_dir: "./data".to_string(),
