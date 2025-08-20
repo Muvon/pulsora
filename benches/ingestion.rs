@@ -125,7 +125,7 @@ fn bench_full_ingestion_pipeline(c: &mut Criterion) {
             &csv_data,
             |b, csv| {
                 b.iter_batched_ref(
-                    || create_test_storage(),
+                    create_test_storage,
                     |(storage, _temp_dir)| {
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         black_box(rt.block_on(async {

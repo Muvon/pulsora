@@ -77,7 +77,7 @@ impl SchemaManager {
         let iter = self.db.prefix_iterator(schema_prefix);
 
         for item in iter {
-            let (key, value) = item.map_err(|e| PulsoraError::RocksDb(e))?;
+            let (key, value) = item.map_err(PulsoraError::RocksDb)?;
 
             // Extract table name from key: "_schema_{table_name}"
             if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -112,7 +112,7 @@ impl SchemaManager {
 
         self.db
             .put(key.as_bytes(), &value)
-            .map_err(|e| PulsoraError::RocksDb(e))?;
+            .map_err(PulsoraError::RocksDb)?;
 
         tracing::info!("Saved schema for table: {}", table);
         Ok(())
@@ -256,7 +256,7 @@ impl SchemaManager {
 
         // Check for integer (including negative)
         // Important: Check integer before float to avoid false positives
-        if let Ok(_) = value.parse::<i64>() {
+        if value.parse::<i64>().is_ok() {
             // Double-check it's not a float with .0
             if !value.contains('.') && !value.contains('e') && !value.contains('E') {
                 return DataType::Integer;

@@ -123,23 +123,23 @@ pub fn compress_timestamps(timestamps: &[i64]) -> Result<(i64, Vec<u8>)> {
     let mut deltas = Vec::with_capacity(timestamps.len() - 1);
     let mut prev_timestamp = timestamps[0];
 
-    for i in 1..timestamps.len() {
-        let delta = timestamps[i] - prev_timestamp;
+    for &timestamp in timestamps.iter().skip(1) {
+        let delta = timestamp - prev_timestamp;
         deltas.push(delta);
-        prev_timestamp = timestamps[i];
+        prev_timestamp = timestamp;
     }
 
     // Second pass: compute delta-of-deltas and encode with varint
     let mut prev_delta = deltas[0];
     encoding::encode_varint_signed(prev_delta, &mut output);
 
-    for i in 1..deltas.len() {
-        let delta_of_delta = deltas[i] - prev_delta;
+    for &delta in deltas.iter().skip(1) {
+        let delta_of_delta = delta - prev_delta;
 
         // Use varint encoding for delta-of-delta
         // This is more efficient than fixed-size bit packing for most cases
         encoding::encode_varint_signed(delta_of_delta, &mut output);
-        prev_delta = deltas[i];
+        prev_delta = delta;
     }
 
     Ok((base, output))
@@ -192,8 +192,8 @@ pub fn compress_values(values: &[f64]) -> Result<(f64, Vec<u8>)> {
     let mut prev_leading = 0u8;
     let mut prev_trailing = 0u8;
 
-    for i in 1..values.len() {
-        let curr_bits = values[i].to_bits();
+    for &value in values.iter().skip(1) {
+        let curr_bits = value.to_bits();
         let xor = prev_bits ^ curr_bits;
 
         if xor == 0 {
@@ -316,10 +316,10 @@ pub fn compress_integers(values: &[i64]) -> Result<(i64, Vec<u8>)> {
 
     // Use delta encoding with varint
     let mut prev_value = base;
-    for i in 1..values.len() {
-        let delta = values[i] - prev_value;
+    for &value in values.iter().skip(1) {
+        let delta = value - prev_value;
         encoding::encode_varint_signed(delta, &mut output);
-        prev_value = values[i];
+        prev_value = value;
     }
 
     Ok((base, output))

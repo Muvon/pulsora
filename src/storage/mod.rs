@@ -202,7 +202,7 @@ impl StorageEngine {
 
         // Create prefix for this table's keys
         let prefix = table_hash.to_be_bytes();
-        let iter = self.db.prefix_iterator(&prefix);
+        let iter = self.db.prefix_iterator(prefix);
 
         for item in iter {
             match item {

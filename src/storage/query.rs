@@ -109,7 +109,7 @@ pub fn execute_query(
             // Group by block ID
             block_requests
                 .entry(block_id.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(row_idx);
             request_order.push((block_id, row_idx));
             count += 1;
@@ -143,7 +143,7 @@ pub fn execute_query(
     let mut block_cache: HashMap<Vec<u8>, Vec<HashMap<String, String>>> = HashMap::new();
 
     // Fetch unique blocks in batch
-    for (block_id, _row_indices) in &block_requests {
+    for block_id in block_requests.keys() {
         if !block_cache.contains_key(block_id) {
             match db.get(block_id) {
                 Ok(Some(block_data)) => match ColumnBlock::deserialize(&block_data) {

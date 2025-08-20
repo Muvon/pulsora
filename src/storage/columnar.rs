@@ -30,7 +30,7 @@ impl ColumnBlock {
         // Process each column separately
         for column in &schema.columns {
             let mut values = Vec::with_capacity(row_count);
-            let mut null_bitmap = vec![0u8; (row_count + 7) / 8];
+            let mut null_bitmap = vec![0u8; row_count.div_ceil(8)];
 
             for (idx, row) in rows.iter().enumerate() {
                 if let Some(value_str) = row.get(&column.name) {
@@ -383,8 +383,8 @@ fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<
             };
             let mut run_length = 1u32;
 
-            for i in 1..values.len() {
-                if let EncodedValue::Boolean(b) = &values[i] {
+            for value in values.iter().skip(1) {
+                if let EncodedValue::Boolean(b) = value {
                     if *b == current_value {
                         run_length += 1;
                     } else {
