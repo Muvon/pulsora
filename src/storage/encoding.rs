@@ -94,6 +94,7 @@ pub fn decode_string(input: &mut Cursor<&[u8]>) -> Result<String> {
 /// Value types for encoding
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodedValue {
+    Id(u64),
     Integer(i64),
     Float(f64),
     String(String),

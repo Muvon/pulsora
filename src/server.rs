@@ -78,6 +78,7 @@ pub async fn start(config: Config) -> Result<()> {
         .route("/tables/:table/query", get(query_data))
         .route("/tables/:table/schema", get(get_schema))
         .route("/tables/:table/count", get(get_table_count))
+        .route("/tables/:table/row/:id", get(get_row_by_id))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -223,6 +224,19 @@ async fn get_schema(
         Ok(schema) => Ok(Json(ApiResponse::success(schema))),
         Err(e) => {
             error!("Schema error: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_row_by_id(
+    State(state): State<AppState>,
+    Path((table, id)): Path<(String, u64)>,
+) -> std::result::Result<Json<ApiResponse<Option<HashMap<String, String>>>>, StatusCode> {
+    match state.storage.get_row_by_id(&table, id).await {
+        Ok(row) => Ok(Json(ApiResponse::success(row))),
+        Err(e) => {
+            error!("Get row by ID error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

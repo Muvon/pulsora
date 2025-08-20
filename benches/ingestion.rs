@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use pulsora::config::Config;
+use pulsora::storage::id_manager::IdManagerRegistry;
 use pulsora::storage::{ingestion, StorageEngine};
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -94,11 +95,13 @@ fn bench_data_ingestion(c: &mut Criterion) {
             &(*size, &storage, &schema, &rows),
             |b, (_size, storage, schema, rows)| {
                 b.iter(|| {
+                    let mut id_managers = IdManagerRegistry::new(storage.db.clone());
                     black_box(
                         ingestion::insert_rows(
                             &storage.db,
                             "benchmark_table",
                             schema,
+                            &mut id_managers,
                             black_box(rows.to_vec()),
                             1000, // batch_size
                         )
@@ -170,16 +173,18 @@ fn bench_batch_sizes(c: &mut Criterion) {
                 b.iter_batched(
                     || (),
                     |_| {
-                        black_box(
+                        black_box({
+                            let mut id_managers = IdManagerRegistry::new(storage.db.clone());
                             ingestion::insert_rows(
                                 &storage.db,
                                 "benchmark_table",
                                 schema,
+                                &mut id_managers,
                                 black_box(rows.to_vec()),
                                 *batch_size,
                             )
-                            .unwrap(),
-                        )
+                            .unwrap()
+                        })
                     },
                     criterion::BatchSize::SmallInput,
                 )

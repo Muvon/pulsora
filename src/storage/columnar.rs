@@ -239,6 +239,12 @@ impl ColumnBlock {
 /// Parse a string value according to its data type
 fn parse_typed_value(value: &str, data_type: &DataType) -> Result<EncodedValue> {
     match data_type {
+        DataType::Id => {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| PulsoraError::InvalidData(format!("Invalid ID: {}", value)))?;
+            Ok(EncodedValue::Id(parsed))
+        }
         DataType::Integer => {
             let parsed = value
                 .parse::<i64>()
@@ -278,6 +284,7 @@ fn parse_typed_value(value: &str, data_type: &DataType) -> Result<EncodedValue> 
 /// Get default value for a data type
 fn default_value(data_type: &DataType) -> EncodedValue {
     match data_type {
+        DataType::Id => EncodedValue::Id(0),
         DataType::Integer => EncodedValue::Integer(0),
         DataType::Float => EncodedValue::Float(0.0),
         DataType::Boolean => EncodedValue::Boolean(false),
@@ -289,6 +296,7 @@ fn default_value(data_type: &DataType) -> EncodedValue {
 /// Convert encoded value to string
 fn value_to_string(value: &EncodedValue) -> String {
     match value {
+        EncodedValue::Id(v) => v.to_string(),
         EncodedValue::Integer(v) => v.to_string(),
         EncodedValue::Float(v) => v.to_string(),
         EncodedValue::Boolean(v) => v.to_string(),
@@ -297,7 +305,7 @@ fn value_to_string(value: &EncodedValue) -> String {
     }
 }
 
-/// Compress a column of values using Gorilla compression for numeric types
+/// Compress a column of values with optimized compression for each data type
 fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<u8>> {
     use crate::storage::compression;
 
@@ -305,14 +313,47 @@ fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<
 
     // Write data type marker
     output.push(match data_type {
-        DataType::Integer => 0,
-        DataType::Float => 1,
-        DataType::Boolean => 2,
-        DataType::Timestamp => 3,
-        DataType::String => 4,
+        DataType::Id => 0,
+        DataType::Integer => 1,
+        DataType::Float => 2,
+        DataType::Boolean => 3,
+        DataType::Timestamp => 4,
+        DataType::String => 5,
     });
 
     match data_type {
+        DataType::Id => {
+            // ID columns: optimized delta compression for sequential IDs
+            let ids: Result<Vec<u64>> = values
+                .iter()
+                .map(|v| match v {
+                    EncodedValue::Id(id) => Ok(*id),
+                    _ => Err(PulsoraError::InvalidData(
+                        "Type mismatch for ID".to_string(),
+                    )),
+                })
+                .collect();
+
+            let ids = ids?;
+
+            if ids.is_empty() {
+                return Err(PulsoraError::InvalidData("Empty ID column".to_string()));
+            }
+
+            let base_id = ids[0];
+
+            // Write base ID using varint encoding
+            encoding::encode_varint(base_id, &mut output);
+
+            // Write number of deltas
+            encoding::encode_varint((ids.len() - 1) as u64, &mut output);
+
+            // Write deltas using signed varint encoding
+            for i in 1..ids.len() {
+                let delta = ids[i] as i64 - ids[i - 1] as i64;
+                encoding::encode_varint_signed(delta, &mut output);
+            }
+        }
         DataType::Timestamp => {
             // Extract timestamps and use Gorilla compression
             let timestamps: Result<Vec<i64>> = values
@@ -334,7 +375,7 @@ fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<
             output.extend_from_slice(&compressed);
         }
         DataType::Integer => {
-            // Use efficient integer compression with delta + varint
+            // Regular integer compression with delta + varint
             let integers: Result<Vec<i64>> = values
                 .iter()
                 .map(|v| match v {
@@ -480,7 +521,7 @@ fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<
     Ok(output)
 }
 
-/// Decompress a column of values using Gorilla decompression for numeric types
+/// Decompress a column of values with special handling for ID columns
 fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<Vec<EncodedValue>> {
     use crate::storage::compression;
     use std::io::Cursor;
@@ -492,11 +533,12 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
     // Check data type marker
     let type_marker = data[0];
     let expected_marker = match data_type {
-        DataType::Integer => 0,
-        DataType::Float => 1,
-        DataType::Boolean => 2,
-        DataType::Timestamp => 3,
-        DataType::String => 4,
+        DataType::Id => 0,
+        DataType::Integer => 1,
+        DataType::Float => 2,
+        DataType::Boolean => 3,
+        DataType::Timestamp => 4,
+        DataType::String => 5,
     };
 
     if type_marker != expected_marker {
@@ -507,6 +549,41 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
     let mut values = Vec::with_capacity(count);
 
     match data_type {
+        DataType::Id => {
+            // Special ID column decompression
+            let mut cursor = Cursor::new(&data[pos..]);
+
+            // Read base ID
+            let base_id = encoding::decode_varint(&mut cursor)?;
+            pos += cursor.position() as usize;
+
+            // Read number of deltas
+            cursor = Cursor::new(&data[pos..]);
+            let num_deltas = encoding::decode_varint(&mut cursor)? as usize;
+            pos += cursor.position() as usize;
+
+            // First value is the base
+            values.push(EncodedValue::Id(base_id));
+
+            // Read and apply deltas
+            let mut current_id = base_id;
+            cursor = Cursor::new(&data[pos..]);
+
+            for _ in 0..num_deltas {
+                let delta = encoding::decode_varint_signed(&mut cursor)?;
+                current_id = (current_id as i64 + delta) as u64;
+                values.push(EncodedValue::Id(current_id));
+            }
+
+            // Verify we have the expected count
+            if values.len() != count {
+                return Err(PulsoraError::InvalidData(format!(
+                    "ID count mismatch: expected {}, got {}",
+                    count,
+                    values.len()
+                )));
+            }
+        }
         DataType::Timestamp => {
             // Read base timestamp using varint decoder
             let mut cursor = Cursor::new(&data[pos..]);
@@ -533,7 +610,7 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
             }
         }
         DataType::Integer => {
-            // Read base value using varint decoder
+            // Regular integer decompression
             let mut cursor = Cursor::new(&data[pos..]);
             let base = encoding::decode_varint_signed(&mut cursor)?;
             pos += cursor.position() as usize;
@@ -719,6 +796,7 @@ mod tests {
                 "volume".to_string(),
             ],
             timestamp_column: Some("timestamp".to_string()),
+            id_column: "id".to_string(),
             created_at: chrono::Utc::now(),
         };
 
@@ -775,5 +853,132 @@ mod tests {
             compressed_size,
             original_size as f64 / compressed_size as f64
         );
+    }
+
+    #[test]
+    fn test_id_column_compression() {
+        // Create schema with ID column
+        let columns = vec![
+            crate::storage::schema::Column {
+                name: "id".to_string(),
+                data_type: DataType::Id,
+                nullable: false,
+            },
+            crate::storage::schema::Column {
+                name: "name".to_string(),
+                data_type: DataType::String,
+                nullable: false,
+            },
+        ];
+
+        let schema = Schema {
+            table_name: "test".to_string(),
+            columns: columns.clone(),
+            column_order: vec!["id".to_string(), "name".to_string()],
+            timestamp_column: None,
+            id_column: "id".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Create test rows with sequential IDs (should compress well)
+        let rows: Vec<HashMap<String, String>> = (1..=100)
+            .map(|i| {
+                [
+                    ("id".to_string(), i.to_string()),
+                    ("name".to_string(), format!("User{}", i)),
+                ]
+                .iter()
+                .cloned()
+                .collect()
+            })
+            .collect();
+
+        // Create column block
+        let block = ColumnBlock::from_rows(&rows, &schema).unwrap();
+
+        // Serialize and deserialize
+        let serialized = block.serialize().unwrap();
+        let deserialized = ColumnBlock::deserialize(&serialized).unwrap();
+
+        // Convert back to rows
+        let recovered_rows = deserialized.to_rows(&schema).unwrap();
+
+        // Verify all IDs are correct
+        for (i, row) in recovered_rows.iter().enumerate() {
+            let expected_id = (i + 1).to_string();
+            assert_eq!(row["id"], expected_id);
+            assert_eq!(row["name"], format!("User{}", i + 1));
+        }
+
+        // Check that ID compression is effective
+        let uncompressed_id_size = 100 * 8; // 100 u64 IDs
+        println!(
+            "ID compression: {} bytes uncompressed -> {} bytes total block",
+            uncompressed_id_size,
+            serialized.len()
+        );
+
+        // Sequential IDs should compress very well
+        assert!(
+            serialized.len() < uncompressed_id_size / 2,
+            "ID compression should be effective"
+        );
+    }
+
+    #[test]
+    fn test_non_sequential_id_compression() {
+        // Create schema with ID column
+        let columns = vec![
+            crate::storage::schema::Column {
+                name: "id".to_string(),
+                data_type: DataType::Id,
+                nullable: false,
+            },
+            crate::storage::schema::Column {
+                name: "value".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+            },
+        ];
+
+        let schema = Schema {
+            table_name: "test".to_string(),
+            columns: columns.clone(),
+            column_order: vec!["id".to_string(), "value".to_string()],
+            timestamp_column: None,
+            id_column: "id".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Create test rows with non-sequential IDs
+        let ids = [1, 100, 1000, 10000, 100000];
+        let rows: Vec<HashMap<String, String>> = ids
+            .iter()
+            .map(|&id| {
+                [
+                    ("id".to_string(), id.to_string()),
+                    ("value".to_string(), (id * 10).to_string()),
+                ]
+                .iter()
+                .cloned()
+                .collect()
+            })
+            .collect();
+
+        // Create column block
+        let block = ColumnBlock::from_rows(&rows, &schema).unwrap();
+
+        // Serialize and deserialize
+        let serialized = block.serialize().unwrap();
+        let deserialized = ColumnBlock::deserialize(&serialized).unwrap();
+
+        // Convert back to rows
+        let recovered_rows = deserialized.to_rows(&schema).unwrap();
+
+        // Verify all data is correct
+        for (original, recovered) in rows.iter().zip(recovered_rows.iter()) {
+            assert_eq!(original["id"], recovered["id"]);
+            assert_eq!(original["value"], recovered["value"]);
+        }
     }
 }

@@ -1,7 +1,7 @@
-//! CSV data ingestion and processing
+//! CSV data ingestion and processing with ID-based row management
 //!
 //! This module handles parsing CSV data, validating against schemas,
-//! and efficiently storing data in RocksDB with time-series optimized keys.
+//! and efficiently storing data in RocksDB with ID-based keys and time-series optimization.
 
 use chrono::{DateTime, Utc};
 use rocksdb::{WriteBatch, DB};
@@ -12,6 +12,7 @@ use tracing::debug;
 use crate::error::{PulsoraError, Result};
 use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
+use crate::storage::id_manager::{IdManagerRegistry, RowId};
 use crate::storage::schema::Schema;
 
 pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
@@ -41,6 +42,7 @@ pub fn insert_rows(
     db: &Arc<DB>,
     table: &str,
     schema: &Schema,
+    id_managers: &mut IdManagerRegistry,
     rows: Vec<HashMap<String, String>>,
     batch_size: usize,
 ) -> Result<u64> {
@@ -48,41 +50,81 @@ pub fn insert_rows(
         return Ok(0);
     }
 
+    // Get ID manager for this table
+    let id_manager = id_managers.get_or_create(table)?;
+
+    // Process rows and assign IDs
+    let mut processed_rows = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        // Handle ID assignment
+        let row_id = if let Some(id_str) = row.get(&schema.id_column) {
+            if id_str.trim().is_empty() {
+                // Empty ID - auto assign
+                RowId::Auto
+            } else {
+                // Parse user-provided ID
+                let parsed_id = RowId::from_string(id_str)?;
+                if let RowId::User(id) = parsed_id {
+                    id_manager.register_user_id(id)?;
+                }
+                parsed_id
+            }
+        } else {
+            // Missing ID column - auto assign
+            RowId::Auto
+        };
+
+        // Resolve ID to actual value
+        let actual_id = row_id.resolve(&id_manager);
+
+        // Set the ID in the row data
+        row.insert(schema.id_column.clone(), actual_id.to_string());
+
+        // Validate the complete row
+        schema.validate_row(&row)?;
+
+        processed_rows.push((actual_id, row));
+    }
+
     // Process rows in chunks for columnar storage
-    let chunks: Vec<_> = rows.chunks(batch_size).collect();
+    let chunks: Vec<_> = processed_rows.chunks(batch_size).collect();
     let mut total_inserted = 0u64;
 
     // Process each chunk as a column block
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        // Validate all rows in chunk
-        for row in chunk.iter() {
-            schema.validate_row(row)?;
-        }
+        // Extract just the row data for column block creation
+        let chunk_rows: Vec<HashMap<String, String>> =
+            chunk.iter().map(|(_, row)| row.clone()).collect();
 
         // Create column block for this chunk
-        let column_block = ColumnBlock::from_rows(chunk, schema)?;
+        let column_block = ColumnBlock::from_rows(&chunk_rows, schema)?;
         let serialized_block = column_block.serialize()?;
 
         let mut batch = WriteBatch::default();
 
         // Generate a unique block ID for this chunk
-        let block_id = format!("_block_{}_{}", table, chunk_idx);
+        let timestamp = Utc::now().timestamp_millis();
+        let block_id = format!("_block_{}_{}_{}", table, timestamp, chunk_idx);
 
         // Store the compressed block ONCE with the block ID
         batch.put(block_id.as_bytes(), &serialized_block);
 
-        // For each row, store just a small pointer to the block
-        for (row_idx, row) in chunk.iter().enumerate() {
-            let row_key = generate_key(table, schema, row)?;
-
-            // Store a lightweight reference: [marker][block_id_len][block_id][row_idx]
+        // For each row, store references using dual key strategy
+        for (row_idx, (id, row)) in chunk.iter().enumerate() {
+            // Create reference data: [marker][block_id_len][block_id][row_idx]
             let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
             ref_data.push(0xFF); // Reference marker
             ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
             ref_data.extend_from_slice(block_id.as_bytes());
             ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
 
-            batch.put(&row_key, &ref_data);
+            // Primary key: [table_hash:u32][id:u64] - for direct ID lookups
+            let id_key = generate_id_key(table, *id);
+            batch.put(&id_key, &ref_data);
+
+            // Time index key: [table_hash:u32][timestamp:i64][id:u64] - for time-range queries
+            let time_key = generate_time_key(table, schema, row, *id)?;
+            batch.put(&time_key, &ref_data);
         }
 
         db.write(batch)?;
@@ -93,11 +135,34 @@ pub fn insert_rows(
     Ok(total_inserted)
 }
 
-fn generate_key(table: &str, schema: &Schema, row: &HashMap<String, String>) -> Result<Vec<u8>> {
-    // Binary key format for maximum performance:
-    // [table_hash:u32][timestamp:i64][row_id:u64]
-    // This ensures time-ordered storage with minimal overhead
+/// Generate primary key for direct ID lookup: [table_hash:u32][id:u64]
+fn generate_id_key(table: &str, id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(12); // 4 + 8 bytes
 
+    // Table hash (4 bytes) - big-endian for correct ordering
+    let table_hash = calculate_table_hash(table);
+    key.extend_from_slice(&table_hash.to_be_bytes());
+
+    // ID (8 bytes) - big-endian for correct ordering
+    key.extend_from_slice(&id.to_be_bytes());
+
+    key
+}
+
+/// Generate time index key: [table_hash:u32][timestamp:i64][id:u64]
+fn generate_time_key(
+    table: &str,
+    schema: &Schema,
+    row: &HashMap<String, String>,
+    id: u64,
+) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(20); // 4 + 8 + 8 bytes
+
+    // Table hash (4 bytes) - big-endian for correct ordering
+    let table_hash = calculate_table_hash(table);
+    key.extend_from_slice(&table_hash.to_be_bytes());
+
+    // Timestamp (8 bytes) - big-endian for correct ordering
     let timestamp = if let Some(ts_col) = schema.get_timestamp_column() {
         if let Some(ts_value) = row.get(ts_col) {
             parse_timestamp(ts_value)?
@@ -107,22 +172,10 @@ fn generate_key(table: &str, schema: &Schema, row: &HashMap<String, String>) -> 
     } else {
         Utc::now().timestamp_millis()
     };
-
-    // Generate a unique row ID
-    let row_id = generate_row_id();
-
-    // Create binary key with fixed size for better performance
-    let mut key = Vec::with_capacity(4 + 8 + 8); // 20 bytes total
-
-    // Table hash (4 bytes) - using simple hash for table prefix
-    let table_hash = calculate_table_hash(table);
-    key.extend_from_slice(&table_hash.to_be_bytes());
-
-    // Timestamp (8 bytes) - big-endian for correct ordering
     key.extend_from_slice(&timestamp.to_be_bytes());
 
-    // Row ID (8 bytes) - for uniqueness
-    key.extend_from_slice(&row_id.to_be_bytes());
+    // ID (8 bytes) - for uniqueness and ordering
+    key.extend_from_slice(&id.to_be_bytes());
 
     Ok(key)
 }
@@ -158,12 +211,6 @@ fn parse_timestamp(value: &str) -> Result<i64> {
         "Invalid timestamp format: {}",
         value
     )))
-}
-
-fn generate_row_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
 #[cfg(test)]

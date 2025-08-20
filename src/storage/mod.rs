@@ -1,5 +1,6 @@
 use rocksdb::{Options, DB};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -20,10 +21,12 @@ pub fn calculate_table_hash(table: &str) -> u32 {
 pub mod columnar;
 pub mod compression;
 pub mod encoding;
+pub mod id_manager;
 pub mod ingestion;
 pub mod query;
 pub mod schema;
 
+use id_manager::IdManagerRegistry;
 use schema::SchemaManager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,6 +39,7 @@ pub struct IngestionStats {
 pub struct StorageEngine {
     pub db: Arc<DB>,
     pub schemas: Arc<RwLock<SchemaManager>>,
+    pub id_managers: Arc<RwLock<IdManagerRegistry>>,
     config: Config,
 }
 
@@ -131,6 +135,7 @@ impl StorageEngine {
         Ok(Self {
             db: Arc::clone(&db_arc),
             schemas: Arc::new(RwLock::new(SchemaManager::new(Arc::clone(&db_arc))?)),
+            id_managers: Arc::new(RwLock::new(IdManagerRegistry::new(Arc::clone(&db_arc)))),
             config: config.clone(),
         })
     }
@@ -150,14 +155,18 @@ impl StorageEngine {
             schemas.get_or_create_schema(table, &rows)?
         };
 
-        // Validate and insert data
-        let rows_inserted = ingestion::insert_rows(
-            &self.db,
-            table,
-            &schema,
-            rows,
-            self.config.ingestion.batch_size,
-        )?;
+        // Validate and insert data with ID management
+        let rows_inserted = {
+            let mut id_managers = self.id_managers.write().await;
+            ingestion::insert_rows(
+                &self.db,
+                table,
+                &schema,
+                &mut id_managers,
+                rows,
+                self.config.ingestion.batch_size,
+            )?
+        };
 
         let processing_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -235,5 +244,18 @@ impl StorageEngine {
             .ok_or_else(|| PulsoraError::Schema(format!("Table '{}' not found", table)))?;
 
         Ok(serde_json::to_value(schema)?)
+    }
+
+    pub async fn get_row_by_id(
+        &self,
+        table: &str,
+        id: u64,
+    ) -> Result<Option<HashMap<String, String>>> {
+        let schemas = self.schemas.read().await;
+        let schema = schemas
+            .get_schema(table)
+            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+
+        query::get_row_by_id(&self.db, table, schema, id)
     }
 }

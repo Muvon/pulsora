@@ -14,6 +14,100 @@ use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
 use crate::storage::schema::Schema;
 
+/// Execute ID-based query to retrieve a single row by ID
+pub fn get_row_by_id(
+    db: &Arc<DB>,
+    table: &str,
+    schema: &Schema,
+    id: u64,
+) -> Result<Option<HashMap<String, String>>> {
+    // Generate primary key for direct ID lookup
+    let id_key = generate_id_key(table, id);
+
+    // Try to find the row reference
+    match db.get(&id_key)? {
+        Some(ref_data) => {
+            // Parse the reference data to get block ID and row index
+            let (block_id, row_idx) = parse_reference_data(&ref_data)?;
+
+            // Load the block
+            let block_data = db
+                .get(&block_id)?
+                .ok_or_else(|| PulsoraError::Query("Block not found".to_string()))?;
+
+            // Deserialize the column block
+            let column_block = ColumnBlock::deserialize(&block_data)?;
+
+            // Convert to rows and return the specific row
+            let rows = column_block.to_rows(schema)?;
+
+            if row_idx < rows.len() {
+                Ok(Some(rows[row_idx].clone()))
+            } else {
+                Err(PulsoraError::Query("Row index out of bounds".to_string()))
+            }
+        }
+        None => Ok(None), // Row not found
+    }
+}
+
+/// Generate primary key for ID-based lookup: [table_hash:u32][id:u64]
+fn generate_id_key(table: &str, id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(12); // 4 + 8 bytes
+
+    // Table hash (4 bytes) - big-endian for correct ordering
+    let table_hash = calculate_table_hash(table);
+    key.extend_from_slice(&table_hash.to_be_bytes());
+
+    // ID (8 bytes) - big-endian for correct ordering
+    key.extend_from_slice(&id.to_be_bytes());
+
+    key
+}
+
+/// Parse reference data to extract block ID and row index
+fn parse_reference_data(ref_data: &[u8]) -> Result<(Vec<u8>, usize)> {
+    if ref_data.is_empty() || ref_data[0] != 0xFF {
+        return Err(PulsoraError::Query("Invalid reference data".to_string()));
+    }
+
+    let mut pos = 1;
+
+    // Read block ID length
+    if ref_data.len() < pos + 4 {
+        return Err(PulsoraError::Query(
+            "Invalid reference data length".to_string(),
+        ));
+    }
+    let block_id_len = u32::from_le_bytes([
+        ref_data[pos],
+        ref_data[pos + 1],
+        ref_data[pos + 2],
+        ref_data[pos + 3],
+    ]) as usize;
+    pos += 4;
+
+    // Read block ID
+    if ref_data.len() < pos + block_id_len {
+        return Err(PulsoraError::Query("Invalid block ID length".to_string()));
+    }
+    let block_id = ref_data[pos..pos + block_id_len].to_vec();
+    pos += block_id_len;
+
+    // Read row index
+    if ref_data.len() < pos + 4 {
+        return Err(PulsoraError::Query("Invalid row index data".to_string()));
+    }
+    let row_idx = u32::from_le_bytes([
+        ref_data[pos],
+        ref_data[pos + 1],
+        ref_data[pos + 2],
+        ref_data[pos + 3],
+    ]) as usize;
+
+    Ok((block_id, row_idx))
+}
+
 pub fn execute_query(
     db: &Arc<DB>,
     table: &str,
@@ -252,6 +346,10 @@ fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Result
     for (key, value) in row {
         if let Some(column) = schema.columns.iter().find(|c| c.name == *key) {
             let json_value = match column.data_type {
+                crate::storage::schema::DataType::Id => match value.parse::<u64>() {
+                    Ok(id) => Value::Number(serde_json::Number::from(id)),
+                    Err(_) => Value::String(value.clone()),
+                },
                 crate::storage::schema::DataType::Integer => match value.parse::<i64>() {
                     Ok(i) => Value::Number(serde_json::Number::from(i)),
                     Err(_) => Value::String(value.clone()),

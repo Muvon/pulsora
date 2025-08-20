@@ -14,6 +14,8 @@ use crate::error::{PulsoraError, Result};
 /// Supported data types for time series data
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DataType {
+    /// 64-bit unsigned integer ID (special type for row IDs)
+    Id,
     /// 64-bit signed integer
     Integer,
     /// 64-bit floating point number
@@ -42,12 +44,14 @@ pub struct Column {
 pub struct Schema {
     /// Name of the table this schema belongs to
     pub table_name: String,
-    /// List of column definitions
+    /// List of column definitions (includes ID column)
     pub columns: Vec<Column>,
     /// Ordered list of column names for consistent encoding/decoding
     pub column_order: Vec<String>,
     /// Name of the primary timestamp column (if detected)
     pub timestamp_column: Option<String>,
+    /// Name of the ID column (always "id")
+    pub id_column: String,
     /// When this schema was created
     pub created_at: DateTime<Utc>,
 }
@@ -160,16 +164,38 @@ impl SchemaManager {
         let first_row = &sample_rows[0];
         let mut column_types: HashMap<String, DataType> = HashMap::new();
         let mut timestamp_column = None;
+        let mut has_id_column = false;
 
         // Initialize with column names
         for name in first_row.keys() {
-            column_types.insert(name.clone(), DataType::String); // Start with most general type
+            if name == "id" {
+                has_id_column = true;
+                column_types.insert(name.clone(), DataType::Id); // ID is always Id type
+            } else {
+                column_types.insert(name.clone(), DataType::String); // Start with most general type
+            }
+        }
+
+        // Always ensure ID column exists
+        if !has_id_column {
+            column_types.insert("id".to_string(), DataType::Id);
         }
 
         // Analyze ALL rows to determine the most specific type for each column
         for row in sample_rows {
             for (name, value) in row {
-                if let Some(current_type) = column_types.get_mut(name) {
+                if name == "id" {
+                    // ID column is always Integer, but validate if provided
+                    if !value.trim().is_empty()
+                        && (value.parse::<u64>().is_err() || value.parse::<u64>().unwrap_or(0) == 0)
+                    {
+                        return Err(PulsoraError::Schema(format!(
+                            "Invalid ID value '{}': ID must be a positive integer",
+                            value
+                        )));
+                    }
+                    // Keep as Integer type
+                } else if let Some(current_type) = column_types.get_mut(name) {
                     let inferred_type = self.infer_data_type(value);
                     *current_type = self.merge_types(current_type.clone(), inferred_type);
                 }
@@ -179,10 +205,11 @@ impl SchemaManager {
         // Build columns with final types
         let mut columns = Vec::new();
         for (name, data_type) in &column_types {
-            // Check if this could be a timestamp column
-            if (data_type == &DataType::Timestamp
-                || name.to_lowercase().contains("time")
-                || name.to_lowercase().contains("date"))
+            // Check if this could be a timestamp column (but not ID)
+            if name != "id"
+                && (data_type == &DataType::Timestamp
+                    || name.to_lowercase().contains("time")
+                    || name.to_lowercase().contains("date"))
                 && timestamp_column.is_none()
             {
                 timestamp_column = Some(name.clone());
@@ -191,14 +218,22 @@ impl SchemaManager {
             columns.push(Column {
                 name: name.clone(),
                 data_type: data_type.clone(),
-                nullable: false, // For MVP, assume non-nullable
+                nullable: name != "id", // ID is never nullable, others can be for future
             });
         }
 
-        // Sort columns to ensure consistent ordering
-        columns.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sort columns to ensure consistent ordering, but keep ID first for efficiency
+        columns.sort_by(|a, b| {
+            if a.name == "id" {
+                std::cmp::Ordering::Less
+            } else if b.name == "id" {
+                std::cmp::Ordering::Greater
+            } else {
+                a.name.cmp(&b.name)
+            }
+        });
 
-        // Create column order list
+        // Create column order list (ID first, then alphabetical)
         let column_order = columns.iter().map(|c| c.name.clone()).collect();
 
         Ok(Schema {
@@ -206,6 +241,7 @@ impl SchemaManager {
             columns,
             column_order,
             timestamp_column,
+            id_column: "id".to_string(),
             created_at: Utc::now(),
         })
     }
@@ -314,9 +350,24 @@ impl SchemaManager {
 
 impl Schema {
     pub fn validate_row(&self, row: &HashMap<String, String>) -> Result<()> {
-        // Check that all required columns are present
+        // ID column is special - it can be missing (auto-assigned) or empty (auto-assigned)
+        // but if present and non-empty, must be valid
+        if let Some(id_value) = row.get(&self.id_column) {
+            if !id_value.trim().is_empty() {
+                // Validate ID if provided
+                if id_value.parse::<u64>().is_err() || id_value.parse::<u64>().unwrap_or(0) == 0 {
+                    return Err(PulsoraError::Schema(format!(
+                        "Invalid ID value '{}': ID must be a positive integer",
+                        id_value
+                    )));
+                }
+            }
+        }
+
+        // Check that all other required columns are present
         for column in &self.columns {
-            if !column.nullable && !row.contains_key(&column.name) {
+            if !column.nullable && column.name != self.id_column && !row.contains_key(&column.name)
+            {
                 return Err(PulsoraError::Schema(format!(
                     "Missing required column: {}",
                     column.name
@@ -324,10 +375,12 @@ impl Schema {
             }
         }
 
-        // Validate data types
+        // Validate data types for non-ID columns
         for (name, value) in row {
-            if let Some(column) = self.columns.iter().find(|c| c.name == *name) {
-                self.validate_value(&column.data_type, value)?;
+            if name != &self.id_column {
+                if let Some(column) = self.columns.iter().find(|c| c.name == *name) {
+                    self.validate_value(&column.data_type, value)?;
+                }
             }
         }
 
@@ -336,6 +389,20 @@ impl Schema {
 
     fn validate_value(&self, expected_type: &DataType, value: &str) -> Result<()> {
         match expected_type {
+            DataType::Id => {
+                // ID must be positive u64
+                if value.trim().is_empty() {
+                    return Ok(()); // Empty is OK - will be auto-assigned
+                }
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    PulsoraError::InvalidData(format!("Invalid ID value: {}", value))
+                })?;
+                if parsed == 0 {
+                    return Err(PulsoraError::InvalidData(
+                        "ID must be positive (> 0)".to_string(),
+                    ));
+                }
+            }
             DataType::Integer => {
                 value.parse::<i64>().map_err(|_| {
                     PulsoraError::InvalidData(format!("Invalid integer: {}", value))
