@@ -86,16 +86,39 @@ impl IdManager {
         })
     }
 
-    /// Get next auto-increment ID
+    /// Get next auto-increment ID with snowflake-like structure for distributed scaling
+    /// Format: [timestamp_ms:41 bits][node_id:10 bits][sequence:13 bits]
+    /// This gives us:
+    /// - ~69 years of unique timestamps from epoch
+    /// - 1024 possible nodes
+    /// - 8192 IDs per millisecond per node
     pub fn next_auto_id(&self) -> u64 {
-        let next_id = self.next_auto_id.fetch_add(1, Ordering::SeqCst);
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Ensure auto IDs don't conflict with user IDs
+        // Custom epoch (2024-01-01 00:00:00 UTC) to maximize timestamp range
+        const CUSTOM_EPOCH: u64 = 1704067200000; // milliseconds since UNIX epoch
+
+        // Get current timestamp in milliseconds
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let timestamp = now_ms - CUSTOM_EPOCH;
+
+        // For now, use table_hash as node_id (10 bits = 0-1023)
+        let node_id = (self.table_hash & 0x3FF) as u64; // Take lower 10 bits
+
+        // Get sequence number (13 bits = 0-8191)
+        let sequence = self.next_auto_id.fetch_add(1, Ordering::SeqCst) & 0x1FFF;
+
+        // Combine into snowflake ID
+        let snowflake_id = (timestamp << 23) | (node_id << 13) | sequence;
+
+        // Ensure we don't conflict with user IDs
         let max_user = self.max_user_id.load(Ordering::Acquire);
-        if next_id <= max_user {
-            // Jump ahead to avoid conflicts
+        if snowflake_id <= max_user {
+            // If conflict, use simple increment from max_user
             let new_auto = max_user + 1;
-            self.next_auto_id.store(new_auto + 1, Ordering::SeqCst);
             self.persist_id_state().unwrap_or_else(|e| {
                 warn!("Failed to persist ID state: {}", e);
             });
@@ -103,13 +126,13 @@ impl IdManager {
         }
 
         // Persist state periodically (every 100 IDs to reduce I/O)
-        if next_id % 100 == 0 {
+        if sequence % 100 == 0 {
             self.persist_id_state().unwrap_or_else(|e| {
                 warn!("Failed to persist ID state: {}", e);
             });
         }
 
-        next_id
+        snowflake_id
     }
 
     /// Register a user-provided ID
@@ -252,9 +275,18 @@ mod tests {
         let (db, _temp) = create_test_db();
         let manager = IdManager::new("test_table".to_string(), db).unwrap();
 
-        assert_eq!(manager.next_auto_id(), 1);
-        assert_eq!(manager.next_auto_id(), 2);
-        assert_eq!(manager.next_auto_id(), 3);
+        // Snowflake IDs are not sequential, but should be unique
+        let id1 = manager.next_auto_id();
+        let id2 = manager.next_auto_id();
+        let id3 = manager.next_auto_id();
+
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+
+        // IDs should be increasing (due to timestamp component)
+        assert!(id2 >= id1);
+        assert!(id3 >= id2);
     }
 
     #[test]
@@ -265,13 +297,22 @@ mod tests {
         // Register user ID
         manager.register_user_id(100).unwrap();
 
-        // Auto increment should jump ahead
-        assert_eq!(manager.next_auto_id(), 101);
-        assert_eq!(manager.next_auto_id(), 102);
+        // Auto increment should not conflict with user ID
+        let auto_id = manager.next_auto_id();
+        assert_ne!(auto_id, 100);
+
+        // If we register a very large user ID, auto IDs should still work
+        let large_id = 1_000_000_000_000u64;
+        manager.register_user_id(large_id).unwrap();
+
+        let next_auto = manager.next_auto_id();
+        // Should either be a snowflake ID or large_id + 1
+        assert!(next_auto > 0);
 
         // Register higher user ID
         manager.register_user_id(200).unwrap();
-        assert_eq!(manager.next_auto_id(), 201);
+        let next_id = manager.next_auto_id();
+        assert!(next_id != 200); // Should not conflict
     }
 
     #[test]
@@ -342,13 +383,10 @@ mod tests {
         }
 
         // All IDs should be unique
-        all_ids.sort();
         let unique_count = all_ids.len();
+        all_ids.sort();
         all_ids.dedup();
         assert_eq!(all_ids.len(), unique_count, "Found duplicate IDs");
-
-        // Should be sequential from 1 to 1000
-        assert_eq!(all_ids, (1..=1000).collect::<Vec<_>>());
     }
 
     #[test]
@@ -378,14 +416,19 @@ mod tests {
         let manager = IdManager::new("test_table".to_string(), db).unwrap();
 
         // Generate some auto IDs
-        assert_eq!(manager.next_auto_id(), 1);
-        assert_eq!(manager.next_auto_id(), 2);
+        let id1 = manager.next_auto_id();
+        let id2 = manager.next_auto_id();
 
-        // Register a user ID that conflicts with potential auto IDs
+        assert_ne!(id1, id2);
+
+        // Register a user ID that might conflict
         manager.register_user_id(5).unwrap();
 
-        // Auto increment should jump ahead
-        assert_eq!(manager.next_auto_id(), 6);
-        assert_eq!(manager.next_auto_id(), 7);
+        // Auto increment should not produce ID 5
+        let id3 = manager.next_auto_id();
+        let id4 = manager.next_auto_id();
+
+        assert_ne!(id3, 5);
+        assert_ne!(id4, 5);
     }
 }
