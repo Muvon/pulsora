@@ -50,6 +50,14 @@ impl<T> ApiResponse<T> {
             error: None,
         }
     }
+
+    fn error(message: String) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message),
+        }
+    }
 }
 
 pub async fn start(config: Config) -> Result<()> {
@@ -69,6 +77,7 @@ pub async fn start(config: Config) -> Result<()> {
         .route("/tables/:table/ingest", post(ingest_csv))
         .route("/tables/:table/query", get(query_data))
         .route("/tables/:table/schema", get(get_schema))
+        .route("/tables/:table/count", get(get_table_count))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -185,6 +194,23 @@ async fn query_data(
         Err(e) => {
             error!("Query error: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_table_count(
+    Path(table): Path<String>,
+    State(state): State<AppState>,
+) -> Json<ApiResponse<HashMap<String, u64>>> {
+    match state.storage.get_table_count(&table).await {
+        Ok(count) => {
+            let mut result = HashMap::new();
+            result.insert("count".to_string(), count);
+            Json(ApiResponse::success(result))
+        }
+        Err(e) => {
+            error!("Failed to get table count: {}", e);
+            Json(ApiResponse::error(e.to_string()))
         }
     }
 }

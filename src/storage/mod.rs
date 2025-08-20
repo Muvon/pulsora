@@ -7,6 +7,16 @@ use tracing::info;
 use crate::config::Config;
 use crate::error::{PulsoraError, Result};
 
+/// Calculate FNV-1a hash for table name
+pub fn calculate_table_hash(table: &str) -> u32 {
+    let mut hash = 2166136261u32;
+    for byte in table.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
+
 pub mod columnar;
 pub mod compression;
 pub mod encoding;
@@ -176,6 +186,46 @@ impl StorageEngine {
             .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
 
         query::execute_query(&self.db, table, schema, start, end, limit, offset)
+    }
+
+    pub async fn get_table_count(&self, table: &str) -> Result<u64> {
+        // Check if table exists by checking schema
+        let schemas = self.schemas.read().await;
+        if schemas.get_schema(table).is_none() {
+            return Err(PulsoraError::Query(format!("Table '{}' not found", table)));
+        }
+        drop(schemas);
+
+        // Count rows by iterating through table keys
+        let table_hash = calculate_table_hash(table);
+        let mut count = 0u64;
+
+        // Create prefix for this table's keys
+        let prefix = table_hash.to_be_bytes();
+        let iter = self.db.prefix_iterator(&prefix);
+
+        for item in iter {
+            match item {
+                Ok((key, value)) => {
+                    // Verify this is actually our table (not a hash collision)
+                    if key.len() >= 4 {
+                        let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
+                        if key_table_hash == table_hash {
+                            // Check if this is a row pointer (not a block or schema)
+                            if !value.is_empty() && value[0] == 0xFF {
+                                count += 1;
+                            }
+                        } else {
+                            // Hash collision or end of our table's data
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(count)
     }
 
     pub async fn get_schema(&self, table: &str) -> Result<serde_json::Value> {

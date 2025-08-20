@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{PulsoraError, Result};
+use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
 use crate::storage::schema::Schema;
 
@@ -211,16 +212,6 @@ fn build_range_key(table: &str, timestamp: Option<&str>, is_start: bool) -> Resu
     }
 
     Ok(key)
-}
-
-fn calculate_table_hash(table: &str) -> u32 {
-    // Same FNV-1a hash as in ingestion
-    let mut hash = 2166136261u32;
-    for byte in table.bytes() {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(16777619);
-    }
-    hash
 }
 
 fn parse_query_timestamp(timestamp: &str) -> Result<i64> {

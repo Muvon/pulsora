@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::error::{PulsoraError, Result};
+use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
 use crate::storage::schema::Schema;
 
@@ -124,16 +125,6 @@ fn generate_key(table: &str, schema: &Schema, row: &HashMap<String, String>) -> 
     key.extend_from_slice(&row_id.to_be_bytes());
 
     Ok(key)
-}
-
-fn calculate_table_hash(table: &str) -> u32 {
-    // Simple FNV-1a hash for table name
-    let mut hash = 2166136261u32;
-    for byte in table.bytes() {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(16777619);
-    }
-    hash
 }
 
 fn parse_timestamp(value: &str) -> Result<i64> {
