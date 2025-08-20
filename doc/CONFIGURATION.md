@@ -74,7 +74,7 @@ Controls the underlying RocksDB storage engine behavior.
 
 **write_buffer_size_mb:**
 - **Small datasets (< 1GB):** 32-64 MB
-- **Medium datasets (1-10GB):** 64-128 MB  
+- **Medium datasets (1-10GB):** 64-128 MB
 - **Large datasets (> 10GB):** 128-256 MB
 - **High write throughput:** 256+ MB
 

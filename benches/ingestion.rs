@@ -83,7 +83,7 @@ fn bench_data_ingestion(c: &mut Criterion) {
         let schema = rt.block_on(async {
             let mut schemas = storage.schemas.write().await;
             schemas
-                .get_or_create_schema("benchmark_table", &rows[0])
+                .get_or_create_schema("benchmark_table", &rows[0..1])
                 .unwrap()
         });
 
@@ -157,7 +157,7 @@ fn bench_batch_sizes(c: &mut Criterion) {
         let schema = rt.block_on(async {
             let mut schemas = storage.schemas.write().await;
             schemas
-                .get_or_create_schema("benchmark_table", &rows[0])
+                .get_or_create_schema("benchmark_table", &rows[0..1])
                 .unwrap()
         });
 

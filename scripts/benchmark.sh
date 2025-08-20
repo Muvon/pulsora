@@ -71,7 +71,7 @@ cat > "$RESULTS_DIR/benchmark_summary.md" << EOF
 - Full ingestion pipeline
 - Batch size optimization
 
-### 2. Query Performance  
+### 2. Query Performance
 - Time-range queries
 - Pagination efficiency
 - Result set scaling
@@ -95,7 +95,7 @@ The benchmarks measure:
 
 - \`complete_results.txt\` - Full benchmark output
 - \`ingestion_output.txt\` - Ingestion benchmark details
-- \`query_output.txt\` - Query benchmark details  
+- \`query_output.txt\` - Query benchmark details
 - \`end_to_end_output.txt\` - End-to-end benchmark details
 - HTML reports in \`target/criterion/\` directory
 

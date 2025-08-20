@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{PulsoraError, Result};
-use crate::storage::ingestion::deserialize_row;
+use crate::storage::columnar::ColumnBlock;
 use crate::storage::schema::Schema;
 
 pub fn execute_query(
@@ -32,18 +32,28 @@ pub fn execute_query(
     let mut count = 0;
     let mut skipped = 0;
 
+    // Group row requests by block ID for batch processing
+    let mut block_requests: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    let mut request_order: Vec<(Vec<u8>, usize)> = Vec::new(); // Preserve order
+    let mut direct_results: Vec<Value> = Vec::new();
+
     // Create iterator for range scan
-    let table_prefix = format!("{}:", table);
+    let table_hash = calculate_table_hash(table);
     let iter = db.iterator(IteratorMode::From(&start_key, Direction::Forward));
 
+    // First pass: collect and group row requests by block
     for item in iter {
         let (key, value) = match item {
             Ok((k, v)) => (k, v),
             Err(_) => continue,
         };
-        // Check if key belongs to our table
-        let key_str = String::from_utf8_lossy(&key);
-        if !key_str.starts_with(&table_prefix) {
+
+        // Check if key belongs to our table (first 4 bytes = table hash)
+        if key.len() < 4 {
+            continue;
+        }
+        let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
+        if key_table_hash != table_hash {
             break;
         }
 
@@ -63,40 +73,154 @@ pub fn execute_query(
             break;
         }
 
-        // Deserialize and convert to JSON
-        match deserialize_row(&value, schema) {
-            Ok(row) => {
-                let json_row = convert_row_to_json(&row, schema)?;
-                results.push(json_row);
-                count += 1;
-            }
-            Err(e) => {
-                // Log error but continue processing
-                tracing::warn!("Failed to deserialize row: {}", e);
+        // Check if this is a reference or direct data
+        if !value.is_empty() && value[0] == 0xFF {
+            // This is a reference to a block
+            let mut pos = 1;
+
+            // Read block ID length
+            if value.len() < pos + 4 {
+                tracing::warn!("Invalid reference data");
                 continue;
+            }
+            let block_id_len =
+                u32::from_le_bytes([value[pos], value[pos + 1], value[pos + 2], value[pos + 3]])
+                    as usize;
+            pos += 4;
+
+            // Read block ID
+            if value.len() < pos + block_id_len {
+                tracing::warn!("Invalid reference data");
+                continue;
+            }
+            let block_id = value[pos..pos + block_id_len].to_vec();
+            pos += block_id_len;
+
+            // Read row index
+            if value.len() < pos + 4 {
+                tracing::warn!("Invalid reference data");
+                continue;
+            }
+            let row_idx =
+                u32::from_le_bytes([value[pos], value[pos + 1], value[pos + 2], value[pos + 3]])
+                    as usize;
+
+            // Group by block ID
+            block_requests
+                .entry(block_id.clone())
+                .or_insert_with(Vec::new)
+                .push(row_idx);
+            request_order.push((block_id, row_idx));
+            count += 1;
+        } else {
+            // Try as direct column block (shouldn't happen in normal flow)
+            match ColumnBlock::deserialize(&value) {
+                Ok(block) => match block.to_rows(schema) {
+                    Ok(rows) => {
+                        for row in rows {
+                            if direct_results.len() >= limit - request_order.len() {
+                                break;
+                            }
+                            let json_row = convert_row_to_json(&row, schema)?;
+                            direct_results.push(json_row);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize column block: {}", e);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to deserialize data: {}", e);
+                    continue;
+                }
             }
         }
     }
+
+    // Second pass: batch fetch blocks and extract rows
+    let mut block_cache: HashMap<Vec<u8>, Vec<HashMap<String, String>>> = HashMap::new();
+
+    // Fetch unique blocks in batch
+    for (block_id, _row_indices) in &block_requests {
+        if !block_cache.contains_key(block_id) {
+            match db.get(block_id) {
+                Ok(Some(block_data)) => match ColumnBlock::deserialize(&block_data) {
+                    Ok(block) => match block.to_rows(schema) {
+                        Ok(rows) => {
+                            block_cache.insert(block_id.clone(), rows);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to deserialize column block: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize column block: {}", e);
+                    }
+                },
+                Ok(None) => {
+                    tracing::warn!("Column block not found");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch column block: {}", e);
+                }
+            }
+        }
+    }
+
+    // Third pass: extract rows in original order
+    for (block_id, row_idx) in request_order {
+        if let Some(rows) = block_cache.get(&block_id) {
+            if row_idx < rows.len() {
+                let json_row = convert_row_to_json(&rows[row_idx], schema)?;
+                results.push(json_row);
+            }
+        }
+    }
+
+    // Add any direct results
+    results.extend(direct_results);
 
     Ok(results)
 }
 
 fn build_range_key(table: &str, timestamp: Option<&str>, is_start: bool) -> Result<Vec<u8>> {
+    // Binary key format matching ingestion
     let ts_millis = if let Some(ts) = timestamp {
         parse_query_timestamp(ts)?
     } else if is_start {
         0i64 // Beginning of time
     } else {
-        return Ok(vec![]); // No end key
+        i64::MAX // End of time for upper bound
     };
 
-    let key = if is_start {
-        format!("{}:{:020}", table, ts_millis)
+    let mut key = Vec::with_capacity(4 + 8 + 8);
+
+    // Table hash (4 bytes)
+    let table_hash = calculate_table_hash(table);
+    key.extend_from_slice(&table_hash.to_be_bytes());
+
+    // Timestamp (8 bytes)
+    key.extend_from_slice(&ts_millis.to_be_bytes());
+
+    // Row ID (8 bytes) - min or max for range boundaries
+    if is_start {
+        key.extend_from_slice(&0u64.to_be_bytes());
     } else {
-        format!("{}:{:020}~", table, ts_millis) // ~ is after all possible row IDs
-    };
+        key.extend_from_slice(&u64::MAX.to_be_bytes());
+    }
 
-    Ok(key.into_bytes())
+    Ok(key)
+}
+
+fn calculate_table_hash(table: &str) -> u32 {
+    // Same FNV-1a hash as in ingestion
+    let mut hash = 2166136261u32;
+    for byte in table.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
 }
 
 fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
@@ -194,7 +318,13 @@ mod tests {
     #[test]
     fn test_build_range_key() {
         let start_key = build_range_key("test_table", Some("1704110400"), true).unwrap();
-        let key_str = String::from_utf8(start_key).unwrap();
-        assert!(key_str.starts_with("test_table:"));
+        // Binary key format: [table_hash:4][timestamp:8][row_id:8] = 20 bytes
+        assert_eq!(start_key.len(), 20);
+
+        // Check that table hash is consistent
+        let table_hash = calculate_table_hash("test_table");
+        let key_table_hash =
+            u32::from_be_bytes([start_key[0], start_key[1], start_key[2], start_key[3]]);
+        assert_eq!(table_hash, key_table_hash);
     }
 }

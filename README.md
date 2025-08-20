@@ -1,8 +1,8 @@
 # Pulsora
 
-**The fastest and easiest time-series database optimized for speed**
+**The fastest and easiest time-series database with columnar storage**
 
-Pulsora is a high-performance time-series database built with Rust, featuring dynamic schema inference, streaming CSV ingestion, and sub-millisecond query performance.
+Pulsora is a high-performance time-series database built with Rust, featuring columnar storage, advanced compression, dynamic schema inference, and sub-millisecond query performance.
 
 ## Quick Start
 
@@ -28,19 +28,20 @@ pkill pulsora
 
 ## Key Features
 
-- **🚀 High Performance**: 350K+ rows/s ingestion, sub-ms queries
-- **📊 Dynamic Schema**: Automatic type inference from CSV data
-- **⚡ Streaming Ingestion**: Memory-bounded processing with backpressure
-- **🔍 Time-Series Optimized**: Efficient range queries and pagination
-- **🛠️ Simple API**: RESTful HTTP interface
-- **📈 Benchmarking Suite**: Comprehensive performance testing
+- **🚀 High Performance**: 100K+ rows/s ingestion, sub-ms queries with block caching
+- **📊 Columnar Storage**: 2-10x compression with type-specific algorithms
+- **⚡ Advanced Compression**: Gorilla (XOR), delta-of-delta, varint encoding
+- **🔍 Time-Series Optimized**: Efficient range queries with binary key encoding
+- **📈 Block-based Architecture**: Reduced I/O with intelligent caching
+- **🛠️ Simple API**: RESTful HTTP interface with automatic schema inference
 
 ## Architecture
 
-- **Storage**: RocksDB with time-ordered keys (`table:timestamp:row_id`)
-- **Server**: Axum/Tokio async HTTP server
-- **Configuration**: TOML-based with sensible defaults
-- **Schema**: Dynamic inference with timestamp detection
+- **Storage**: RocksDB with columnar blocks and binary keys (`table_hash:timestamp:row_id`)
+- **Compression**: Type-specific algorithms (Gorilla, delta-of-delta, varint, dictionary)
+- **Server**: Axum/Tokio async HTTP server with block caching
+- **Configuration**: TOML-based with performance-optimized defaults
+- **Schema**: Dynamic inference with automatic timestamp detection
 
 ## Documentation
 

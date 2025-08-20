@@ -5,7 +5,7 @@
 ### Prerequisites
 
 - **Rust:** 1.70+ (latest stable recommended)
-- **System Dependencies:** 
+- **System Dependencies:**
   - `clang` (for RocksDB compilation)
   - `cmake` (for RocksDB compilation)
   - `pkg-config`

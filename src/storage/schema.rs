@@ -4,8 +4,10 @@
 //! type inference, and data validation for time series storage.
 
 use chrono::{DateTime, Utc};
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::{PulsoraError, Result};
 
@@ -53,23 +55,75 @@ pub struct Schema {
 #[derive(Debug)]
 pub struct SchemaManager {
     schemas: HashMap<String, Schema>,
-}
-
-impl Default for SchemaManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    db: Arc<DB>,
 }
 
 impl SchemaManager {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(db: Arc<DB>) -> Result<Self> {
+        let mut manager = Self {
             schemas: HashMap::new(),
+            db,
+        };
+
+        // Load existing schemas from RocksDB on startup
+        manager.load_schemas_from_db()?;
+
+        Ok(manager)
+    }
+
+    /// Load all schemas from RocksDB into memory
+    fn load_schemas_from_db(&mut self) -> Result<()> {
+        let schema_prefix = b"_schema_";
+        let iter = self.db.prefix_iterator(schema_prefix);
+
+        for item in iter {
+            let (key, value) = item.map_err(|e| PulsoraError::RocksDb(e))?;
+
+            // Extract table name from key: "_schema_{table_name}"
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if let Some(table_name) = key_str.strip_prefix("_schema_") {
+                    // Deserialize schema
+                    match serde_json::from_slice::<Schema>(&value) {
+                        Ok(schema) => {
+                            tracing::info!("Loaded schema for table: {}", table_name);
+                            self.schemas.insert(table_name.to_string(), schema);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to deserialize schema for table {}: {}",
+                                table_name,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
         }
+
+        tracing::info!("Loaded {} schemas from database", self.schemas.len());
+        Ok(())
+    }
+
+    /// Save schema to RocksDB
+    fn save_schema_to_db(&self, table: &str, schema: &Schema) -> Result<()> {
+        let key = format!("_schema_{}", table);
+        let value = serde_json::to_vec(schema)
+            .map_err(|e| PulsoraError::Schema(format!("Failed to serialize schema: {}", e)))?;
+
+        self.db
+            .put(key.as_bytes(), &value)
+            .map_err(|e| PulsoraError::RocksDb(e))?;
+
+        tracing::info!("Saved schema for table: {}", table);
+        Ok(())
     }
 
     pub fn get_schema(&self, table: &str) -> Option<&Schema> {
         self.schemas.get(table)
+    }
+
+    pub fn list_tables(&self) -> Vec<String> {
+        self.schemas.keys().cloned().collect()
     }
 
     pub fn get_or_create_schema(
@@ -83,6 +137,9 @@ impl SchemaManager {
 
         // Infer schema from ALL sample rows for better accuracy
         let schema = self.infer_schema_from_rows(table, sample_rows)?;
+
+        // Save to both memory and RocksDB
+        self.save_schema_to_db(table, &schema)?;
         self.schemas.insert(table.to_string(), schema.clone());
 
         Ok(schema)

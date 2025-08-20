@@ -9,7 +9,7 @@ Welcome to the Pulsora documentation! This directory contains comprehensive guid
 - **[API.md](API.md)** - Complete REST API reference with examples
 - **[CONFIGURATION.md](CONFIGURATION.md)** - Configuration guide and performance tuning
 
-### 🏗️ Technical Documentation  
+### 🏗️ Technical Documentation
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - System architecture and design decisions
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** - Development setup and contribution guide

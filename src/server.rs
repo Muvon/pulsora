@@ -57,7 +57,7 @@ pub async fn start(config: Config) -> Result<()> {
     let storage = Arc::new(StorageEngine::new(&config).await?);
     let config = Arc::new(config);
 
-    let state = AppState { 
+    let state = AppState {
         storage,
         config: config.clone(),
     };
@@ -65,6 +65,7 @@ pub async fn start(config: Config) -> Result<()> {
     // Build router
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/tables", get(list_tables))
         .route("/tables/:table/ingest", post(ingest_csv))
         .route("/tables/:table/query", get(query_data))
         .route("/tables/:table/schema", get(get_schema))
@@ -82,6 +83,12 @@ pub async fn start(config: Config) -> Result<()> {
     Ok(())
 }
 
+async fn list_tables(State(state): State<AppState>) -> Json<ApiResponse<Vec<String>>> {
+    let schemas = state.storage.schemas.read().await;
+    let tables = schemas.list_tables();
+    Json(ApiResponse::success(tables))
+}
+
 async fn health_check() -> Json<ApiResponse<HashMap<String, String>>> {
     let mut status = HashMap::new();
     status.insert("status".to_string(), "healthy".to_string());
@@ -97,32 +104,35 @@ async fn ingest_csv(
 ) -> std::result::Result<Json<ApiResponse<HashMap<String, u64>>>, StatusCode> {
     // Stream the body and collect it in chunks
     let body_stream = body.into_data_stream();
-    
+
     // Get max body size from config (0 means unlimited)
     let max_size = if state.config.server.max_body_size_mb > 0 {
         Some(state.config.server.max_body_size_mb * 1024 * 1024)
     } else {
         None
     };
-    
+
     // Process the CSV data in a streaming fashion
     let mut csv_data = Vec::new();
     let mut stream = body_stream;
     let mut total_size = 0usize;
-    
+
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => {
                 total_size += bytes.len();
-                
+
                 // Check size limit if configured (0 means unlimited)
                 if let Some(max) = max_size {
                     if total_size > max {
-                        error!("Request body exceeds maximum size of {} MB", state.config.server.max_body_size_mb);
+                        error!(
+                            "Request body exceeds maximum size of {} MB",
+                            state.config.server.max_body_size_mb
+                        );
                         return Err(StatusCode::PAYLOAD_TOO_LARGE);
                     }
                 }
-                
+
                 csv_data.extend_from_slice(&bytes);
             }
             Err(e) => {
@@ -131,7 +141,7 @@ async fn ingest_csv(
             }
         }
     }
-    
+
     // Convert bytes to string
     let csv_string = match String::from_utf8(csv_data) {
         Ok(s) => s,
@@ -140,7 +150,7 @@ async fn ingest_csv(
             return Err(StatusCode::BAD_REQUEST);
         }
     };
-    
+
     match state.storage.ingest_csv(&table, csv_string).await {
         Ok(stats) => {
             let mut response = HashMap::new();

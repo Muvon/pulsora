@@ -186,7 +186,7 @@ Recommended CI benchmark integration:
 ```yaml
 - name: Run Benchmarks
   run: cargo bench --bench ingestion -- --output-format json > bench.json
-  
+
 - name: Check Performance Regression
   run: ./scripts/check_regression.sh bench.json baseline.json
 ```

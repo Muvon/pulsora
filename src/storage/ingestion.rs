@@ -10,8 +10,8 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::error::{PulsoraError, Result};
-use crate::storage::encoding::{self, EncodedValue};
-use crate::storage::schema::{DataType, Schema};
+use crate::storage::columnar::ColumnBlock;
+use crate::storage::schema::Schema;
 
 pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
@@ -43,44 +43,59 @@ pub fn insert_rows(
     rows: Vec<HashMap<String, String>>,
     batch_size: usize,
 ) -> Result<u64> {
-    let mut total_inserted = 0u64;
-    let mut batch = WriteBatch::default();
-    let mut batch_count = 0;
-
-    for row in rows {
-        // Validate row against schema
-        schema.validate_row(&row)?;
-
-        // Generate key and value
-        let key = generate_key(table, schema, &row)?;
-        let value = serialize_row(&row, schema)?;
-
-        batch.put(&key, &value);
-        batch_count += 1;
-
-        // Write batch when it reaches the configured size
-        if batch_count >= batch_size {
-            db.write(batch)?;
-            total_inserted += batch_count as u64;
-            batch = WriteBatch::default();
-            batch_count = 0;
-            debug!("Wrote batch of {} rows", batch_size);
-        }
+    if rows.is_empty() {
+        return Ok(0);
     }
 
-    // Write remaining rows
-    if batch_count > 0 {
+    // Process rows in chunks for columnar storage
+    let chunks: Vec<_> = rows.chunks(batch_size).collect();
+    let mut total_inserted = 0u64;
+
+    // Process each chunk as a column block
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        // Validate all rows in chunk
+        for row in chunk.iter() {
+            schema.validate_row(row)?;
+        }
+
+        // Create column block for this chunk
+        let column_block = ColumnBlock::from_rows(chunk, schema)?;
+        let serialized_block = column_block.serialize()?;
+
+        let mut batch = WriteBatch::default();
+
+        // Generate a unique block ID for this chunk
+        let block_id = format!("_block_{}_{}", table, chunk_idx);
+
+        // Store the compressed block ONCE with the block ID
+        batch.put(block_id.as_bytes(), &serialized_block);
+
+        // For each row, store just a small pointer to the block
+        for (row_idx, row) in chunk.iter().enumerate() {
+            let row_key = generate_key(table, schema, row)?;
+
+            // Store a lightweight reference: [marker][block_id_len][block_id][row_idx]
+            let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
+            ref_data.push(0xFF); // Reference marker
+            ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
+            ref_data.extend_from_slice(block_id.as_bytes());
+            ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
+
+            batch.put(&row_key, &ref_data);
+        }
+
         db.write(batch)?;
-        total_inserted += batch_count as u64;
-        debug!("Wrote final batch of {} rows", batch_count);
+        total_inserted += chunk.len() as u64;
+        debug!("Wrote column block {} with {} rows", chunk_idx, chunk.len());
     }
 
     Ok(total_inserted)
 }
 
 fn generate_key(table: &str, schema: &Schema, row: &HashMap<String, String>) -> Result<Vec<u8>> {
-    // Key format: {table}:{timestamp}:{row_id}
-    // This ensures time-ordered storage for efficient range queries
+    // Binary key format for maximum performance:
+    // [table_hash:u32][timestamp:i64][row_id:u64]
+    // This ensures time-ordered storage with minimal overhead
 
     let timestamp = if let Some(ts_col) = schema.get_timestamp_column() {
         if let Some(ts_value) = row.get(ts_col) {
@@ -92,11 +107,33 @@ fn generate_key(table: &str, schema: &Schema, row: &HashMap<String, String>) -> 
         Utc::now().timestamp_millis()
     };
 
-    // Generate a unique row ID (simple counter for MVP)
+    // Generate a unique row ID
     let row_id = generate_row_id();
 
-    let key = format!("{}:{}:{:016x}", table, timestamp, row_id);
-    Ok(key.into_bytes())
+    // Create binary key with fixed size for better performance
+    let mut key = Vec::with_capacity(4 + 8 + 8); // 20 bytes total
+
+    // Table hash (4 bytes) - using simple hash for table prefix
+    let table_hash = calculate_table_hash(table);
+    key.extend_from_slice(&table_hash.to_be_bytes());
+
+    // Timestamp (8 bytes) - big-endian for correct ordering
+    key.extend_from_slice(&timestamp.to_be_bytes());
+
+    // Row ID (8 bytes) - for uniqueness
+    key.extend_from_slice(&row_id.to_be_bytes());
+
+    Ok(key)
+}
+
+fn calculate_table_hash(table: &str) -> u32 {
+    // Simple FNV-1a hash for table name
+    let mut hash = 2166136261u32;
+    for byte in table.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
 }
 
 fn parse_timestamp(value: &str) -> Result<i64> {
@@ -136,72 +173,6 @@ fn generate_row_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::SeqCst)
-}
-
-fn serialize_row(row: &HashMap<String, String>, schema: &Schema) -> Result<Vec<u8>> {
-    // Convert string values to typed EncodedValues based on schema
-    let mut encoded_row = HashMap::new();
-
-    for column in &schema.columns {
-        if let Some(value) = row.get(&column.name) {
-            let encoded_value = match column.data_type {
-                DataType::Integer => {
-                    let parsed = value.parse::<i64>().map_err(|_| {
-                        PulsoraError::InvalidData(format!("Invalid integer: {}", value))
-                    })?;
-                    EncodedValue::Integer(parsed)
-                }
-                DataType::Float => {
-                    let parsed = value.parse::<f64>().map_err(|_| {
-                        PulsoraError::InvalidData(format!("Invalid float: {}", value))
-                    })?;
-                    EncodedValue::Float(parsed)
-                }
-                DataType::Boolean => {
-                    let parsed = match value.to_lowercase().as_str() {
-                        "true" => true,
-                        "false" => false,
-                        _ => {
-                            return Err(PulsoraError::InvalidData(format!(
-                                "Invalid boolean: {}",
-                                value
-                            )))
-                        }
-                    };
-                    EncodedValue::Boolean(parsed)
-                }
-                DataType::Timestamp => {
-                    let parsed = parse_timestamp(value)?;
-                    EncodedValue::Timestamp(parsed)
-                }
-                DataType::String => EncodedValue::String(value.clone()),
-            };
-            encoded_row.insert(column.name.clone(), encoded_value);
-        }
-    }
-
-    // Use our efficient encoding
-    encoding::encode_row(&encoded_row, &schema.column_order)
-}
-
-pub fn deserialize_row(data: &[u8], schema: &Schema) -> Result<HashMap<String, String>> {
-    // Decode using our efficient encoding
-    let encoded_row = encoding::decode_row(data, &schema.column_order)?;
-
-    // Convert EncodedValues back to strings for compatibility
-    let mut string_row = HashMap::new();
-    for (key, value) in encoded_row {
-        let string_value = match value {
-            EncodedValue::Integer(v) => v.to_string(),
-            EncodedValue::Float(v) => v.to_string(),
-            EncodedValue::Boolean(v) => v.to_string(),
-            EncodedValue::Timestamp(v) => v.to_string(),
-            EncodedValue::String(v) => v,
-        };
-        string_row.insert(key, string_value);
-    }
-
-    Ok(string_row)
 }
 
 #[cfg(test)]

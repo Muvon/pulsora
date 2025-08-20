@@ -11,7 +11,7 @@ Pulsora includes a comprehensive benchmarking suite to measure and optimize perf
 Tests CSV data ingestion performance:
 
 - **CSV Parsing**: Raw CSV parsing speed
-- **Data Ingestion**: Database insertion throughput  
+- **Data Ingestion**: Database insertion throughput
 - **Full Pipeline**: End-to-end ingestion including schema inference
 - **Batch Size Optimization**: Performance across different batch sizes
 
@@ -124,18 +124,29 @@ Based on benchmarks, Pulsora targets:
 
 **Ingestion Performance:**
 - CSV Parsing: 1M+ rows/second
-- Database Insertion: 100K+ rows/second  
-- End-to-end Ingestion: 50K+ rows/second
+- Columnar Compression: 2-10x compression ratios
+- Block-based Insertion: 100K+ rows/second with reduced write amplification
+- End-to-end Ingestion: 50K+ rows/second with schema inference
 
 **Query Performance:**
-- Time Range Queries: <1ms for 1K results
-- Pagination: <5ms for any page
-- Concurrent Reads: Linear scaling to CPU cores
+- Block Cache Hit: <0.1ms for cached blocks
+- Block Decompression: <1ms for typical blocks (1K-10K rows)
+- Time Range Queries: <1ms for 1K results (cached), <10ms (uncached)
+- Pagination: <5ms for any page with block caching
+- Concurrent Reads: Linear scaling to CPU cores with block-level parallelism
+
+**Compression Performance:**
+- Timestamps: 5-10x compression (delta-of-delta + varint)
+- Floats: 2-5x compression (XOR + varfloat)
+- Integers: 3-8x compression (delta + varint)
+- Strings: 2-4x compression (dictionary encoding)
+- Booleans: 10-50x compression (run-length encoding)
 
 **System Performance:**
 - HTTP API: 1K+ requests/second
-- Memory Usage: <2GB for 10M rows
-- Storage Efficiency: 50%+ compression ratio
+- Memory Usage: <2GB for 10M rows (with 2-10x compression)
+- Storage Efficiency: 50-90% compression ratio (type-dependent)
+- Block Cache: 50+ blocks cached for sub-millisecond access
 
 ## Benchmark Configuration
 
@@ -175,14 +186,14 @@ nice -n -20 cargo bench
 ```rust
 fn bench_new_feature(c: &mut Criterion) {
     let mut group = c.benchmark_group("new_feature");
-    
+
     group.bench_function("test_case", |b| {
         b.iter(|| {
             // Benchmark code here
             black_box(function_to_test())
         })
     });
-    
+
     group.finish();
 }
 ```
@@ -220,7 +231,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         // Track allocation
         System.alloc(layout)
     }
-    
+
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // Track deallocation
         System.dealloc(ptr, layout)
