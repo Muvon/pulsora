@@ -73,6 +73,28 @@ impl<'a> BitReader<'a> {
     }
 
     fn read_bits(&mut self, bits: u8) -> Result<u64> {
+        if bits == 0 {
+            return Ok(0);
+        }
+
+        // Fast path for single bit reads (most common case)
+        if bits == 1 {
+            if self.byte_pos >= self.data.len() {
+                return Err(PulsoraError::InvalidData(
+                    "Unexpected end of compressed data".to_string(),
+                ));
+            }
+
+            let bit = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1;
+            self.bit_pos += 1;
+            if self.bit_pos == 8 {
+                self.byte_pos += 1;
+                self.bit_pos = 0;
+            }
+            return Ok(bit as u64);
+        }
+
+        // Original implementation for multi-bit reads
         let mut result = 0u64;
         let mut bits_to_read = bits;
 
@@ -243,7 +265,8 @@ pub fn decompress_values(base: f64, data: &[u8], count: usize) -> Result<Vec<f64
         return Ok(Vec::new());
     }
 
-    let mut values = vec![base];
+    let mut values = Vec::with_capacity(count);
+    values.push(base);
     if count == 1 {
         return Ok(values);
     }

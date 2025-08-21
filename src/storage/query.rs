@@ -137,12 +137,12 @@ pub fn execute_query(
     let limit = limit.unwrap_or(1000).min(10000);
     let offset = offset.unwrap_or(0);
 
-    // Build block index scan key
+    // Build block index scan key - start from beginning and filter later
     let table_hash = calculate_table_hash(table);
-    let mut start_key = Vec::with_capacity(13);
+    let mut start_key = Vec::with_capacity(5);
     start_key.extend_from_slice(&table_hash.to_be_bytes());
     start_key.push(b'B'); // Block marker
-    start_key.extend_from_slice(&start_ts.to_be_bytes());
+                          // Don't add timestamp to start_key - scan all blocks and filter by timestamp range
 
     // Optimized read options
     let mut read_opts = ReadOptions::default();
@@ -157,6 +157,9 @@ pub fn execute_query(
 
     let mut results = Vec::with_capacity(limit);
     let mut skipped_rows = 0usize;
+
+    // OPTIMIZATION: Collect block metadata first for potential parallel processing
+    let mut block_metadata = Vec::new();
 
     // Scan block index
     for item in iter {
@@ -186,7 +189,7 @@ pub fn execute_query(
             }
         }
 
-        // Parse block index value
+        // Parse block index value - standard format
         if value.len() < 24 {
             continue; // Invalid block index
         }
@@ -224,6 +227,12 @@ pub fn execute_query(
             continue;
         }
 
+        // Collect block metadata for processing
+        block_metadata.push((block_id.to_vec(), block_min_ts, block_max_ts));
+    }
+
+    // OPTIMIZATION: Process blocks with potential parallelization
+    for (block_id, block_min_ts, block_max_ts) in block_metadata {
         // Fetch and decompress the block
         let mut fetch_opts = ReadOptions::default();
         fetch_opts.set_verify_checksums(false);
@@ -231,36 +240,100 @@ pub fn execute_query(
 
         if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
             if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                // Convert directly to JSON
-                if let Ok(json_values) = block.to_json_values(schema) {
-                    // Filter rows by timestamp if needed
-                    for json_row in json_values {
-                        // Check timestamp bounds if block spans our range
-                        if block_min_ts < start_ts || block_max_ts > end_ts {
-                            // Need to check individual row timestamp
-                            if let Some(ts_field) = schema.get_timestamp_column() {
-                                if let Some(Value::Number(ts_val)) = json_row.get(ts_field) {
-                                    if let Some(ts) = ts_val.as_i64() {
-                                        if ts < start_ts || ts > end_ts {
-                                            continue;
+                // Get block row count for bulk offset handling
+                let block_row_count = block.row_count();
+
+                // OPTIMIZATION 1: Bulk offset skipping at block level
+                if skipped_rows + block_row_count <= offset {
+                    // Skip entire block
+                    skipped_rows += block_row_count;
+                    continue;
+                }
+
+                // OPTIMIZATION 2: Calculate how many rows to skip within this block
+                let skip_in_block = offset.saturating_sub(skipped_rows);
+
+                // OPTIMIZATION 3: Calculate how many rows we can take from this block
+                let remaining_limit = limit - results.len();
+                let available_in_block = block_row_count - skip_in_block;
+                let take_from_block = remaining_limit.min(available_in_block);
+
+                // Use slice-based processing for better performance
+                if let Ok(json_values) = block.to_json_slice(schema, skip_in_block, take_from_block)
+                {
+                    // Block is entirely within timestamp range - add all rows directly
+                    if block_min_ts >= start_ts && block_max_ts <= end_ts {
+                        results.extend(json_values);
+                    } else {
+                        // Need individual timestamp checking only if block spans our range
+                        if let Some(ts_field) = schema.get_timestamp_column() {
+                            for json_row in json_values {
+                                let mut include_row = true;
+
+                                if let Some(ts_value) = json_row.get(ts_field) {
+                                    let ts_millis = match ts_value {
+                                        Value::Number(n) => n.as_i64(),
+                                        Value::String(s) => {
+                                            // Parse ISO timestamp back to millis for comparison
+                                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+                                            {
+                                                Some(dt.timestamp_millis())
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    };
+
+                                    if let Some(ts) = ts_millis {
+                                        include_row = ts >= start_ts && ts <= end_ts;
+                                    }
+                                }
+
+                                if include_row {
+                                    results.push(json_row);
+                                    if results.len() >= limit {
+                                        return Ok(results);
+                                    }
+                                }
+                            }
+                        } else {
+                            // No timestamp field, add all rows
+                            results.extend(json_values);
+                        }
+                    }
+
+                    // Update skipped count
+                    skipped_rows = offset;
+                } else {
+                    // Fallback to old method if slice method fails
+                    if let Ok(json_values) = block.to_json_values(schema) {
+                        let mut block_processed = 0;
+                        for json_row in json_values {
+                            if block_processed < skip_in_block {
+                                block_processed += 1;
+                                continue;
+                            }
+
+                            // Check timestamp bounds if block spans our range
+                            if block_min_ts < start_ts || block_max_ts > end_ts {
+                                if let Some(ts_field) = schema.get_timestamp_column() {
+                                    if let Some(Value::Number(ts_val)) = json_row.get(ts_field) {
+                                        if let Some(ts) = ts_val.as_i64() {
+                                            if ts < start_ts || ts > end_ts {
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // Apply offset
-                        if skipped_rows < offset {
-                            skipped_rows += 1;
-                            continue;
+                            results.push(json_row);
+                            if results.len() >= limit {
+                                return Ok(results);
+                            }
                         }
-
-                        // Apply limit
-                        if results.len() >= limit {
-                            return Ok(results);
-                        }
-
-                        results.push(json_row);
+                        skipped_rows = offset;
                     }
                 }
             }

@@ -91,6 +91,85 @@ impl ColumnBlock {
         Ok(rows)
     }
 
+    /// Get the number of rows in this block
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Convert a slice of rows to JSON values efficiently
+    pub fn to_json_slice(
+        &self,
+        schema: &Schema,
+        skip: usize,
+        take: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        use serde_json::Value;
+
+        if skip >= self.row_count {
+            return Ok(Vec::new());
+        }
+
+        let end_idx = (skip + take).min(self.row_count);
+        let actual_take = end_idx - skip;
+
+        // Simple approach: decompress what we need, but do it efficiently
+        let mut decompressed_columns = Vec::with_capacity(schema.columns.len());
+
+        for column in &schema.columns {
+            let compressed = self.columns.get(&column.name).ok_or_else(|| {
+                PulsoraError::InvalidData(format!("Missing column: {}", column.name))
+            })?;
+
+            let values = decompress_column(compressed, &column.data_type, self.row_count)?;
+            let null_bitmap = self.null_bitmaps.get(&column.name);
+
+            decompressed_columns.push((column, values, null_bitmap));
+        }
+
+        // Build JSON objects for the requested slice only
+        let mut results = Vec::with_capacity(actual_take);
+
+        for row_idx in skip..end_idx {
+            let mut json_obj = serde_json::Map::with_capacity(schema.columns.len());
+
+            for (column, values, null_bitmap) in &decompressed_columns {
+                // Check if value is null
+                if let Some(bitmap) = null_bitmap {
+                    let byte_idx = row_idx >> 3;
+                    let bit_idx = row_idx & 7;
+                    if byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0 {
+                        continue;
+                    }
+                }
+
+                let json_value = match &values[row_idx] {
+                    EncodedValue::Id(v) => Value::Number(serde_json::Number::from(*v)),
+                    EncodedValue::Integer(v) => Value::Number(serde_json::Number::from(*v)),
+                    EncodedValue::Float(v) => Value::Number(
+                        serde_json::Number::from_f64(*v)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ),
+                    EncodedValue::Boolean(v) => Value::Bool(*v),
+                    EncodedValue::Timestamp(v) => {
+                        // Convert timestamp to ISO string like before
+                        if let Some(datetime) = chrono::DateTime::from_timestamp_millis(*v) {
+                            Value::String(datetime.to_rfc3339())
+                        } else {
+                            Value::Number(serde_json::Number::from(*v))
+                        }
+                    }
+                    EncodedValue::String(v) => Value::String(v.clone()),
+                };
+
+                json_obj.insert(column.name.clone(), json_value);
+            }
+
+            results.push(Value::Object(json_obj));
+        }
+
+        Ok(results)
+    }
+
     /// Direct columnar to JSON conversion without intermediate HashMaps
     /// This is 5-10x faster than to_rows() + convert_row_to_json()
     pub fn to_json_values(&self, schema: &Schema) -> Result<Vec<serde_json::Value>> {
@@ -136,8 +215,12 @@ impl ColumnBlock {
                     ),
                     EncodedValue::Boolean(v) => Value::Bool(*v),
                     EncodedValue::Timestamp(v) => {
-                        // Keep as number for efficiency, convert to ISO string only if needed
-                        Value::Number(serde_json::Number::from(*v))
+                        // Convert timestamp to ISO string like the original convert_row_to_json
+                        if let Some(datetime) = chrono::DateTime::from_timestamp_millis(*v) {
+                            Value::String(datetime.to_rfc3339())
+                        } else {
+                            Value::String(v.to_string())
+                        }
                     }
                     EncodedValue::String(v) => Value::String(v.clone()),
                 };
