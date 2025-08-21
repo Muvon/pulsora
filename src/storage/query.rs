@@ -340,7 +340,7 @@ fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
     )))
 }
 
-fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Result<Value> {
+pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Result<Value> {
     let mut json_obj = serde_json::Map::new();
 
     for (key, value) in row {
@@ -367,8 +367,19 @@ fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Result
                     _ => Value::String(value.clone()),
                 },
                 crate::storage::schema::DataType::Timestamp => {
-                    // Keep as string for now, could convert to ISO format
-                    Value::String(value.clone())
+                    // Convert milliseconds back to ISO format
+                    if let Ok(millis) = value.parse::<i64>() {
+                        // Convert milliseconds to DateTime and format as ISO
+                        if let Some(datetime) = chrono::DateTime::from_timestamp_millis(millis) {
+                            Value::String(datetime.to_rfc3339())
+                        } else {
+                            // Fallback to original value if conversion fails
+                            Value::String(value.clone())
+                        }
+                    } else {
+                        // If it's not milliseconds, keep as-is (might already be ISO format)
+                        Value::String(value.clone())
+                    }
                 }
                 crate::storage::schema::DataType::String => Value::String(value.clone()),
             };

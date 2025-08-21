@@ -232,8 +232,8 @@ async fn get_schema(
 async fn get_row_by_id(
     State(state): State<AppState>,
     Path((table, id)): Path<(String, u64)>,
-) -> std::result::Result<Json<ApiResponse<Option<HashMap<String, String>>>>, StatusCode> {
-    match state.storage.get_row_by_id(&table, id).await {
+) -> std::result::Result<Json<ApiResponse<Option<serde_json::Value>>>, StatusCode> {
+    match state.storage.get_row_by_id_json(&table, id).await {
         Ok(row) => Ok(Json(ApiResponse::success(row))),
         Err(e) => {
             error!("Get row by ID error: {}", e);

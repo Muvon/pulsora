@@ -166,14 +166,13 @@ impl SchemaManager {
         let mut timestamp_column = None;
         let mut has_id_column = false;
 
-        // Initialize with column names
+        // Initialize with column names - start with None to infer from first value
         for name in first_row.keys() {
             if name == "id" {
                 has_id_column = true;
                 column_types.insert(name.clone(), DataType::Id); // ID is always Id type
-            } else {
-                column_types.insert(name.clone(), DataType::String); // Start with most general type
             }
+            // Don't initialize other columns yet - let them be inferred from first value
         }
 
         // Always ensure ID column exists
@@ -198,6 +197,10 @@ impl SchemaManager {
                 } else if let Some(current_type) = column_types.get_mut(name) {
                     let inferred_type = self.infer_data_type(value);
                     *current_type = self.merge_types(current_type.clone(), inferred_type);
+                } else {
+                    // First time seeing this column - infer type from first value
+                    let inferred_type = self.infer_data_type(value);
+                    column_types.insert(name.clone(), inferred_type);
                 }
             }
         }

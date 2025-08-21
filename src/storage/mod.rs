@@ -1,6 +1,6 @@
 use rocksdb::{Options, DB};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -246,16 +246,21 @@ impl StorageEngine {
         Ok(serde_json::to_value(schema)?)
     }
 
-    pub async fn get_row_by_id(
+    pub async fn get_row_by_id_json(
         &self,
         table: &str,
         id: u64,
-    ) -> Result<Option<HashMap<String, String>>> {
+    ) -> Result<Option<serde_json::Value>> {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
             .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
 
-        query::get_row_by_id(&self.db, table, schema, id)
+        if let Some(row) = query::get_row_by_id(&self.db, table, schema, id)? {
+            let json_row = query::convert_row_to_json(&row, schema)?;
+            Ok(Some(json_row))
+        } else {
+            Ok(None)
+        }
     }
 }
