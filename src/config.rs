@@ -40,6 +40,10 @@ pub struct PerformanceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     pub level: String,
+    pub format: String, // "pretty" or "json"
+    pub enable_access_logs: bool,
+    pub enable_performance_logs: bool,
+    pub file_output: Option<String>, // Optional file path for logs
 }
 
 impl Default for Config {
@@ -65,6 +69,10 @@ impl Default for Config {
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
+                format: "pretty".to_string(),
+                enable_access_logs: true,
+                enable_performance_logs: true,
+                file_output: None, // Default to stdout only
             },
         }
     }
@@ -109,6 +117,22 @@ impl Config {
             return Err(PulsoraError::Config(format!(
                 "Invalid compression '{}'. Valid options: {:?}",
                 self.performance.compression, valid_compressions
+            )));
+        }
+
+        let valid_log_levels = ["error", "warn", "info", "debug", "trace"];
+        if !valid_log_levels.contains(&self.logging.level.as_str()) {
+            return Err(PulsoraError::Config(format!(
+                "Invalid log level '{}'. Valid options: {:?}",
+                self.logging.level, valid_log_levels
+            )));
+        }
+
+        let valid_log_formats = ["pretty", "json"];
+        if !valid_log_formats.contains(&self.logging.format.as_str()) {
+            return Err(PulsoraError::Config(format!(
+                "Invalid log format '{}'. Valid options: {:?}",
+                self.logging.format, valid_log_formats
             )));
         }
 

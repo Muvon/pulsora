@@ -33,3 +33,7 @@ cache_size_mb = 256
 [logging]
 # Logging configuration
 level = "info"
+format = "pretty"  # "pretty" or "json"
+enable_access_logs = true
+enable_performance_logs = true
+# file_output = "/var/log/pulsora.log"  # Optional file output
