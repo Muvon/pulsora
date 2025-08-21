@@ -56,52 +56,119 @@ pub fn fast_parse_i64(s: &str) -> Option<i64> {
     Some(if negative { -result } else { result })
 }
 
-/// Encode an unsigned integer using variable-length encoding
+/// Encode an unsigned integer using variable-length encoding - optimized version
+#[inline(always)]
 pub fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+    // Fast path for common small values
+    if value < 128 {
+        output.push(value as u8);
+        return;
+    }
+
+    // Unroll the loop for better performance
     while value >= 0x80 {
+        output.push((value as u8) | 0x80);
+        value >>= 7;
+
+        if value < 0x80 {
+            output.push(value as u8);
+            return;
+        }
+
         output.push((value as u8) | 0x80);
         value >>= 7;
     }
     output.push(value as u8);
 }
 
-/// Decode an unsigned integer from variable-length encoding
+/// Decode an unsigned integer from variable-length encoding - optimized version
+#[inline(always)]
 pub fn decode_varint(input: &mut Cursor<&[u8]>) -> Result<u64> {
+    let pos = input.position() as usize;
+    let bytes = input.get_ref();
+
+    // Fast path for single byte (common case)
+    if pos < bytes.len() {
+        let first = bytes[pos];
+        if first < 0x80 {
+            input.set_position((pos + 1) as u64);
+            return Ok(first as u64);
+        }
+    }
+
     let mut result = 0u64;
     let mut shift = 0;
+    let mut idx = pos;
 
-    loop {
-        let mut byte = [0u8; 1];
-        input.read_exact(&mut byte)?;
+    // Unroll first few iterations for common cases
+    if idx < bytes.len() {
+        let byte = bytes[idx];
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte < 0x80 {
+            input.set_position((idx + 1) as u64);
+            return Ok(result);
+        }
+        shift += 7;
+        idx += 1;
+    } else {
+        return Err(PulsoraError::InvalidData(
+            "Unexpected end of varint".to_string(),
+        ));
+    }
 
+    if idx < bytes.len() {
+        let byte = bytes[idx];
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte < 0x80 {
+            input.set_position((idx + 1) as u64);
+            return Ok(result);
+        }
+        shift += 7;
+        idx += 1;
+    } else {
+        return Err(PulsoraError::InvalidData(
+            "Unexpected end of varint".to_string(),
+        ));
+    }
+
+    // Handle remaining bytes
+    while idx < bytes.len() {
         if shift >= 70 {
             return Err(PulsoraError::InvalidData("Varint too long".to_string()));
         }
 
-        let value = (byte[0] & 0x7F) as u64;
-        result |= value << shift;
+        let byte = bytes[idx];
+        result |= ((byte & 0x7F) as u64) << shift;
+        idx += 1;
 
-        if byte[0] & 0x80 == 0 {
-            break;
+        if byte < 0x80 {
+            input.set_position(idx as u64);
+            return Ok(result);
         }
 
         shift += 7;
     }
 
-    Ok(result)
+    Err(PulsoraError::InvalidData(
+        "Unexpected end of varint".to_string(),
+    ))
 }
 
-/// Encode a signed integer using zigzag encoding + varint
+/// Encode a signed integer using zigzag encoding + varint - optimized version
+#[inline(always)]
 pub fn encode_varint_signed(value: i64, output: &mut Vec<u8>) {
     // Zigzag encoding: positive numbers map to even, negative to odd
+    // Use arithmetic shift for sign extension
     let zigzag = ((value << 1) ^ (value >> 63)) as u64;
     encode_varint(zigzag, output);
 }
 
-/// Decode a signed integer from zigzag + varint encoding
+/// Decode a signed integer from zigzag + varint encoding - optimized version
+#[inline(always)]
 pub fn decode_varint_signed(input: &mut Cursor<&[u8]>) -> Result<i64> {
     let zigzag = decode_varint(input)?;
-    // Reverse zigzag encoding
+    // Reverse zigzag encoding using bit manipulation
+    // This avoids branching and is faster
     Ok(((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64))
 }
 

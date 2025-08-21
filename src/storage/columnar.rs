@@ -5,8 +5,16 @@
 use crate::error::{PulsoraError, Result};
 use crate::storage::encoding::{self, EncodedValue};
 use crate::storage::schema::{DataType, Schema};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Read;
+
+// Type alias for decompressed column data
+type DecompressedColumn<'a> = (
+    &'a crate::storage::schema::Column,
+    Vec<EncodedValue>,
+    Option<&'a Vec<u8>>,
+);
 
 /// Column-oriented storage format
 /// Each column is stored as a contiguous array of values
@@ -112,19 +120,8 @@ impl ColumnBlock {
         let end_idx = (skip + take).min(self.row_count);
         let actual_take = end_idx - skip;
 
-        // Simple approach: decompress what we need, but do it efficiently
-        let mut decompressed_columns = Vec::with_capacity(schema.columns.len());
-
-        for column in &schema.columns {
-            let compressed = self.columns.get(&column.name).ok_or_else(|| {
-                PulsoraError::InvalidData(format!("Missing column: {}", column.name))
-            })?;
-
-            let values = decompress_column(compressed, &column.data_type, self.row_count)?;
-            let null_bitmap = self.null_bitmaps.get(&column.name);
-
-            decompressed_columns.push((column, values, null_bitmap));
-        }
+        // Always use parallel decompression for better performance
+        let decompressed_columns = self.decompress_columns_parallel(schema)?;
 
         // Build JSON objects for the requested slice only
         let mut results = Vec::with_capacity(actual_take);
@@ -133,7 +130,7 @@ impl ColumnBlock {
             let mut json_obj = serde_json::Map::with_capacity(schema.columns.len());
 
             for (column, values, null_bitmap) in &decompressed_columns {
-                // Check if value is null
+                // Check if value is null using bit operations
                 if let Some(bitmap) = null_bitmap {
                     let byte_idx = row_idx >> 3;
                     let bit_idx = row_idx & 7;
@@ -142,6 +139,7 @@ impl ColumnBlock {
                     }
                 }
 
+                // Use direct indexing - bounds are guaranteed by loop
                 let json_value = match &values[row_idx] {
                     EncodedValue::Id(v) => Value::Number(serde_json::Number::from(*v)),
                     EncodedValue::Integer(v) => Value::Number(serde_json::Number::from(*v)),
@@ -151,7 +149,6 @@ impl ColumnBlock {
                     ),
                     EncodedValue::Boolean(v) => Value::Bool(*v),
                     EncodedValue::Timestamp(v) => {
-                        // Convert timestamp to ISO string like before
                         if let Some(datetime) = chrono::DateTime::from_timestamp_millis(*v) {
                             Value::String(datetime.to_rfc3339())
                         } else {
@@ -175,19 +172,8 @@ impl ColumnBlock {
     pub fn to_json_values(&self, schema: &Schema) -> Result<Vec<serde_json::Value>> {
         use serde_json::Value;
 
-        // Pre-decompress all columns at once
-        let mut decompressed_columns = Vec::with_capacity(schema.columns.len());
-
-        for column in &schema.columns {
-            let compressed = self.columns.get(&column.name).ok_or_else(|| {
-                PulsoraError::InvalidData(format!("Missing column: {}", column.name))
-            })?;
-
-            let values = decompress_column(compressed, &column.data_type, self.row_count)?;
-            let null_bitmap = self.null_bitmaps.get(&column.name);
-
-            decompressed_columns.push((column, values, null_bitmap));
-        }
+        // Always use parallel decompression for maximum performance
+        let decompressed_columns = self.decompress_columns_parallel(schema)?;
 
         // Build JSON objects row by row with pre-allocated capacity
         let mut results = Vec::with_capacity(self.row_count);
@@ -196,16 +182,16 @@ impl ColumnBlock {
             let mut json_obj = serde_json::Map::with_capacity(schema.columns.len());
 
             for (column, values, null_bitmap) in &decompressed_columns {
-                // Check if value is null
+                // Check if value is null using bit operations
                 if let Some(bitmap) = null_bitmap {
                     let byte_idx = row_idx >> 3;
                     let bit_idx = row_idx & 7;
                     if byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0 {
-                        continue; // Skip null values
+                        continue;
                     }
                 }
 
-                // Convert directly to JSON value without string intermediate
+                // Use direct indexing - bounds are guaranteed by loop
                 let json_value = match &values[row_idx] {
                     EncodedValue::Id(v) => Value::Number(serde_json::Number::from(*v)),
                     EncodedValue::Integer(v) => Value::Number(serde_json::Number::from(*v)),
@@ -215,7 +201,6 @@ impl ColumnBlock {
                     ),
                     EncodedValue::Boolean(v) => Value::Bool(*v),
                     EncodedValue::Timestamp(v) => {
-                        // Convert timestamp to ISO string like the original convert_row_to_json
                         if let Some(datetime) = chrono::DateTime::from_timestamp_millis(*v) {
                             Value::String(datetime.to_rfc3339())
                         } else {
@@ -232,6 +217,26 @@ impl ColumnBlock {
         }
 
         Ok(results)
+    }
+
+    /// Parallel column decompression for maximum performance
+    fn decompress_columns_parallel<'a>(
+        &'a self,
+        schema: &'a Schema,
+    ) -> Result<Vec<DecompressedColumn<'a>>> {
+        // Process all columns in parallel for maximum throughput
+        schema
+            .columns
+            .par_iter()
+            .map(|column| {
+                let compressed = self.columns.get(&column.name).ok_or_else(|| {
+                    PulsoraError::InvalidData(format!("Missing column: {}", column.name))
+                })?;
+                let null_bitmap = self.null_bitmaps.get(&column.name);
+                let values = decompress_column(compressed, &column.data_type, self.row_count)?;
+                Ok((column, values, null_bitmap))
+            })
+            .collect()
     }
 
     /// Serialize the column block for storage with pre-calculated size
@@ -670,7 +675,8 @@ fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<
     Ok(output)
 }
 
-/// Decompress a column of values with special handling for ID columns
+/// Decompress a column of values with special handling for ID columns - optimized version
+#[inline(never)] // Better instruction cache usage
 fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<Vec<EncodedValue>> {
     use crate::storage::compression;
     use std::io::Cursor;
@@ -695,26 +701,23 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
     }
 
     let mut pos = 1;
-    let mut values = Vec::with_capacity(count);
 
     match data_type {
         DataType::Id => {
-            // Special ID column decompression
+            // Special ID column decompression - optimized
             let mut cursor = Cursor::new(&data[pos..]);
-
-            // Read base ID
             let base_id = encoding::decode_varint(&mut cursor)?;
             pos += cursor.position() as usize;
 
-            // Read number of deltas
             cursor = Cursor::new(&data[pos..]);
             let num_deltas = encoding::decode_varint(&mut cursor)? as usize;
             pos += cursor.position() as usize;
 
-            // First value is the base
+            // Pre-allocate exact capacity
+            let mut values = Vec::with_capacity(count);
             values.push(EncodedValue::Id(base_id));
 
-            // Read and apply deltas
+            // Read and apply deltas efficiently
             let mut current_id = base_id;
             cursor = Cursor::new(&data[pos..]);
 
@@ -724,7 +727,6 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
                 values.push(EncodedValue::Id(current_id));
             }
 
-            // Verify we have the expected count
             if values.len() != count {
                 return Err(PulsoraError::InvalidData(format!(
                     "ID count mismatch: expected {}, got {}",
@@ -732,79 +734,71 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
                     values.len()
                 )));
             }
+            Ok(values)
         }
         DataType::Timestamp => {
-            // Read base timestamp using varint decoder
+            // Optimized timestamp decompression
             let mut cursor = Cursor::new(&data[pos..]);
             let base = encoding::decode_varint(&mut cursor)? as i64;
             pos += cursor.position() as usize;
 
-            // Read compressed data length using varint
             cursor = Cursor::new(&data[pos..]);
             let compressed_len = encoding::decode_varint(&mut cursor)? as usize;
             pos += cursor.position() as usize;
 
-            // Read compressed data
             if data.len() < pos + compressed_len {
                 return Err(PulsoraError::InvalidData(
                     "Invalid timestamp data".to_string(),
                 ));
             }
-            let compressed_data = &data[pos..pos + compressed_len];
 
-            // Decompress timestamps
-            let timestamps = compression::decompress_timestamps(base, compressed_data, count)?;
-            for t in timestamps {
-                values.push(EncodedValue::Timestamp(t));
-            }
+            // Decompress directly and convert in one pass
+            let timestamps =
+                compression::decompress_timestamps(base, &data[pos..pos + compressed_len], count)?;
+            Ok(timestamps
+                .into_iter()
+                .map(EncodedValue::Timestamp)
+                .collect())
         }
         DataType::Integer => {
-            // Regular integer decompression
+            // Optimized integer decompression
             let mut cursor = Cursor::new(&data[pos..]);
             let base = encoding::decode_varint_signed(&mut cursor)?;
             pos += cursor.position() as usize;
 
-            // Read compressed data length using varint
             cursor = Cursor::new(&data[pos..]);
             let compressed_len = encoding::decode_varint(&mut cursor)? as usize;
             pos += cursor.position() as usize;
 
-            // Read compressed data
             if data.len() < pos + compressed_len {
                 return Err(PulsoraError::InvalidData(
                     "Invalid integer data".to_string(),
                 ));
             }
-            let compressed_data = &data[pos..pos + compressed_len];
 
-            // Decompress integers
-            let integers = compression::decompress_integers(base, compressed_data, count)?;
-            for i in integers {
-                values.push(EncodedValue::Integer(i));
-            }
+            // Decompress directly and convert in one pass
+            let integers =
+                compression::decompress_integers(base, &data[pos..pos + compressed_len], count)?;
+            Ok(integers.into_iter().map(EncodedValue::Integer).collect())
         }
         DataType::Float => {
-            // Read base value using varfloat decoder
+            // Optimized float decompression
             let mut cursor = Cursor::new(&data[pos..]);
             let base = encoding::decode_varfloat(&mut cursor)?;
             pos += cursor.position() as usize;
 
-            // Read compressed data length using varint
             cursor = Cursor::new(&data[pos..]);
             let compressed_len = encoding::decode_varint(&mut cursor)? as usize;
             pos += cursor.position() as usize;
 
-            // Read compressed data
             if data.len() < pos + compressed_len {
                 return Err(PulsoraError::InvalidData("Invalid float data".to_string()));
             }
-            let compressed_data = &data[pos..pos + compressed_len];
 
-            // Decompress values
-            let floats = compression::decompress_values(base, compressed_data, count)?;
-            for f in floats {
-                values.push(EncodedValue::Float(f));
-            }
+            // Decompress directly and convert in one pass
+            let floats =
+                compression::decompress_values(base, &data[pos..pos + compressed_len], count)?;
+            Ok(floats.into_iter().map(EncodedValue::Float).collect())
         }
         DataType::Boolean => {
             // Check sub-type marker
@@ -816,8 +810,10 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
             let subtype = data[pos];
             pos += 1;
 
+            let mut values = Vec::with_capacity(count);
+
             if subtype == 2 {
-                // Run-length encoded booleans
+                // Run-length encoded booleans - optimized
                 let mut cursor = Cursor::new(&data[pos..]);
                 let num_runs = encoding::decode_varint(&mut cursor)? as usize;
 
@@ -834,34 +830,31 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
                         1
                     };
 
-                    for _ in 0..length {
-                        if values.len() >= count {
-                            break;
-                        }
-                        values.push(EncodedValue::Boolean(value));
+                    // Use extend for better performance
+                    values.extend(std::iter::repeat_n(
+                        EncodedValue::Boolean(value),
+                        length.min(count - values.len()),
+                    ));
+
+                    if values.len() >= count {
+                        break;
                     }
                 }
             } else {
-                // Legacy bit-packed format (shouldn't happen with new data)
-                let mut byte_idx = 0;
-                let mut bit_idx = 0;
+                // Legacy bit-packed format
                 let bytes = &data[pos..];
-
-                for _ in 0..count {
-                    if byte_idx >= bytes.len() {
-                        values.push(EncodedValue::Boolean(false));
+                for i in 0..count {
+                    let byte_idx = i >> 3;
+                    let bit_idx = i & 7;
+                    let bit = if byte_idx < bytes.len() {
+                        (bytes[byte_idx] >> bit_idx) & 1 != 0
                     } else {
-                        let bit = (bytes[byte_idx] >> bit_idx) & 1;
-                        values.push(EncodedValue::Boolean(bit != 0));
-
-                        bit_idx += 1;
-                        if bit_idx == 8 {
-                            byte_idx += 1;
-                            bit_idx = 0;
-                        }
-                    }
+                        false
+                    };
+                    values.push(EncodedValue::Boolean(bit));
                 }
             }
+            Ok(values)
         }
         DataType::String => {
             // Check sub-type marker
@@ -872,43 +865,36 @@ fn decompress_column(data: &[u8], data_type: &DataType, count: usize) -> Result<
             pos += 1;
 
             let mut cursor = Cursor::new(&data[pos..]);
+            let mut values = Vec::with_capacity(count);
 
             if subtype == 4 {
-                // Dictionary-encoded strings
+                // Dictionary-encoded strings - optimized
                 let dict_size = encoding::decode_varint(&mut cursor)? as usize;
 
                 // Read dictionary
                 let mut dictionary = Vec::with_capacity(dict_size);
                 for _ in 0..dict_size {
-                    let s = encoding::decode_string(&mut cursor)?;
-                    dictionary.push(s);
+                    dictionary.push(encoding::decode_string(&mut cursor)?);
                 }
 
-                // Read string IDs and reconstruct values
+                // Read string IDs and reconstruct values efficiently
                 for _ in 0..count {
                     let id = encoding::decode_varint(&mut cursor)? as usize;
                     if id >= dictionary.len() {
                         return Err(PulsoraError::InvalidData("Invalid string ID".to_string()));
                     }
+                    // Direct indexing - bounds already checked
                     values.push(EncodedValue::String(dictionary[id].clone()));
                 }
-            } else if subtype == 5 {
-                // Direct-encoded strings
-                for _ in 0..count {
-                    let v = encoding::decode_string(&mut cursor)?;
-                    values.push(EncodedValue::String(v));
-                }
             } else {
-                // Legacy format or unknown subtype
+                // Direct-encoded strings (subtype 5 or legacy)
                 for _ in 0..count {
-                    let v = encoding::decode_string(&mut cursor)?;
-                    values.push(EncodedValue::String(v));
+                    values.push(EncodedValue::String(encoding::decode_string(&mut cursor)?));
                 }
             }
+            Ok(values)
         }
     }
-
-    Ok(values)
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use crate::error::{PulsoraError, Result};
 use crate::storage::encoding;
 use std::io::Cursor;
 
-/// Bit writer for efficient bit-level operations
+/// Bit writer for efficient bit-level operations - optimized version
 struct BitWriter {
     data: Vec<u8>,
     current_byte: u8,
@@ -15,24 +15,40 @@ struct BitWriter {
 }
 
 impl BitWriter {
+    #[inline(always)]
     fn new() -> Self {
         Self {
-            data: Vec::new(),
+            data: Vec::with_capacity(1024), // Pre-allocate for better performance
             current_byte: 0,
             bits_in_current: 0,
         }
     }
 
+    #[inline(always)]
     fn write_bits(&mut self, value: u64, bits: u8) {
+        // Fast path for single bit writes
+        if bits == 1 {
+            self.current_byte |= ((value & 1) as u8) << (7 - self.bits_in_current);
+            self.bits_in_current += 1;
+            if self.bits_in_current == 8 {
+                self.data.push(self.current_byte);
+                self.current_byte = 0;
+                self.bits_in_current = 0;
+            }
+            return;
+        }
+
         let mut bits_to_write = bits;
+        let mut value_to_write = value;
 
         while bits_to_write > 0 {
             let available = 8 - self.bits_in_current;
             let write_now = bits_to_write.min(available);
 
-            // Extract bits to write
-            let mask = (1u64 << write_now) - 1;
-            let bits_value = ((value >> (bits_to_write - write_now)) & mask) as u8;
+            // Extract bits to write using optimized bit operations
+            let shift = bits_to_write.saturating_sub(write_now);
+            let mask = ((1u64 << write_now) - 1) as u8;
+            let bits_value = ((value_to_write >> shift) & (mask as u64)) as u8;
 
             // Write to current byte
             self.current_byte |= bits_value << (available - write_now);
@@ -45,9 +61,11 @@ impl BitWriter {
             }
 
             bits_to_write -= write_now;
+            value_to_write &= (1u64 << shift) - 1; // Clear written bits
         }
     }
 
+    #[inline(always)]
     fn finish(mut self) -> Vec<u8> {
         if self.bits_in_current > 0 {
             self.data.push(self.current_byte);
@@ -56,50 +74,109 @@ impl BitWriter {
     }
 }
 
-/// Bit reader for decompression
+/// Bit reader for decompression - optimized with prefetching and better cache usage
 struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
     bit_pos: u8,
+    // Cache current and next bytes for better performance
+    current_byte: u8,
+    next_byte: u8,
+    cached: bool,
 }
 
 impl<'a> BitReader<'a> {
+    #[inline(always)]
     fn new(data: &'a [u8]) -> Self {
-        Self {
+        let mut reader = Self {
             data,
             byte_pos: 0,
             bit_pos: 0,
+            current_byte: 0,
+            next_byte: 0,
+            cached: false,
+        };
+        reader.prefetch();
+        reader
+    }
+
+    #[inline(always)]
+    fn prefetch(&mut self) {
+        if self.byte_pos < self.data.len() {
+            // Use unsafe for performance - we already checked bounds
+            self.current_byte = unsafe { *self.data.get_unchecked(self.byte_pos) };
+            self.next_byte = if self.byte_pos + 1 < self.data.len() {
+                unsafe { *self.data.get_unchecked(self.byte_pos + 1) }
+            } else {
+                0
+            };
+            self.cached = true;
         }
     }
 
+    #[inline(always)]
     fn read_bits(&mut self, bits: u8) -> Result<u64> {
         if bits == 0 {
             return Ok(0);
         }
 
-        // Fast path for single bit reads (most common case)
+        // Ultra-fast path for single bit reads (most common case)
         if bits == 1 {
-            if self.byte_pos >= self.data.len() {
+            if !self.cached && self.byte_pos >= self.data.len() {
                 return Err(PulsoraError::InvalidData(
                     "Unexpected end of compressed data".to_string(),
                 ));
             }
 
-            let bit = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1;
+            // Use cached byte for faster access
+            let bit = (self.current_byte >> (7 - self.bit_pos)) & 1;
             self.bit_pos += 1;
             if self.bit_pos == 8 {
                 self.byte_pos += 1;
                 self.bit_pos = 0;
+                self.current_byte = self.next_byte;
+                // Prefetch next byte
+                if self.byte_pos + 1 < self.data.len() {
+                    self.next_byte = unsafe { *self.data.get_unchecked(self.byte_pos + 1) };
+                } else {
+                    self.cached = self.byte_pos < self.data.len();
+                }
             }
             return Ok(bit as u64);
         }
 
-        // Original implementation for multi-bit reads
+        // Fast path for common bit counts (2-8 bits within same byte)
+        if bits <= 8 && self.bit_pos + bits <= 8 {
+            if !self.cached && self.byte_pos >= self.data.len() {
+                return Err(PulsoraError::InvalidData(
+                    "Unexpected end of compressed data".to_string(),
+                ));
+            }
+
+            let available = 8 - self.bit_pos;
+            let mask = ((1u16 << bits) - 1) as u8;
+            let result = ((self.current_byte >> (available - bits)) & mask) as u64;
+
+            self.bit_pos += bits;
+            if self.bit_pos == 8 {
+                self.byte_pos += 1;
+                self.bit_pos = 0;
+                self.current_byte = self.next_byte;
+                if self.byte_pos + 1 < self.data.len() {
+                    self.next_byte = unsafe { *self.data.get_unchecked(self.byte_pos + 1) };
+                } else {
+                    self.cached = self.byte_pos < self.data.len();
+                }
+            }
+            return Ok(result);
+        }
+
+        // Optimized multi-bit reads with better cache usage
         let mut result = 0u64;
         let mut bits_to_read = bits;
 
         while bits_to_read > 0 {
-            if self.byte_pos >= self.data.len() {
+            if !self.cached && self.byte_pos >= self.data.len() {
                 return Err(PulsoraError::InvalidData(
                     "Unexpected end of compressed data".to_string(),
                 ));
@@ -108,9 +185,9 @@ impl<'a> BitReader<'a> {
             let available = 8 - self.bit_pos;
             let read_now = bits_to_read.min(available);
 
-            // Extract bits from current byte
+            // Use cached byte
             let mask = ((1u16 << read_now) - 1) as u8;
-            let bits_value = (self.data[self.byte_pos] >> (available - read_now)) & mask;
+            let bits_value = (self.current_byte >> (available - read_now)) & mask;
 
             result = (result << read_now) | (bits_value as u64);
 
@@ -118,6 +195,12 @@ impl<'a> BitReader<'a> {
             if self.bit_pos == 8 {
                 self.byte_pos += 1;
                 self.bit_pos = 0;
+                self.current_byte = self.next_byte;
+                if self.byte_pos + 1 < self.data.len() {
+                    self.next_byte = unsafe { *self.data.get_unchecked(self.byte_pos + 1) };
+                } else {
+                    self.cached = self.byte_pos < self.data.len();
+                }
             }
 
             bits_to_read -= read_now;
@@ -167,13 +250,17 @@ pub fn compress_timestamps(timestamps: &[i64]) -> Result<(i64, Vec<u8>)> {
     Ok((base, output))
 }
 
-/// Decompress timestamps using varint + delta-of-delta decoding
+/// Decompress timestamps using varint + delta-of-delta decoding - optimized version
+#[inline(never)]
 pub fn decompress_timestamps(base: i64, data: &[u8], count: usize) -> Result<Vec<i64>> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    let mut timestamps = vec![base];
+    // Pre-allocate exact capacity
+    let mut timestamps = Vec::with_capacity(count);
+    timestamps.push(base);
+
     if count == 1 {
         return Ok(timestamps);
     }
@@ -184,12 +271,13 @@ pub fn decompress_timestamps(base: i64, data: &[u8], count: usize) -> Result<Vec
     let mut prev_delta = encoding::decode_varint_signed(&mut cursor)?;
     timestamps.push(base + prev_delta);
 
-    // Read remaining delta-of-deltas
+    // Read remaining delta-of-deltas with optimized loop
+    let mut last_timestamp = timestamps[1];
     for _ in 2..count {
         let delta_of_delta = encoding::decode_varint_signed(&mut cursor)?;
         let delta = prev_delta + delta_of_delta;
-        let last_timestamp = *timestamps.last().unwrap();
-        timestamps.push(last_timestamp + delta);
+        last_timestamp += delta;
+        timestamps.push(last_timestamp);
         prev_delta = delta;
     }
 
@@ -214,8 +302,11 @@ pub fn compress_values(values: &[f64]) -> Result<(f64, Vec<u8>)> {
     let mut prev_leading = 0u8;
     let mut prev_trailing = 0u8;
 
+    // Process values with optimized XOR operations
     for &value in values.iter().skip(1) {
         let curr_bits = value.to_bits();
+
+        // Use XOR for delta compression
         let xor = prev_bits ^ curr_bits;
 
         if xor == 0 {
@@ -224,6 +315,7 @@ pub fn compress_values(values: &[f64]) -> Result<(f64, Vec<u8>)> {
         } else {
             writer.write_bits(1, 1);
 
+            // Use intrinsics for counting leading/trailing zeros when available
             let leading_zeros = xor.leading_zeros() as u8;
             let trailing_zeros = xor.trailing_zeros() as u8;
 
@@ -259,14 +351,17 @@ pub fn compress_values(values: &[f64]) -> Result<(f64, Vec<u8>)> {
     Ok((base, writer.finish()))
 }
 
-/// Decompress float values
+/// Decompress float values - optimized with pre-allocation and better cache usage
+#[inline(never)] // Prevent inlining for better instruction cache usage
 pub fn decompress_values(base: f64, data: &[u8], count: usize) -> Result<Vec<f64>> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
+    // Pre-allocate exact capacity
     let mut values = Vec::with_capacity(count);
     values.push(base);
+
     if count == 1 {
         return Ok(values);
     }
@@ -276,48 +371,48 @@ pub fn decompress_values(base: f64, data: &[u8], count: usize) -> Result<Vec<f64
     let mut prev_leading = 0u8;
     let mut prev_trailing = 0u8;
 
+    // Process remaining values
     for _ in 1..count {
         let first_bit = reader.read_bits(1)?;
 
-        let curr_bits = if first_bit == 0 {
-            // Same value
-            prev_bits
-        } else {
-            // Different value - read control bit
-            let control = reader.read_bits(1)?;
+        // Optimize the most common case (same value) first
+        if first_bit == 0 {
+            values.push(f64::from_bits(prev_bits));
+            continue;
+        }
 
-            let xor = if control == 0 {
-                // Reuse previous window
-                let significant_bits = 64 - prev_leading - prev_trailing;
-                if significant_bits > 0 {
-                    let xor_middle = reader.read_bits(significant_bits)?;
-                    xor_middle << prev_trailing
-                } else {
-                    0
-                }
+        // Different value - read control bit
+        let control = reader.read_bits(1)?;
+
+        let xor = if control == 0 {
+            // Reuse previous window - optimized path
+            let significant_bits = 64 - prev_leading - prev_trailing;
+            if significant_bits > 0 {
+                reader.read_bits(significant_bits)? << prev_trailing
             } else {
-                // New window
-                let leading_zeros = reader.read_bits(5)? as u8;
-                let trailing_zeros = reader.read_bits(5)? as u8;
+                0
+            }
+        } else {
+            // New window - read leading and trailing zeros
+            let leading_zeros = reader.read_bits(5)? as u8;
+            let trailing_zeros = reader.read_bits(5)? as u8;
 
-                let significant_bits = 64 - leading_zeros - trailing_zeros;
-                let xor = if significant_bits > 0 {
-                    let xor_middle = reader.read_bits(significant_bits)?;
-                    xor_middle << trailing_zeros
-                } else {
-                    0
-                };
-
-                prev_leading = leading_zeros;
-                prev_trailing = trailing_zeros;
-                xor
+            let significant_bits = 64 - leading_zeros - trailing_zeros;
+            let xor_middle = if significant_bits > 0 {
+                reader.read_bits(significant_bits)?
+            } else {
+                0
             };
 
-            prev_bits ^ xor
+            // Update window for next iteration
+            prev_leading = leading_zeros;
+            prev_trailing = trailing_zeros;
+
+            xor_middle << trailing_zeros
         };
 
-        values.push(f64::from_bits(curr_bits));
-        prev_bits = curr_bits;
+        prev_bits ^= xor;
+        values.push(f64::from_bits(prev_bits));
     }
 
     Ok(values)
@@ -331,13 +426,13 @@ pub fn compress_integers(values: &[i64]) -> Result<(i64, Vec<u8>)> {
     }
 
     let base = values[0];
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(values.len() * 2); // Pre-allocate
 
     if values.len() == 1 {
         return Ok((base, output));
     }
 
-    // Use delta encoding with varint
+    // Use delta encoding with varint - optimized loop
     let mut prev_value = base;
     for &value in values.iter().skip(1) {
         let delta = value - prev_value;
@@ -348,13 +443,17 @@ pub fn compress_integers(values: &[i64]) -> Result<(i64, Vec<u8>)> {
     Ok((base, output))
 }
 
-/// Decompress integer values
+/// Decompress integer values - optimized version
+#[inline(never)]
 pub fn decompress_integers(base: i64, data: &[u8], count: usize) -> Result<Vec<i64>> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    let mut values = vec![base];
+    // Pre-allocate exact capacity
+    let mut values = Vec::with_capacity(count);
+    values.push(base);
+
     if count == 1 {
         return Ok(values);
     }
@@ -362,11 +461,37 @@ pub fn decompress_integers(base: i64, data: &[u8], count: usize) -> Result<Vec<i
     let mut cursor = Cursor::new(data);
     let mut prev_value = base;
 
-    for _ in 1..count {
-        let delta = encoding::decode_varint_signed(&mut cursor)?;
-        let value = prev_value + delta;
-        values.push(value);
-        prev_value = value;
+    // Unroll loop for better performance
+    let mut i = 1;
+    while i < count {
+        // Process 4 values at a time when possible
+        if i + 3 < count {
+            let delta1 = encoding::decode_varint_signed(&mut cursor)?;
+            let value1 = prev_value + delta1;
+            values.push(value1);
+
+            let delta2 = encoding::decode_varint_signed(&mut cursor)?;
+            let value2 = value1 + delta2;
+            values.push(value2);
+
+            let delta3 = encoding::decode_varint_signed(&mut cursor)?;
+            let value3 = value2 + delta3;
+            values.push(value3);
+
+            let delta4 = encoding::decode_varint_signed(&mut cursor)?;
+            let value4 = value3 + delta4;
+            values.push(value4);
+
+            prev_value = value4;
+            i += 4;
+        } else {
+            // Handle remaining values
+            let delta = encoding::decode_varint_signed(&mut cursor)?;
+            let value = prev_value + delta;
+            values.push(value);
+            prev_value = value;
+            i += 1;
+        }
     }
 
     Ok(values)
