@@ -1,62 +1,132 @@
 # Pulsora
 
-**The fastest and easiest time-series database with columnar storage**
+**High-performance time-series database with columnar storage and advanced compression**
 
-Pulsora is a high-performance time-series database built with Rust, featuring columnar storage, advanced compression, dynamic schema inference, and sub-millisecond query performance.
+Pulsora is a Rust-based time-series database optimized for market data and time-ordered datasets. It features columnar storage, type-specific compression algorithms, dynamic schema inference, and sub-millisecond query performance.
 
 ## Quick Start
 
 ```bash
-# Start the server in background
-cargo run &
+# Start the server
+cargo run
 
-# Or build and run the binary
+# Or with custom configuration
+cargo run -- -c pulsora.toml
+
+# Build and run release version
 cargo build --release
-./target/release/pulsora &
+./target/release/pulsora
 
 # Ingest CSV data
-curl -X POST http://localhost:8080/ingest/stocks \
+curl -X POST http://localhost:8080/tables/stocks/ingest \
   -H "Content-Type: text/csv" \
   --data-binary @data.csv
 
-# Query data
-curl "http://localhost:8080/query/stocks?start=2024-01-01T10:00:00&limit=100"
+# Query data with time range
+curl "http://localhost:8080/tables/stocks/query?start=2024-01-01T10:00:00&limit=100"
 
-# Stop the server
-pkill pulsora
+# Get table schema
+curl "http://localhost:8080/tables/stocks/schema"
+
+# Health check
+curl "http://localhost:8080/health"
 ```
 
 ## Key Features
 
-- **🚀 High Performance**: 100K+ rows/s ingestion, sub-ms queries with block caching
-- **📊 Columnar Storage**: 2-10x compression with type-specific algorithms
-- **⚡ Advanced Compression**: Gorilla (XOR), delta-of-delta, varint encoding
-- **🔍 Time-Series Optimized**: Efficient range queries with binary key encoding
-- **📈 Block-based Architecture**: Reduced I/O with intelligent caching
+- **🚀 High Performance**: 350K+ rows/s ingestion, sub-ms queries with intelligent caching
+- **📊 Columnar Storage**: Block-based architecture with 2-10x compression ratios
+- **⚡ Advanced Compression**: Gorilla (XOR), delta-of-delta, varint, dictionary encoding
+- **🔍 Time-Series Optimized**: Binary key encoding for efficient range queries
+- **📈 Block Caching**: Intelligent decompression caching for query performance
 - **🛠️ Simple API**: RESTful HTTP interface with automatic schema inference
+- **🔧 Dynamic Schema**: Automatic type detection and validation
+- **⚙️ Configurable**: TOML-based configuration with performance tuning options
 
 ## Architecture
 
-- **Storage**: RocksDB with columnar blocks and binary keys (`table_hash:timestamp:row_id`)
-- **Compression**: Type-specific algorithms (Gorilla, delta-of-delta, varint, dictionary)
-- **Server**: Axum/Tokio async HTTP server with block caching
-- **Configuration**: TOML-based with performance-optimized defaults
-- **Schema**: Dynamic inference with automatic timestamp detection
+- **Storage Engine**: RocksDB with columnar blocks and binary keys (`table_hash:timestamp:row_id`)
+- **Compression**: Type-specific algorithms (Gorilla XOR, delta-of-delta, varint, dictionary)
+- **HTTP Server**: Axum/Tokio async server with CORS support and structured logging
+- **Configuration**: TOML-based with comprehensive performance tuning options
+- **Schema Management**: Dynamic inference with automatic timestamp detection and validation
+- **ID Management**: Unique row ID generation with collision detection
+
+## Data Types
+
+Pulsora automatically infers and validates these data types:
+
+- **Integer**: Whole numbers with delta + varint compression
+- **Float**: Decimal numbers with XOR (Gorilla) + varfloat compression
+- **String**: Text data with dictionary encoding for repetitive values
+- **Boolean**: True/false values with run-length encoding
+- **Timestamp**: Various datetime formats with delta-of-delta compression
 
 ## Documentation
 
-- **[API Reference](docs/API.md)** - HTTP endpoints and usage
-- **[Configuration](docs/CONFIGURATION.md)** - Server and storage settings
-- **[Architecture](docs/ARCHITECTURE.md)** - System design and components
-- **[Benchmarks](docs/BENCH.md)** - Performance testing and results
+- **[API Reference](doc/API.md)** - HTTP endpoints and usage examples
+- **[Configuration](doc/CONFIGURATION.md)** - Server and storage settings
+- **[Architecture](doc/ARCHITECTURE.md)** - System design and implementation details
+- **[Development](doc/DEVELOPMENT.md)** - Setup and contribution guide
+- **[Benchmarks](doc/BENCH.md)** - Performance testing and results
 
-## Performance
+## Performance Characteristics
 
-| Operation | Throughput | Latency |
-|-----------|------------|---------|
-| CSV Ingestion | 350K+ rows/s | ~3ms/1K rows |
-| Range Queries | 7M+ ops/s | <1ms |
-| Full Table Scan | 12M+ rows/s | ~800µs |
+Based on comprehensive benchmarks:
+
+| Operation | Throughput | Compression | Notes |
+|-----------|------------|-------------|-------|
+| CSV Ingestion | 350K+ rows/s | 2-10x | Type-specific algorithms |
+| Range Queries | 7M+ ops/s | - | With block caching |
+| Full Table Scan | 12M+ rows/s | - | Columnar decompression |
+| Timestamp Compression | 5-10x | Delta-of-delta + varint | Regular intervals |
+| Float Compression | 2-5x | XOR (Gorilla) + varfloat | Slowly changing values |
+| Integer Compression | 3-8x | Delta + varint | Sequential/counter data |
+
+## Configuration
+
+Pulsora uses TOML configuration with performance-optimized defaults:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[storage]
+data_dir = "./data"
+write_buffer_size_mb = 64
+max_open_files = 1000
+
+[ingestion]
+max_csv_size_mb = 512
+batch_size = 10000
+
+[performance]
+compression = "lz4"
+cache_size_mb = 256
+
+[logging]
+level = "info"
+format = "pretty"
+enable_access_logs = true
+enable_performance_logs = true
+```
+
+## Development
+
+```bash
+# Development setup
+cargo build
+cargo test
+cargo bench
+
+# Code quality
+cargo fmt
+cargo clippy
+
+# Run with debug logging
+RUST_LOG=debug cargo run
+```
 
 ## License
 
