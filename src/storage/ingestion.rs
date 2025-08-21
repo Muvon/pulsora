@@ -18,11 +18,12 @@ use crate::storage::schema::Schema;
 pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
     let headers = reader.headers()?.clone();
+    let header_count = headers.len();
     let mut rows = Vec::new();
 
     for result in reader.records() {
         let record = result?;
-        let mut row = HashMap::new();
+        let mut row = HashMap::with_capacity(header_count); // Pre-allocate capacity
 
         for (i, field) in record.iter().enumerate() {
             if let Some(header) = headers.get(i) {
@@ -53,7 +54,7 @@ pub fn insert_rows(
     // Get ID manager for this table
     let id_manager = id_managers.get_or_create(table)?;
 
-    // Process rows and assign IDs
+    // Process rows and assign IDs with pre-allocation
     let mut processed_rows = Vec::with_capacity(rows.len());
     for mut row in rows {
         // Handle ID assignment
@@ -92,12 +93,8 @@ pub fn insert_rows(
 
     // Process each chunk as a column block
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        // Extract just the row data for column block creation
-        let chunk_rows: Vec<HashMap<String, String>> =
-            chunk.iter().map(|(_, row)| row.clone()).collect();
-
         // Create column block for this chunk
-        let column_block = ColumnBlock::from_rows(&chunk_rows, schema)?;
+        let column_block = ColumnBlock::from_rows(chunk, schema)?;
         let serialized_block = column_block.serialize()?;
 
         let mut batch = WriteBatch::default();

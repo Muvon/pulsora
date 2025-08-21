@@ -6,6 +6,56 @@
 use crate::error::{PulsoraError, Result};
 use std::io::{Cursor, Read};
 
+/// Fast unsigned integer parsing without error overhead
+#[inline(always)]
+pub fn fast_parse_u64(s: &str) -> Option<u64> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut result = 0u64;
+    for &b in bytes {
+        let digit = b.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        result = result.wrapping_mul(10).wrapping_add(digit as u64);
+    }
+    Some(result)
+}
+
+/// Fast signed integer parsing without error overhead
+#[inline(always)]
+pub fn fast_parse_i64(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut result = 0i64;
+    let mut negative = false;
+    let mut i = 0;
+
+    if bytes[0] == b'-' {
+        negative = true;
+        i = 1;
+    } else if bytes[0] == b'+' {
+        i = 1;
+    }
+
+    while i < bytes.len() {
+        let digit = bytes[i].wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        result = result.wrapping_mul(10).wrapping_add(digit as i64);
+        i += 1;
+    }
+
+    Some(if negative { -result } else { result })
+}
+
 /// Encode an unsigned integer using variable-length encoding
 pub fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
     while value >= 0x80 {

@@ -4,7 +4,7 @@
 //! for efficient retrieval of time-series data from RocksDB.
 
 use chrono::DateTime;
-use rocksdb::{Direction, IteratorMode, DB};
+use rocksdb::{Direction, IteratorMode, ReadOptions, DB};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,15 +24,20 @@ pub fn get_row_by_id(
     // Generate primary key for direct ID lookup
     let id_key = generate_id_key(table, id);
 
+    // Use optimized read options for faster access
+    let mut read_opts = ReadOptions::default();
+    read_opts.set_verify_checksums(false); // Skip checksum verification for speed
+    read_opts.fill_cache(true); // Use block cache
+
     // Try to find the row reference
-    match db.get(&id_key)? {
+    match db.get_opt(&id_key, &read_opts)? {
         Some(ref_data) => {
             // Parse the reference data to get block ID and row index
             let (block_id, row_idx) = parse_reference_data(&ref_data)?;
 
-            // Load the block
+            // Load the block with optimized read
             let block_data = db
-                .get(&block_id)?
+                .get_opt(&block_id, &read_opts)?
                 .ok_or_else(|| PulsoraError::Query("Block not found".to_string()))?;
 
             // Deserialize the column block
@@ -120,30 +125,41 @@ pub fn execute_query(
     let start_key = build_range_key(table, start.as_deref(), true)?;
     let end_key = build_range_key(table, end.as_deref(), false)?;
 
-    let limit = limit.unwrap_or(1000).min(10000); // Cap at 10k rows for safety
+    let limit = limit.unwrap_or(1000).min(10000);
     let offset = offset.unwrap_or(0);
 
-    let mut results = Vec::new();
+    // Optimized read options for faster sequential scans
+    let mut iter_opts = ReadOptions::default();
+    iter_opts.set_verify_checksums(false);
+    iter_opts.fill_cache(true);
+    iter_opts.set_readahead_size(2 * 1024 * 1024);
+
+    // Structure to hold block data and row indices
+    struct BlockRequest {
+        block_id: Vec<u8>,
+        row_indices: Vec<usize>,
+    }
+
+    let mut blocks_to_fetch: HashMap<Vec<u8>, BlockRequest> = HashMap::new();
+    let mut request_order: Vec<(Vec<u8>, usize)> = Vec::with_capacity(limit);
+
+    let table_hash = calculate_table_hash(table);
+    let iter = db.iterator_opt(
+        IteratorMode::From(&start_key, Direction::Forward),
+        iter_opts,
+    );
+
+    // First pass: collect row references
     let mut count = 0;
     let mut skipped = 0;
 
-    // Group row requests by block ID for batch processing
-    let mut block_requests: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    let mut request_order: Vec<(Vec<u8>, usize)> = Vec::new(); // Preserve order
-    let mut direct_results: Vec<Value> = Vec::new();
-
-    // Create iterator for range scan
-    let table_hash = calculate_table_hash(table);
-    let iter = db.iterator(IteratorMode::From(&start_key, Direction::Forward));
-
-    // First pass: collect and group row requests by block
     for item in iter {
         let (key, value) = match item {
             Ok((k, v)) => (k, v),
             Err(_) => continue,
         };
 
-        // Check if key belongs to our table (first 4 bytes = table hash)
+        // Fast table hash check
         if key.len() < 4 {
             continue;
         }
@@ -152,7 +168,7 @@ pub fn execute_query(
             break;
         }
 
-        // Check end boundary if specified
+        // Check end boundary
         if !end_key.is_empty() && key.as_ref() > end_key.as_slice() {
             break;
         }
@@ -168,113 +184,120 @@ pub fn execute_query(
             break;
         }
 
-        // Check if this is a reference or direct data
+        // Parse reference data inline for speed
         if !value.is_empty() && value[0] == 0xFF {
-            // This is a reference to a block
-            let mut pos = 1;
-
-            // Read block ID length
-            if value.len() < pos + 4 {
-                tracing::warn!("Invalid reference data");
+            if value.len() < 9 {
                 continue;
             }
+
             let block_id_len =
-                u32::from_le_bytes([value[pos], value[pos + 1], value[pos + 2], value[pos + 3]])
-                    as usize;
-            pos += 4;
-
-            // Read block ID
-            if value.len() < pos + block_id_len {
-                tracing::warn!("Invalid reference data");
+                u32::from_le_bytes([value[1], value[2], value[3], value[4]]) as usize;
+            if value.len() < 9 + block_id_len {
                 continue;
             }
-            let block_id = value[pos..pos + block_id_len].to_vec();
-            pos += block_id_len;
 
-            // Read row index
-            if value.len() < pos + 4 {
-                tracing::warn!("Invalid reference data");
-                continue;
-            }
-            let row_idx =
-                u32::from_le_bytes([value[pos], value[pos + 1], value[pos + 2], value[pos + 3]])
-                    as usize;
+            let block_id = value[5..5 + block_id_len].to_vec();
+            let row_idx = u32::from_le_bytes([
+                value[5 + block_id_len],
+                value[6 + block_id_len],
+                value[7 + block_id_len],
+                value[8 + block_id_len],
+            ]) as usize;
 
-            // Group by block ID
-            block_requests
+            // Track request order and group by block
+            request_order.push((block_id.clone(), row_idx));
+
+            blocks_to_fetch
                 .entry(block_id.clone())
-                .or_default()
+                .or_insert_with(|| BlockRequest {
+                    block_id: block_id.clone(),
+                    row_indices: Vec::new(),
+                })
+                .row_indices
                 .push(row_idx);
-            request_order.push((block_id, row_idx));
+
             count += 1;
-        } else {
-            // Try as direct column block (shouldn't happen in normal flow)
-            match ColumnBlock::deserialize(&value) {
-                Ok(block) => match block.to_rows(schema) {
-                    Ok(rows) => {
-                        for row in rows {
-                            if direct_results.len() >= limit - request_order.len() {
-                                break;
+        }
+    }
+
+    // Early return if no results
+    if request_order.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Create read options for fetching blocks
+    let mut fetch_opts = ReadOptions::default();
+    fetch_opts.set_verify_checksums(false);
+    fetch_opts.fill_cache(true);
+
+    // Second pass: fetch and process blocks directly to JSON
+    let mut block_json_cache: HashMap<Vec<u8>, Vec<Value>> = HashMap::new();
+
+    // Determine if we should use parallel processing
+    let use_parallel = blocks_to_fetch.len() > 2 && cfg!(feature = "parallel");
+
+    if use_parallel {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+
+            let json_blocks: Vec<_> = blocks_to_fetch
+                .values()
+                .par_bridge()
+                .filter_map(|req| {
+                    // Create read options per thread
+                    let mut thread_opts = ReadOptions::default();
+                    thread_opts.set_verify_checksums(false);
+                    thread_opts.fill_cache(true);
+
+                    match db.get_opt(&req.block_id, &thread_opts) {
+                        Ok(Some(block_data)) => {
+                            match ColumnBlock::deserialize(&block_data) {
+                                Ok(block) => {
+                                    // Use the new optimized direct-to-JSON method
+                                    match block.to_json_values(schema) {
+                                        Ok(json_values) => {
+                                            Some((req.block_id.clone(), json_values))
+                                        }
+                                        Err(_) => None,
+                                    }
+                                }
+                                Err(_) => None,
                             }
-                            let json_row = convert_row_to_json(&row, schema)?;
-                            direct_results.push(json_row);
                         }
+                        _ => None,
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to deserialize column block: {}", e);
-                        continue;
+                })
+                .collect();
+
+            for (block_id, json_values) in json_blocks {
+                block_json_cache.insert(block_id, json_values);
+            }
+        }
+    } else {
+        // Sequential processing for small queries
+        for req in blocks_to_fetch.values() {
+            if let Ok(Some(block_data)) = db.get_opt(&req.block_id, &fetch_opts) {
+                if let Ok(block) = ColumnBlock::deserialize(&block_data) {
+                    // Use the new optimized direct-to-JSON method
+                    if let Ok(json_values) = block.to_json_values(schema) {
+                        block_json_cache.insert(req.block_id.clone(), json_values);
                     }
-                },
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize data: {}", e);
-                    continue;
                 }
             }
         }
     }
 
-    // Second pass: batch fetch blocks and extract rows
-    let mut block_cache: HashMap<Vec<u8>, Vec<HashMap<String, String>>> = HashMap::new();
+    // Third pass: extract results in original order
+    let mut results = Vec::with_capacity(request_order.len());
 
-    // Fetch unique blocks in batch
-    for block_id in block_requests.keys() {
-        if !block_cache.contains_key(block_id) {
-            match db.get(block_id) {
-                Ok(Some(block_data)) => match ColumnBlock::deserialize(&block_data) {
-                    Ok(block) => match block.to_rows(schema) {
-                        Ok(rows) => {
-                            block_cache.insert(block_id.clone(), rows);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to deserialize column block: {}", e);
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!("Failed to deserialize column block: {}", e);
-                    }
-                },
-                Ok(None) => {
-                    tracing::warn!("Column block not found");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to fetch column block: {}", e);
-                }
-            }
-        }
-    }
-
-    // Third pass: extract rows in original order
     for (block_id, row_idx) in request_order {
-        if let Some(rows) = block_cache.get(&block_id) {
-            if row_idx < rows.len() {
-                let json_row = convert_row_to_json(&rows[row_idx], schema)?;
-                results.push(json_row);
+        if let Some(json_values) = block_json_cache.get(&block_id) {
+            if row_idx < json_values.len() {
+                results.push(json_values[row_idx].clone());
             }
         }
     }
-
-    // Add any direct results
-    results.extend(direct_results);
 
     Ok(results)
 }
@@ -340,20 +363,32 @@ fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
     )))
 }
 
+// Keep the original function name for compatibility
 pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Result<Value> {
-    let mut json_obj = serde_json::Map::new();
+    let mut json_obj = serde_json::Map::with_capacity(row.len());
 
     for (key, value) in row {
-        if let Some(column) = schema.columns.iter().find(|c| c.name == *key) {
+        // Linear search is fine for small schemas, binary search doesn't help much
+        let column = schema.columns.iter().find(|c| c.name == *key);
+
+        if let Some(column) = column {
             let json_value = match column.data_type {
-                crate::storage::schema::DataType::Id => match value.parse::<u64>() {
-                    Ok(id) => Value::Number(serde_json::Number::from(id)),
-                    Err(_) => Value::String(value.clone()),
-                },
-                crate::storage::schema::DataType::Integer => match value.parse::<i64>() {
-                    Ok(i) => Value::Number(serde_json::Number::from(i)),
-                    Err(_) => Value::String(value.clone()),
-                },
+                crate::storage::schema::DataType::Id => {
+                    // Use fast parsing from encoding module
+                    if let Some(id) = crate::storage::encoding::fast_parse_u64(value) {
+                        Value::Number(serde_json::Number::from(id))
+                    } else {
+                        Value::String(value.clone())
+                    }
+                }
+                crate::storage::schema::DataType::Integer => {
+                    // Use fast parsing from encoding module
+                    if let Some(i) = crate::storage::encoding::fast_parse_i64(value) {
+                        Value::Number(serde_json::Number::from(i))
+                    } else {
+                        Value::String(value.clone())
+                    }
+                }
                 crate::storage::schema::DataType::Float => match value.parse::<f64>() {
                     Ok(f) => Value::Number(
                         serde_json::Number::from_f64(f)
@@ -361,23 +396,19 @@ pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Re
                     ),
                     Err(_) => Value::String(value.clone()),
                 },
-                crate::storage::schema::DataType::Boolean => match value.to_lowercase().as_str() {
-                    "true" => Value::Bool(true),
-                    "false" => Value::Bool(false),
+                crate::storage::schema::DataType::Boolean => match value.as_bytes() {
+                    b"true" => Value::Bool(true),
+                    b"false" => Value::Bool(false),
                     _ => Value::String(value.clone()),
                 },
                 crate::storage::schema::DataType::Timestamp => {
-                    // Convert milliseconds back to ISO format
-                    if let Ok(millis) = value.parse::<i64>() {
-                        // Convert milliseconds to DateTime and format as ISO
+                    if let Some(millis) = crate::storage::encoding::fast_parse_i64(value) {
                         if let Some(datetime) = chrono::DateTime::from_timestamp_millis(millis) {
                             Value::String(datetime.to_rfc3339())
                         } else {
-                            // Fallback to original value if conversion fails
                             Value::String(value.clone())
                         }
                     } else {
-                        // If it's not milliseconds, keep as-is (might already be ISO format)
                         Value::String(value.clone())
                     }
                 }
@@ -385,7 +416,6 @@ pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Re
             };
             json_obj.insert(key.clone(), json_value);
         } else {
-            // Column not in schema, treat as string
             json_obj.insert(key.clone(), Value::String(value.clone()));
         }
     }
