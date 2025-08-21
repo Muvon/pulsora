@@ -122,213 +122,157 @@ pub fn execute_query(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<Value>> {
-    let start_key = build_range_key(table, start.as_deref(), true)?;
-    let end_key = build_range_key(table, end.as_deref(), false)?;
+    let start_ts = if let Some(s) = start.as_deref() {
+        parse_query_timestamp(s)?
+    } else {
+        0i64
+    };
+
+    let end_ts = if let Some(e) = end.as_deref() {
+        parse_query_timestamp(e)?
+    } else {
+        i64::MAX
+    };
 
     let limit = limit.unwrap_or(1000).min(10000);
     let offset = offset.unwrap_or(0);
 
-    // Optimized read options for faster sequential scans
-    let mut iter_opts = ReadOptions::default();
-    iter_opts.set_verify_checksums(false);
-    iter_opts.fill_cache(true);
-    iter_opts.set_readahead_size(2 * 1024 * 1024);
-
-    // Structure to hold block data and row indices
-    struct BlockRequest {
-        block_id: Vec<u8>,
-        row_indices: Vec<usize>,
-    }
-
-    let mut blocks_to_fetch: HashMap<Vec<u8>, BlockRequest> = HashMap::new();
-    let mut request_order: Vec<(Vec<u8>, usize)> = Vec::with_capacity(limit);
-
+    // Build block index scan key
     let table_hash = calculate_table_hash(table);
+    let mut start_key = Vec::with_capacity(13);
+    start_key.extend_from_slice(&table_hash.to_be_bytes());
+    start_key.push(b'B'); // Block marker
+    start_key.extend_from_slice(&start_ts.to_be_bytes());
+
+    // Optimized read options
+    let mut read_opts = ReadOptions::default();
+    read_opts.set_verify_checksums(false);
+    read_opts.fill_cache(true);
+    read_opts.set_readahead_size(4 * 1024 * 1024); // 4MB readahead for blocks
+
     let iter = db.iterator_opt(
         IteratorMode::From(&start_key, Direction::Forward),
-        iter_opts,
+        read_opts,
     );
 
-    // First pass: collect row references
-    let mut count = 0;
-    let mut skipped = 0;
+    let mut results = Vec::with_capacity(limit);
+    let mut skipped_rows = 0usize;
 
+    // Scan block index
     for item in iter {
         let (key, value) = match item {
             Ok((k, v)) => (k, v),
             Err(_) => continue,
         };
 
-        // Fast table hash check
-        if key.len() < 4 {
-            continue;
+        // Check if we're still in the block index range
+        if key.len() < 5 || key[4] != b'B' {
+            continue; // Not a block index entry
         }
+
+        // Check table hash
         let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
         if key_table_hash != table_hash {
             break;
         }
 
-        // Check end boundary
-        if !end_key.is_empty() && key.as_ref() > end_key.as_slice() {
-            break;
+        // Check if past end timestamp
+        if key.len() >= 13 {
+            let block_min_ts = i64::from_be_bytes([
+                key[5], key[6], key[7], key[8], key[9], key[10], key[11], key[12],
+            ]);
+            if block_min_ts > end_ts {
+                break;
+            }
         }
 
-        // Apply offset
-        if skipped < offset {
-            skipped += 1;
+        // Parse block index value
+        if value.len() < 24 {
+            continue; // Invalid block index
+        }
+
+        let block_id_len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+        if value.len() < 4 + block_id_len + 16 + 4 {
             continue;
         }
 
-        // Apply limit
-        if count >= limit {
-            break;
+        let block_id = &value[4..4 + block_id_len];
+        let pos = 4 + block_id_len;
+        let block_min_ts = i64::from_le_bytes([
+            value[pos],
+            value[pos + 1],
+            value[pos + 2],
+            value[pos + 3],
+            value[pos + 4],
+            value[pos + 5],
+            value[pos + 6],
+            value[pos + 7],
+        ]);
+        let block_max_ts = i64::from_le_bytes([
+            value[pos + 8],
+            value[pos + 9],
+            value[pos + 10],
+            value[pos + 11],
+            value[pos + 12],
+            value[pos + 13],
+            value[pos + 14],
+            value[pos + 15],
+        ]);
+
+        // Skip blocks entirely outside our range
+        if block_max_ts < start_ts || block_min_ts > end_ts {
+            continue;
         }
 
-        // Parse reference data inline for speed
-        if !value.is_empty() && value[0] == 0xFF {
-            if value.len() < 9 {
-                continue;
-            }
+        // Fetch and decompress the block
+        let mut fetch_opts = ReadOptions::default();
+        fetch_opts.set_verify_checksums(false);
+        fetch_opts.fill_cache(true);
 
-            let block_id_len =
-                u32::from_le_bytes([value[1], value[2], value[3], value[4]]) as usize;
-            if value.len() < 9 + block_id_len {
-                continue;
-            }
-
-            let block_id = value[5..5 + block_id_len].to_vec();
-            let row_idx = u32::from_le_bytes([
-                value[5 + block_id_len],
-                value[6 + block_id_len],
-                value[7 + block_id_len],
-                value[8 + block_id_len],
-            ]) as usize;
-
-            // Track request order and group by block
-            request_order.push((block_id.clone(), row_idx));
-
-            blocks_to_fetch
-                .entry(block_id.clone())
-                .or_insert_with(|| BlockRequest {
-                    block_id: block_id.clone(),
-                    row_indices: Vec::new(),
-                })
-                .row_indices
-                .push(row_idx);
-
-            count += 1;
-        }
-    }
-
-    // Early return if no results
-    if request_order.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Create read options for fetching blocks
-    let mut fetch_opts = ReadOptions::default();
-    fetch_opts.set_verify_checksums(false);
-    fetch_opts.fill_cache(true);
-
-    // Second pass: fetch and process blocks directly to JSON
-    let mut block_json_cache: HashMap<Vec<u8>, Vec<Value>> = HashMap::new();
-
-    // Determine if we should use parallel processing
-    let use_parallel = blocks_to_fetch.len() > 2 && cfg!(feature = "parallel");
-
-    if use_parallel {
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-
-            let json_blocks: Vec<_> = blocks_to_fetch
-                .values()
-                .par_bridge()
-                .filter_map(|req| {
-                    // Create read options per thread
-                    let mut thread_opts = ReadOptions::default();
-                    thread_opts.set_verify_checksums(false);
-                    thread_opts.fill_cache(true);
-
-                    match db.get_opt(&req.block_id, &thread_opts) {
-                        Ok(Some(block_data)) => {
-                            match ColumnBlock::deserialize(&block_data) {
-                                Ok(block) => {
-                                    // Use the new optimized direct-to-JSON method
-                                    match block.to_json_values(schema) {
-                                        Ok(json_values) => {
-                                            Some((req.block_id.clone(), json_values))
+        if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
+            if let Ok(block) = ColumnBlock::deserialize(&block_data) {
+                // Convert directly to JSON
+                if let Ok(json_values) = block.to_json_values(schema) {
+                    // Filter rows by timestamp if needed
+                    for json_row in json_values {
+                        // Check timestamp bounds if block spans our range
+                        if block_min_ts < start_ts || block_max_ts > end_ts {
+                            // Need to check individual row timestamp
+                            if let Some(ts_field) = schema.get_timestamp_column() {
+                                if let Some(Value::Number(ts_val)) = json_row.get(ts_field) {
+                                    if let Some(ts) = ts_val.as_i64() {
+                                        if ts < start_ts || ts > end_ts {
+                                            continue;
                                         }
-                                        Err(_) => None,
                                     }
                                 }
-                                Err(_) => None,
                             }
                         }
-                        _ => None,
-                    }
-                })
-                .collect();
 
-            for (block_id, json_values) in json_blocks {
-                block_json_cache.insert(block_id, json_values);
-            }
-        }
-    } else {
-        // Sequential processing for small queries
-        for req in blocks_to_fetch.values() {
-            if let Ok(Some(block_data)) = db.get_opt(&req.block_id, &fetch_opts) {
-                if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                    // Use the new optimized direct-to-JSON method
-                    if let Ok(json_values) = block.to_json_values(schema) {
-                        block_json_cache.insert(req.block_id.clone(), json_values);
+                        // Apply offset
+                        if skipped_rows < offset {
+                            skipped_rows += 1;
+                            continue;
+                        }
+
+                        // Apply limit
+                        if results.len() >= limit {
+                            return Ok(results);
+                        }
+
+                        results.push(json_row);
                     }
                 }
             }
         }
-    }
 
-    // Third pass: extract results in original order
-    let mut results = Vec::with_capacity(request_order.len());
-
-    for (block_id, row_idx) in request_order {
-        if let Some(json_values) = block_json_cache.get(&block_id) {
-            if row_idx < json_values.len() {
-                results.push(json_values[row_idx].clone());
-            }
+        // Early exit if we have enough results
+        if results.len() >= limit {
+            break;
         }
     }
 
     Ok(results)
-}
-
-fn build_range_key(table: &str, timestamp: Option<&str>, is_start: bool) -> Result<Vec<u8>> {
-    // Binary key format matching ingestion
-    let ts_millis = if let Some(ts) = timestamp {
-        parse_query_timestamp(ts)?
-    } else if is_start {
-        0i64 // Beginning of time
-    } else {
-        i64::MAX // End of time for upper bound
-    };
-
-    let mut key = Vec::with_capacity(4 + 8 + 8);
-
-    // Table hash (4 bytes)
-    let table_hash = calculate_table_hash(table);
-    key.extend_from_slice(&table_hash.to_be_bytes());
-
-    // Timestamp (8 bytes)
-    key.extend_from_slice(&ts_millis.to_be_bytes());
-
-    // Row ID (8 bytes) - min or max for range boundaries
-    if is_start {
-        key.extend_from_slice(&0u64.to_be_bytes());
-    } else {
-        key.extend_from_slice(&u64::MAX.to_be_bytes());
-    }
-
-    Ok(key)
 }
 
 fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
@@ -443,18 +387,5 @@ mod tests {
 
         // Invalid
         assert!(parse_query_timestamp("invalid").is_err());
-    }
-
-    #[test]
-    fn test_build_range_key() {
-        let start_key = build_range_key("test_table", Some("1704110400"), true).unwrap();
-        // Binary key format: [table_hash:4][timestamp:8][row_id:8] = 20 bytes
-        assert_eq!(start_key.len(), 20);
-
-        // Check that table hash is consistent
-        let table_hash = calculate_table_hash("test_table");
-        let key_table_hash =
-            u32::from_be_bytes([start_key[0], start_key[1], start_key[2], start_key[3]]);
-        assert_eq!(table_hash, key_table_hash);
     }
 }

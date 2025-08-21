@@ -106,6 +106,45 @@ pub fn insert_rows(
         // Store the compressed block ONCE with the block ID
         batch.put(block_id.as_bytes(), &serialized_block);
 
+        // Get min and max timestamps from this block for range indexing
+        let mut min_timestamp = i64::MAX;
+        let mut max_timestamp = i64::MIN;
+
+        for (_, row) in chunk.iter() {
+            if let Some(ts_col) = schema.get_timestamp_column() {
+                if let Some(ts_value) = row.get(ts_col) {
+                    if let Ok(ts) = parse_timestamp(ts_value) {
+                        min_timestamp = min_timestamp.min(ts);
+                        max_timestamp = max_timestamp.max(ts);
+                    }
+                }
+            }
+        }
+
+        // If no timestamp column, use current time
+        if min_timestamp == i64::MAX {
+            min_timestamp = timestamp;
+            max_timestamp = timestamp;
+        }
+
+        // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
+        // Block index key: [table_hash:u32][B][min_timestamp:i64]
+        let mut block_index_key = Vec::with_capacity(13);
+        let table_hash = calculate_table_hash(table);
+        block_index_key.extend_from_slice(&table_hash.to_be_bytes());
+        block_index_key.push(b'B'); // Block marker to distinguish from row keys
+        block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
+
+        // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
+        let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
+        block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
+        block_index_value.extend_from_slice(block_id.as_bytes());
+        block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
+        block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
+        block_index_value.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+
+        batch.put(&block_index_key, &block_index_value);
+
         // For each row, store references using dual key strategy
         for (row_idx, (id, row)) in chunk.iter().enumerate() {
             // Create reference data: [marker][block_id_len][block_id][row_idx]
