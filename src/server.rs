@@ -77,11 +77,11 @@ pub async fn start(config: Config) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/tables", get(list_tables))
-        .route("/tables/:table/ingest", post(ingest_csv))
-        .route("/tables/:table/query", get(query_data))
-        .route("/tables/:table/schema", get(get_schema))
-        .route("/tables/:table/count", get(get_table_count))
-        .route("/tables/:table/row/:id", get(get_row_by_id))
+        .route("/tables/{table}/ingest", post(ingest_csv))
+        .route("/tables/{table}/query", get(query_data))
+        .route("/tables/{table}/schema", get(get_schema))
+        .route("/tables/{table}/count", get(get_table_count))
+        .route("/tables/{table}/row/{id}", get(get_row_by_id))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             access_logging_middleware,
