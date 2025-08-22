@@ -89,84 +89,98 @@ pub fn insert_rows(
 
     // Process rows in chunks for columnar storage
     let chunks: Vec<_> = processed_rows.chunks(batch_size).collect();
-    let mut total_inserted = 0u64;
+    
+    // PERFORMANCE OPTIMIZATION: Process chunks in parallel for massive speedup
+    // Each chunk creates its column block independently
+    use rayon::prelude::*;
+    
+    let chunk_results: Result<Vec<_>> = chunks
+        .par_iter()
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            // Create column block for this chunk (now parallelized internally too!)
+            let column_block = ColumnBlock::from_rows(chunk, schema)?;
+            let serialized_block = column_block.serialize()?;
 
-    // Process each chunk as a column block
-    for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        // Create column block for this chunk
-        let column_block = ColumnBlock::from_rows(chunk, schema)?;
-        let serialized_block = column_block.serialize()?;
+            let mut batch = WriteBatch::default();
 
-        let mut batch = WriteBatch::default();
+            // Generate a unique block ID for this chunk
+            let timestamp = Utc::now().timestamp_millis();
+            let block_id = format!("_block_{}_{}_{}", table, timestamp, chunk_idx);
 
-        // Generate a unique block ID for this chunk
-        let timestamp = Utc::now().timestamp_millis();
-        let block_id = format!("_block_{}_{}_{}", table, timestamp, chunk_idx);
+            // Store the compressed block ONCE with the block ID
+            batch.put(block_id.as_bytes(), &serialized_block);
 
-        // Store the compressed block ONCE with the block ID
-        batch.put(block_id.as_bytes(), &serialized_block);
+            // Get min and max timestamps from this block for range indexing
+            let mut min_timestamp = i64::MAX;
+            let mut max_timestamp = i64::MIN;
 
-        // Get min and max timestamps from this block for range indexing
-        let mut min_timestamp = i64::MAX;
-        let mut max_timestamp = i64::MIN;
-
-        for (_, row) in chunk.iter() {
-            if let Some(ts_col) = schema.get_timestamp_column() {
-                if let Some(ts_value) = row.get(ts_col) {
-                    if let Ok(ts) = parse_timestamp(ts_value) {
-                        min_timestamp = min_timestamp.min(ts);
-                        max_timestamp = max_timestamp.max(ts);
+            for (_, row) in chunk.iter() {
+                if let Some(ts_col) = schema.get_timestamp_column() {
+                    if let Some(ts_value) = row.get(ts_col) {
+                        if let Ok(ts) = parse_timestamp(ts_value) {
+                            min_timestamp = min_timestamp.min(ts);
+                            max_timestamp = max_timestamp.max(ts);
+                        }
                     }
                 }
             }
-        }
 
-        // If no timestamp column, use current time
-        if min_timestamp == i64::MAX {
-            min_timestamp = timestamp;
-            max_timestamp = timestamp;
-        }
+            // If no timestamp column, use current time
+            if min_timestamp == i64::MAX {
+                min_timestamp = timestamp;
+                max_timestamp = timestamp;
+            }
 
-        // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
-        // Block index key: [table_hash:u32][B][min_timestamp:i64]
-        let mut block_index_key = Vec::with_capacity(13);
-        let table_hash = calculate_table_hash(table);
-        block_index_key.extend_from_slice(&table_hash.to_be_bytes());
-        block_index_key.push(b'B'); // Block marker to distinguish from row keys
-        block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
+            // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
+            // Block index key: [table_hash:u32][B][min_timestamp:i64]
+            let mut block_index_key = Vec::with_capacity(13);
+            let table_hash = calculate_table_hash(table);
+            block_index_key.extend_from_slice(&table_hash.to_be_bytes());
+            block_index_key.push(b'B'); // Block marker to distinguish from row keys
+            block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
 
-        // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
-        let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
-        block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-        block_index_value.extend_from_slice(block_id.as_bytes());
-        block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
-        block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
-        block_index_value.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
+            let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
+            block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
+            block_index_value.extend_from_slice(block_id.as_bytes());
+            block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
+            block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
+            block_index_value.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
 
-        batch.put(&block_index_key, &block_index_value);
+            batch.put(&block_index_key, &block_index_value);
 
-        // For each row, store references using dual key strategy
-        for (row_idx, (id, row)) in chunk.iter().enumerate() {
-            // Create reference data: [marker][block_id_len][block_id][row_idx]
-            let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
-            ref_data.push(0xFF); // Reference marker
-            ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-            ref_data.extend_from_slice(block_id.as_bytes());
-            ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
+            // For each row, store references using dual key strategy
+            for (row_idx, (id, row)) in chunk.iter().enumerate() {
+                // Create reference data: [marker][block_id_len][block_id][row_idx]
+                let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
+                ref_data.push(0xFF); // Reference marker
+                ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
+                ref_data.extend_from_slice(block_id.as_bytes());
+                ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
 
-            // Primary key: [table_hash:u32][id:u64] - for direct ID lookups
-            // For REPLACE semantics, we simply overwrite the existing key
-            let id_key = generate_id_key(table, *id);
-            batch.put(&id_key, &ref_data);
+                // Primary key: [table_hash:u32][id:u64] - for direct ID lookups
+                // For REPLACE semantics, we simply overwrite the existing key
+                let id_key = generate_id_key(table, *id);
+                batch.put(&id_key, &ref_data);
 
-            // Time index key: [table_hash:u32][timestamp:i64][id:u64] - for time-range queries
-            let time_key = generate_time_key(table, schema, row, *id)?;
-            batch.put(&time_key, &ref_data);
-        }
+                // Time index key: [table_hash:u32][timestamp:i64][id:u64] - for time-range queries
+                let time_key = generate_time_key(table, schema, row, *id)?;
+                batch.put(&time_key, &ref_data);
+            }
 
+            Ok((batch, chunk.len()))
+        })
+        .collect();
+
+    // Process results and write batches sequentially to avoid conflicts
+    let chunk_results = chunk_results?;
+    let mut total_inserted = 0u64;
+    
+    for (idx, (batch, chunk_size)) in chunk_results.into_iter().enumerate() {
         db.write(batch)?;
-        total_inserted += chunk.len() as u64;
-        debug!("Wrote column block {} with {} rows", chunk_idx, chunk.len());
+        total_inserted += chunk_size as u64;
+        debug!("Wrote column block {} with {} rows", idx, chunk_size);
     }
 
     Ok(total_inserted)
