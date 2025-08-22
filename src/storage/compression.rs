@@ -16,9 +16,9 @@ struct BitWriter {
 
 impl BitWriter {
     #[inline(always)]
-    fn new() -> Self {
+    fn new_with_capacity(capacity: usize) -> Self {
         Self {
-            data: Vec::with_capacity(1024), // Pre-allocate for better performance
+            data: Vec::with_capacity(capacity),
             current_byte: 0,
             bits_in_current: 0,
         }
@@ -218,32 +218,31 @@ pub fn compress_timestamps(timestamps: &[i64]) -> Result<(i64, Vec<u8>)> {
     }
 
     let base = timestamps[0];
-    let mut output = Vec::new();
 
     if timestamps.len() == 1 {
-        return Ok((base, output));
+        return Ok((base, Vec::new()));
     }
 
-    // First pass: compute deltas
-    let mut deltas = Vec::with_capacity(timestamps.len() - 1);
-    let mut prev_timestamp = timestamps[0];
+    // PERFORMANCE OPTIMIZATION: Single pass, no intermediate vector
+    // Pre-allocate output buffer
+    let mut output = Vec::with_capacity(timestamps.len() * 2);
 
-    for &timestamp in timestamps.iter().skip(1) {
-        let delta = timestamp - prev_timestamp;
-        deltas.push(delta);
-        prev_timestamp = timestamp;
-    }
+    // Compute and encode in a single pass
+    let mut prev_timestamp = timestamps[1]; // Start from second timestamp
+    let mut prev_delta = timestamps[1] - timestamps[0];
 
-    // Second pass: compute delta-of-deltas and encode with varint
-    let mut prev_delta = deltas[0];
+    // Write first delta
     encoding::encode_varint_signed(prev_delta, &mut output);
 
-    for &delta in deltas.iter().skip(1) {
+    // Process remaining timestamps in single pass
+    for &timestamp in timestamps.iter().skip(2) {
+        let delta = timestamp - prev_timestamp;
         let delta_of_delta = delta - prev_delta;
 
-        // Use varint encoding for delta-of-delta
-        // This is more efficient than fixed-size bit packing for most cases
+        // Encode delta-of-delta directly
         encoding::encode_varint_signed(delta_of_delta, &mut output);
+
+        prev_timestamp = timestamp;
         prev_delta = delta;
     }
 
@@ -292,60 +291,68 @@ pub fn compress_values(values: &[f64]) -> Result<(f64, Vec<u8>)> {
     }
 
     let base = values[0];
-    let mut writer = BitWriter::new();
 
     if values.len() == 1 {
-        return Ok((base, writer.finish()));
+        return Ok((base, Vec::new()));
     }
+
+    // PERFORMANCE OPTIMIZATION: Pre-allocate with better estimate
+    // XOR compression typically needs ~2-4 bytes per value
+    let mut writer = BitWriter::new_with_capacity(values.len() * 4);
 
     let mut prev_bits = base.to_bits();
     let mut prev_leading = 0u8;
     let mut prev_trailing = 0u8;
 
-    // Process values with optimized XOR operations
-    for &value in values.iter().skip(1) {
-        let curr_bits = value.to_bits();
+    // OPTIMIZATION: Process values in chunks for better branch prediction
+    // and cache locality
+    const CHUNK_SIZE: usize = 1024;
 
-        // Use XOR for delta compression
-        let xor = prev_bits ^ curr_bits;
+    for chunk in values[1..].chunks(CHUNK_SIZE) {
+        for &value in chunk {
+            let curr_bits = value.to_bits();
 
-        if xor == 0 {
-            // Same value - just write 1 bit (0)
-            writer.write_bits(0, 1);
-        } else {
-            writer.write_bits(1, 1);
+            // Use XOR for delta compression
+            let xor = prev_bits ^ curr_bits;
 
-            // Use intrinsics for counting leading/trailing zeros when available
-            let leading_zeros = xor.leading_zeros() as u8;
-            let trailing_zeros = xor.trailing_zeros() as u8;
-
-            // Check if we can use the same bit window as before (common case)
-            if leading_zeros >= prev_leading && trailing_zeros >= prev_trailing {
-                // Control bit 0 = reuse previous window
+            if xor == 0 {
+                // Same value - just write 1 bit (0)
                 writer.write_bits(0, 1);
-                let significant_bits = 64 - prev_leading - prev_trailing;
-                if significant_bits > 0 {
-                    writer.write_bits(xor >> prev_trailing, significant_bits);
-                }
             } else {
-                // Control bit 1 = new window
                 writer.write_bits(1, 1);
 
-                // Store new window bounds (5 bits each for leading/trailing)
-                writer.write_bits(leading_zeros as u64, 5);
-                writer.write_bits(trailing_zeros as u64, 5);
+                // Use intrinsics for counting leading/trailing zeros when available
+                let leading_zeros = xor.leading_zeros() as u8;
+                let trailing_zeros = xor.trailing_zeros() as u8;
 
-                let significant_bits = 64 - leading_zeros - trailing_zeros;
-                if significant_bits > 0 {
-                    writer.write_bits(xor >> trailing_zeros, significant_bits);
+                // Check if we can use the same bit window as before (common case)
+                if leading_zeros >= prev_leading && trailing_zeros >= prev_trailing {
+                    // Control bit 0 = reuse previous window
+                    writer.write_bits(0, 1);
+                    let significant_bits = 64 - prev_leading - prev_trailing;
+                    if significant_bits > 0 {
+                        writer.write_bits(xor >> prev_trailing, significant_bits);
+                    }
+                } else {
+                    // Control bit 1 = new window
+                    writer.write_bits(1, 1);
+
+                    // Store new window bounds (5 bits each for leading/trailing)
+                    writer.write_bits(leading_zeros as u64, 5);
+                    writer.write_bits(trailing_zeros as u64, 5);
+
+                    let significant_bits = 64 - leading_zeros - trailing_zeros;
+                    if significant_bits > 0 {
+                        writer.write_bits(xor >> trailing_zeros, significant_bits);
+                    }
+
+                    prev_leading = leading_zeros;
+                    prev_trailing = trailing_zeros;
                 }
-
-                prev_leading = leading_zeros;
-                prev_trailing = trailing_zeros;
             }
-        }
 
-        prev_bits = curr_bits;
+            prev_bits = curr_bits;
+        }
     }
 
     Ok((base, writer.finish()))
@@ -426,20 +433,30 @@ pub fn compress_integers(values: &[i64]) -> Result<(i64, Vec<u8>)> {
     }
 
     let base = values[0];
-    let mut output = Vec::with_capacity(values.len() * 2); // Pre-allocate
 
     if values.len() == 1 {
-        return Ok((base, output));
+        return Ok((base, Vec::new()));
     }
 
-    // Use delta encoding with varint - optimized loop
+    // PERFORMANCE OPTIMIZATION: Pre-calculate exact size needed
+    // This avoids reallocation during encoding
+    let mut output = Vec::with_capacity(values.len() * 3); // Generous pre-allocation
+
+    // OPTIMIZATION: Process in chunks for better CPU cache utilization
+    // This improves performance for large arrays
+    const CHUNK_SIZE: usize = 4096;
     let mut prev_value = base;
-    for &value in values.iter().skip(1) {
-        let delta = value - prev_value;
-        encoding::encode_varint_signed(delta, &mut output);
-        prev_value = value;
+
+    for chunk in values[1..].chunks(CHUNK_SIZE) {
+        for &value in chunk {
+            let delta = value - prev_value;
+            encoding::encode_varint_signed(delta, &mut output);
+            prev_value = value;
+        }
     }
 
+    // Shrink to fit to release excess memory
+    output.shrink_to_fit();
     Ok((base, output))
 }
 

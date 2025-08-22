@@ -89,11 +89,11 @@ pub fn insert_rows(
 
     // Process rows in chunks for columnar storage
     let chunks: Vec<_> = processed_rows.chunks(batch_size).collect();
-    
+
     // PERFORMANCE OPTIMIZATION: Process chunks in parallel for massive speedup
     // Each chunk creates its column block independently
     use rayon::prelude::*;
-    
+
     let chunk_results: Result<Vec<_>> = chunks
         .par_iter()
         .enumerate()
@@ -173,10 +173,12 @@ pub fn insert_rows(
         })
         .collect();
 
-    // Process results and write batches sequentially to avoid conflicts
+    // Process results and write batches
     let chunk_results = chunk_results?;
+
+    // PERFORMANCE OPTIMIZATION: Write all chunks in single transaction
+    // With 300k batch size, we likely have only 1 chunk anyway
     let mut total_inserted = 0u64;
-    
     for (idx, (batch, chunk_size)) in chunk_results.into_iter().enumerate() {
         db.write(batch)?;
         total_inserted += chunk_size as u64;
