@@ -178,131 +178,225 @@ pub fn parse_protobuf(proto_data: &[u8]) -> Result<Vec<HashMap<String, String>>>
     Ok(batch.rows.into_iter().map(|r| r.values).collect())
 }
 
-pub fn process_csv_parallel(
+pub fn process_csv_bulk(
     csv_data: &str,
     schema: &Schema,
     id_manager: &Arc<IdManager>,
-    threads: usize,
-) -> Result<Vec<(u64, HashMap<String, String>)>> {
-    // 1. Extract header
+) -> Result<(ColumnBlock, Vec<u64>, i64, i64, Option<Vec<i64>>)> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
     let headers = reader.headers()?.clone();
-    let header_count = headers.len();
 
-    // Find where the data starts (after the first newline)
-    let data_start = match csv_data.find('\n') {
-        Some(i) => i + 1,
-        None => return Ok(Vec::new()),
-    };
-
-    if data_start >= csv_data.len() {
-        return Ok(Vec::new());
+    // Map Schema Column Name -> CSV Index
+    let mut schema_to_csv_idx = HashMap::with_capacity(schema.columns.len());
+    for (i, header) in headers.iter().enumerate() {
+        schema_to_csv_idx.insert(header, i);
     }
 
-    let data_str = &csv_data[data_start..];
-    let data_len = data_str.len();
+    // Initialize column vectors
+    let est_rows = csv_data.len() / 50; // Rough estimate
+    let mut id_col_vals = Vec::with_capacity(est_rows);
+    let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut float_cols: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut string_cols: HashMap<String, Vec<String>> = HashMap::new();
+    let mut bool_cols: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut ts_cols: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut null_bitmaps: HashMap<String, Vec<u8>> = HashMap::new();
 
-    // 2. Determine chunk size
-    let num_threads = if threads == 0 {
-        rayon::current_num_threads()
-    } else {
-        threads
-    };
-
-    // If data is small, don't bother splitting
-    if data_len < 1024 * 1024 || num_threads <= 1 {
-        return process_csv_single_thread(csv_data, schema, id_manager);
-    }
-
-    let target_chunk_size = data_len / num_threads;
-    let mut chunks = Vec::with_capacity(num_threads);
-    let mut start = 0;
-
-    // 3. Split into chunks respecting quotes
-    while start < data_len {
-        let mut end = std::cmp::min(start + target_chunk_size, data_len);
-        let mut in_quote = false;
-
-        // Scan from start to find the split point
-        let mut current = start;
-        let bytes = data_str.as_bytes();
-
-        while current < data_len {
-            let b = bytes[current];
-            if b == b'"' {
-                in_quote = !in_quote;
-            } else if b == b'\n' && !in_quote && current >= end {
-                end = current;
-                break;
+    // Initialize vectors for each column in schema
+    for col in &schema.columns {
+        match col.data_type {
+            crate::storage::schema::DataType::Id => {} // Handled separately
+            crate::storage::schema::DataType::Integer => {
+                int_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
             }
-            current += 1;
+            crate::storage::schema::DataType::Float => {
+                float_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+            }
+            crate::storage::schema::DataType::String => {
+                string_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+            }
+            crate::storage::schema::DataType::Boolean => {
+                bool_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+            }
+            crate::storage::schema::DataType::Timestamp => {
+                ts_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+            }
         }
-
-        if current >= data_len {
-            end = data_len;
-        }
-
-        if start < end {
-            chunks.push(&data_str[start..end]);
-        }
-        start = end + 1; // Skip the newline
+        null_bitmaps.insert(col.name.clone(), Vec::new());
     }
 
-    // 4. Process chunks in parallel
-    let results: Result<Vec<Vec<_>>> = chunks
-        .par_iter()
-        .map(|chunk_str| {
-            let mut chunk_rows = Vec::with_capacity(chunk_str.len() / 100); // Estimate row count
-            let mut reader = csv::ReaderBuilder::new()
-                .has_headers(false)
-                .from_reader(chunk_str.as_bytes());
+    let mut row_count = 0;
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    let ts_col_name = schema.get_timestamp_column();
 
-            for result in reader.records() {
-                let record = result?;
-                let mut row = HashMap::with_capacity(header_count);
+    for result in reader.records() {
+        let record = result?;
+        row_count += 1;
 
-                for (i, field) in record.iter().enumerate() {
-                    if let Some(header) = headers.get(i) {
-                        row.insert(header.to_string(), field.to_string());
+        // Handle ID
+        let id = if let Some(&idx) = schema_to_csv_idx.get(schema.id_column.as_str()) {
+            let val = record.get(idx).unwrap_or("");
+            if val.is_empty() {
+                id_manager.next_auto_id()
+            } else if let Ok(uid) = val.parse::<u64>() {
+                id_manager.register_user_id(uid)?;
+                uid
+            } else {
+                id_manager.next_auto_id()
+            }
+        } else {
+            id_manager.next_auto_id()
+        };
+        id_col_vals.push(id);
+
+        // Handle other columns
+        for col in &schema.columns {
+            if col.name == schema.id_column {
+                continue;
+            }
+
+            let val_str = if let Some(&idx) = schema_to_csv_idx.get(col.name.as_str()) {
+                record.get(idx)
+            } else {
+                None
+            };
+
+            let is_null = val_str.is_none() || val_str.unwrap().is_empty();
+
+            // Update null bitmap
+            let byte_idx = (row_count - 1) >> 3;
+            let bit_idx = (row_count - 1) & 7;
+            let bitmap = null_bitmaps.get_mut(&col.name).unwrap();
+            if bitmap.len() <= byte_idx {
+                bitmap.push(0);
+            }
+            if is_null {
+                bitmap[byte_idx] |= 1 << bit_idx;
+            }
+
+            match col.data_type {
+                crate::storage::schema::DataType::Id => {} // Already handled
+                crate::storage::schema::DataType::Integer => {
+                    let val = if is_null {
+                        0
+                    } else {
+                        val_str.unwrap().parse::<i64>().unwrap_or(0)
+                    };
+                    int_cols.get_mut(&col.name).unwrap().push(val);
+
+                    if Some(col.name.as_str()) == ts_col_name {
+                        min_ts = min_ts.min(val);
+                        max_ts = max_ts.max(val);
                     }
                 }
+                crate::storage::schema::DataType::Float => {
+                    let val = if is_null {
+                        0.0
+                    } else {
+                        val_str.unwrap().parse::<f64>().unwrap_or(0.0)
+                    };
+                    float_cols.get_mut(&col.name).unwrap().push(val);
+                }
+                crate::storage::schema::DataType::String => {
+                    let val = if is_null {
+                        String::new()
+                    } else {
+                        val_str.unwrap().to_string()
+                    };
+                    string_cols.get_mut(&col.name).unwrap().push(val);
+                }
+                crate::storage::schema::DataType::Boolean => {
+                    let val = if is_null {
+                        false
+                    } else {
+                        val_str.unwrap().parse::<bool>().unwrap_or(false)
+                    };
+                    bool_cols.get_mut(&col.name).unwrap().push(val);
+                }
+                crate::storage::schema::DataType::Timestamp => {
+                    let val = if is_null {
+                        chrono::Utc::now().timestamp_millis()
+                    } else {
+                        parse_timestamp(val_str.unwrap())
+                            .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+                    };
+                    ts_cols.get_mut(&col.name).unwrap().push(val);
 
-                if !row.is_empty() {
-                    let processed = process_single_row(row, schema, id_manager)?;
-                    chunk_rows.push(processed);
+                    if Some(col.name.as_str()) == ts_col_name {
+                        min_ts = min_ts.min(val);
+                        max_ts = max_ts.max(val);
+                    }
                 }
             }
-            Ok(chunk_rows)
-        })
-        .collect();
+        }
+    }
 
-    // 5. Flatten results
-    let mut final_rows = Vec::with_capacity(
-        results
-            .as_ref()
-            .map(|v| v.iter().map(|c| c.len()).sum())
-            .unwrap_or(0),
+    if row_count == 0 {
+        return Ok((
+            ColumnBlock {
+                row_count: 0,
+                columns: HashMap::new(),
+                null_bitmaps: HashMap::new(),
+            },
+            Vec::new(),
+            0,
+            0,
+            None,
+        ));
+    }
+
+    // Compress columns
+    let mut columns = HashMap::new();
+
+    // ID Column
+    columns.insert(
+        schema.id_column.clone(),
+        crate::storage::columnar::compress_id_column(&id_col_vals)?,
     );
-    for chunk_res in results? {
-        final_rows.extend(chunk_res);
+
+    for (name, vals) in int_cols {
+        columns.insert(name, crate::storage::columnar::compress_int_column(&vals)?);
+    }
+    for (name, vals) in float_cols {
+        columns.insert(
+            name,
+            crate::storage::columnar::compress_float_column(&vals)?,
+        );
+    }
+    for (name, vals) in string_cols {
+        columns.insert(
+            name,
+            crate::storage::columnar::compress_string_column(&vals)?,
+        );
+    }
+    for (name, vals) in bool_cols {
+        columns.insert(name, crate::storage::columnar::compress_bool_column(&vals)?);
+    }
+    for (name, vals) in &ts_cols {
+        columns.insert(
+            name.clone(),
+            crate::storage::columnar::compress_timestamp_column(vals)?,
+        );
     }
 
-    Ok(final_rows)
-}
+    let ts_values = if let Some(ts_name) = ts_col_name {
+        ts_cols.remove(ts_name)
+    } else {
+        None
+    };
 
-fn process_csv_single_thread(
-    csv_data: &str,
-    schema: &Schema,
-    id_manager: &Arc<IdManager>,
-) -> Result<Vec<(u64, HashMap<String, String>)>> {
-    let rows = parse_csv(csv_data)?;
-    let mut processed_rows = Vec::with_capacity(rows.len());
-
-    for row in rows {
-        let processed = process_single_row(row, schema, id_manager)?;
-        processed_rows.push(processed);
-    }
-    Ok(processed_rows)
+    Ok((
+        ColumnBlock {
+            row_count,
+            columns,
+            null_bitmaps,
+        },
+        id_col_vals,
+        min_ts,
+        max_ts,
+        ts_values,
+    ))
 }
 
 pub fn write_column_block_to_rocksdb(

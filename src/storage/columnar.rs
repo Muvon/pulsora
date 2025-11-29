@@ -634,214 +634,198 @@ fn value_to_string(value: &EncodedValue) -> String {
     }
 }
 
-/// Compress a column of values with optimized compression for each data type
-fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<u8>> {
+pub fn compress_id_column(ids: &[u64]) -> Result<Vec<u8>> {
+    if ids.is_empty() {
+        return Err(PulsoraError::InvalidData("Empty ID column".to_string()));
+    }
+    let mut output = Vec::with_capacity(ids.len() * 2);
+    output.push(0); // DataType::Id marker
+
+    let base_id = ids[0];
+    encoding::encode_varint(base_id, &mut output);
+    encoding::encode_varint((ids.len() - 1) as u64, &mut output);
+
+    for i in 1..ids.len() {
+        let delta = unsafe { *ids.get_unchecked(i) as i64 - *ids.get_unchecked(i - 1) as i64 };
+        encoding::encode_varint_signed(delta, &mut output);
+    }
+    Ok(output)
+}
+
+pub fn compress_timestamp_column(timestamps: &[i64]) -> Result<Vec<u8>> {
     use crate::storage::compression;
+    let mut output = Vec::with_capacity(timestamps.len() * 2);
+    output.push(4); // DataType::Timestamp marker
 
-    // Pre-allocate with estimated size
-    let mut output = Vec::with_capacity(values.len() * 2);
+    let (base, compressed) = compression::compress_timestamps(timestamps)?;
+    encoding::encode_varint(base as u64, &mut output);
+    encoding::encode_varint(compressed.len() as u64, &mut output);
+    output.extend_from_slice(&compressed);
+    Ok(output)
+}
 
-    // Write data type marker
-    output.push(match data_type {
-        DataType::Id => 0,
-        DataType::Integer => 1,
-        DataType::Float => 2,
-        DataType::Boolean => 3,
-        DataType::Timestamp => 4,
-        DataType::String => 5,
-    });
+pub fn compress_int_column(integers: &[i64]) -> Result<Vec<u8>> {
+    use crate::storage::compression;
+    let mut output = Vec::with_capacity(integers.len() * 2);
+    output.push(1); // DataType::Integer marker
 
+    let (base, compressed) = compression::compress_integers(integers)?;
+    encoding::encode_varint_signed(base, &mut output);
+    encoding::encode_varint(compressed.len() as u64, &mut output);
+    output.extend_from_slice(&compressed);
+    Ok(output)
+}
+
+pub fn compress_float_column(floats: &[f64]) -> Result<Vec<u8>> {
+    use crate::storage::compression;
+    let mut output = Vec::with_capacity(floats.len() * 2);
+    output.push(2); // DataType::Float marker
+
+    let (base, compressed) = compression::compress_values(floats)?;
+    encoding::encode_varfloat(base, &mut output);
+    encoding::encode_varint(compressed.len() as u64, &mut output);
+    output.extend_from_slice(&compressed);
+    Ok(output)
+}
+
+pub fn compress_bool_column(booleans: &[bool]) -> Result<Vec<u8>> {
+    if booleans.is_empty() {
+        return Ok(vec![3]); // DataType::Boolean marker
+    }
+    let mut output = Vec::with_capacity(booleans.len() / 8 + 10);
+    output.push(3); // DataType::Boolean marker
+
+    let mut runs = Vec::new();
+    let mut current_value = booleans[0];
+    let mut run_length = 1u32;
+
+    for &b in booleans.iter().skip(1) {
+        if b == current_value {
+            run_length += 1;
+        } else {
+            runs.push((current_value, run_length));
+            current_value = b;
+            run_length = 1;
+        }
+    }
+    runs.push((current_value, run_length));
+
+    output.push(2); // Sub-type marker for RLE
+    encoding::encode_varint(runs.len() as u64, &mut output);
+    for (value, length) in runs {
+        if length == 1 {
+            output.push(if value { 0x80 } else { 0x00 });
+        } else {
+            let first_byte = if value { 0x80 } else { 0x00 } | 0x40;
+            output.push(first_byte);
+            encoding::encode_varint(length as u64, &mut output);
+        }
+    }
+    Ok(output)
+}
+
+pub fn compress_string_column(strings: &[String]) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(strings.len() * 10);
+    output.push(5); // DataType::String marker
+
+    let mut string_to_id = std::collections::HashMap::with_capacity(strings.len() / 4);
+    let mut dictionary = Vec::new();
+    let mut ids = Vec::with_capacity(strings.len());
+
+    for s in strings {
+        let id = match string_to_id.get(s.as_str()) {
+            Some(&existing_id) => existing_id,
+            None => {
+                let new_id = dictionary.len() as u32;
+                dictionary.push(s.as_str());
+                string_to_id.insert(s.as_str(), new_id);
+                new_id
+            }
+        };
+        ids.push(id);
+    }
+
+    if dictionary.len() < strings.len() / 2 && strings.len() > 10 {
+        output.push(4); // Dictionary encoded
+        encoding::encode_varint(dictionary.len() as u64, &mut output);
+        for s in dictionary {
+            encoding::encode_string(s, &mut output);
+        }
+        for id in ids {
+            encoding::encode_varint(id as u64, &mut output);
+        }
+    } else {
+        output.push(5); // Direct encoded
+        for s in strings {
+            encoding::encode_string(s, &mut output);
+        }
+    }
+    Ok(output)
+}
+
+fn compress_column(values: &[EncodedValue], data_type: &DataType) -> Result<Vec<u8>> {
     match data_type {
         DataType::Id => {
-            // PERFORMANCE OPTIMIZATION: Direct extraction without error collection
             let ids: Vec<u64> = values
                 .iter()
                 .map(|v| match v {
                     EncodedValue::Id(id) => *id,
-                    _ => 0, // This should never happen due to type checking
+                    _ => 0,
                 })
                 .collect();
-
-            if ids.is_empty() {
-                return Err(PulsoraError::InvalidData("Empty ID column".to_string()));
-            }
-
-            let base_id = ids[0];
-
-            // Write base ID using varint encoding
-            encoding::encode_varint(base_id, &mut output);
-
-            // Write number of deltas
-            encoding::encode_varint((ids.len() - 1) as u64, &mut output);
-
-            // Write deltas using signed varint encoding
-            // OPTIMIZATION: Use unsafe for known bounds to avoid checks
-            for i in 1..ids.len() {
-                // Safety: i is always valid due to loop bounds
-                let delta =
-                    unsafe { *ids.get_unchecked(i) as i64 - *ids.get_unchecked(i - 1) as i64 };
-                encoding::encode_varint_signed(delta, &mut output);
-            }
-        }
-        DataType::Timestamp => {
-            // PERFORMANCE OPTIMIZATION: Direct extraction without error collection
-            let timestamps: Vec<i64> = values
-                .iter()
-                .map(|v| match v {
-                    EncodedValue::Timestamp(t) => *t,
-                    _ => 0, // This should never happen due to type checking
-                })
-                .collect();
-
-            let (base, compressed) = compression::compress_timestamps(&timestamps)?;
-
-            // Write base timestamp using varint encoding
-            encoding::encode_varint(base as u64, &mut output);
-            // Write compressed data length using varint
-            encoding::encode_varint(compressed.len() as u64, &mut output);
-            // Write compressed data
-            output.extend_from_slice(&compressed);
+            compress_id_column(&ids)
         }
         DataType::Integer => {
-            // PERFORMANCE OPTIMIZATION: Avoid intermediate vector collection
-            // Stream directly from values to compression
-            let integers: Vec<i64> = values
+            let ints: Vec<i64> = values
                 .iter()
                 .map(|v| match v {
                     EncodedValue::Integer(i) => *i,
-                    _ => 0, // This should never happen due to type checking
+                    _ => 0,
                 })
                 .collect();
-
-            let (base, compressed) = compression::compress_integers(&integers)?;
-
-            // Write base value using varint encoding
-            encoding::encode_varint_signed(base, &mut output);
-            // Write compressed data length using varint
-            encoding::encode_varint(compressed.len() as u64, &mut output);
-            // Write compressed data
-            output.extend_from_slice(&compressed);
+            compress_int_column(&ints)
         }
         DataType::Float => {
-            // PERFORMANCE OPTIMIZATION: Direct extraction without error collection
             let floats: Vec<f64> = values
                 .iter()
                 .map(|v| match v {
                     EncodedValue::Float(f) => *f,
-                    _ => 0.0, // This should never happen due to type checking
+                    _ => 0.0,
                 })
                 .collect();
-
-            let (base, compressed) = compression::compress_values(&floats)?;
-
-            // Write base value using varfloat encoding (not raw bits!)
-            encoding::encode_varfloat(base, &mut output);
-            // Write compressed data length
-            encoding::encode_varint(compressed.len() as u64, &mut output);
-            // Write compressed data
-            output.extend_from_slice(&compressed);
+            compress_float_column(&floats)
         }
         DataType::Boolean => {
-            // Use run-length encoding for booleans (great for sparse or repetitive data)
-            let mut runs = Vec::new();
-            let mut current_value = if let EncodedValue::Boolean(b) = &values[0] {
-                *b
-            } else {
-                return Err(PulsoraError::InvalidData("Type mismatch".to_string()));
-            };
-            let mut run_length = 1u32;
-
-            for value in values.iter().skip(1) {
-                if let EncodedValue::Boolean(b) = value {
-                    if *b == current_value {
-                        run_length += 1;
-                    } else {
-                        // Store run: value (1 bit) + length (varint)
-                        runs.push((current_value, run_length));
-                        current_value = *b;
-                        run_length = 1;
-                    }
-                } else {
-                    return Err(PulsoraError::InvalidData("Type mismatch".to_string()));
-                }
-            }
-            // Don't forget the last run
-            runs.push((current_value, run_length));
-
-            // Encode runs
-            output.push(2); // Sub-type marker for RLE booleans
-            encoding::encode_varint(runs.len() as u64, &mut output);
-            for (value, length) in runs {
-                // Pack value bit with first bit of length for efficiency
-                if length == 1 {
-                    // Single value - use 1 byte with value in MSB
-                    output.push(if value { 0x80 } else { 0x00 });
-                } else {
-                    // Multiple values - value in MSB, then varint length
-                    let first_byte = if value { 0x80 } else { 0x00 } | 0x40; // Set continuation bit
-                    output.push(first_byte);
-                    encoding::encode_varint(length as u64, &mut output);
-                }
-            }
+            let bools: Vec<bool> = values
+                .iter()
+                .map(|v| match v {
+                    EncodedValue::Boolean(b) => *b,
+                    _ => false,
+                })
+                .collect();
+            compress_bool_column(&bools)
+        }
+        DataType::Timestamp => {
+            let ts: Vec<i64> = values
+                .iter()
+                .map(|v| match v {
+                    EncodedValue::Timestamp(t) => *t,
+                    _ => 0,
+                })
+                .collect();
+            compress_timestamp_column(&ts)
         }
         DataType::String => {
-            // PERFORMANCE OPTIMIZATION: Avoid cloning strings during analysis
-            // Build dictionary directly without pre-checking uniqueness
-            let mut string_to_id = std::collections::HashMap::with_capacity(values.len() / 4);
-            let mut dictionary = Vec::new();
-            let mut ids = Vec::with_capacity(values.len());
-
-            // Single pass to build dictionary and collect IDs
-            for value in values {
-                if let EncodedValue::String(s) = value {
-                    let id = match string_to_id.get(s.as_str()) {
-                        Some(&existing_id) => existing_id,
-                        None => {
-                            let new_id = dictionary.len() as u32;
-                            dictionary.push(s.as_str());
-                            string_to_id.insert(s.as_str(), new_id);
-                            new_id
-                        }
-                    };
-                    ids.push(id);
-                }
-            }
-
-            // Use dictionary only if we have significant repetition
-            // If unique strings are less than 50% of total, dictionary helps
-            if dictionary.len() < values.len() / 2 && values.len() > 10 {
-                // Dictionary encoding for repeated strings
-                output.push(4); // Sub-type marker for dictionary-encoded strings
-
-                // Write dictionary size
-                encoding::encode_varint(dictionary.len() as u64, &mut output);
-
-                // Write dictionary entries using our encoder
-                for s in dictionary {
-                    encoding::encode_string(s, &mut output);
-                }
-
-                // Write string IDs using varint encoding
-                for id in ids {
-                    encoding::encode_varint(id as u64, &mut output);
-                }
-            } else {
-                // Direct encoding for mostly unique strings
-                output.push(5); // Sub-type marker for direct strings
-
-                // Just use our string encoder directly
-                for value in values {
-                    if let EncodedValue::String(v) = value {
-                        encoding::encode_string(v, &mut output);
-                    } else {
-                        return Err(PulsoraError::InvalidData("Type mismatch".to_string()));
-                    }
-                }
-            }
+            let strings: Vec<String> = values
+                .iter()
+                .map(|v| match v {
+                    EncodedValue::String(s) => s.clone(),
+                    _ => String::new(),
+                })
+                .collect();
+            compress_string_column(&strings)
         }
     }
-
-    Ok(output)
 }
 
 /// Decompress a column of values with special handling for ID columns - optimized version

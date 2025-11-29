@@ -597,66 +597,95 @@ impl StorageEngine {
             schemas.get_schema(table).cloned()
         };
 
-        let (processed_rows, schema) = if let Some(schema) = existing_schema {
-            // Parallel path for existing tables
+        if let Some(schema) = existing_schema {
+            // Ensure any buffered data is flushed first to maintain consistency
+            self.flush_table(table).await?;
+
+            // FAST PATH: Bulk ingestion directly to ColumnBlock
             let id_manager = {
                 let mut id_managers = self.id_managers.write().await;
                 id_managers.get_or_create(table)?.clone()
             };
 
-            let rows = ingestion::process_csv_parallel(
-                &csv_data,
-                &schema,
-                &id_manager,
-                self.config.ingestion.ingestion_threads,
-            )?;
+            // Use spawn_blocking for CPU-intensive parsing/compression
+            let table_owned = table.to_string();
+            let schema_clone = schema.clone();
+            let id_manager_clone = id_manager.clone();
 
-            (rows, schema)
-        } else {
-            // Serial path for new tables (need to infer schema)
-            let rows = ingestion::parse_csv(&csv_data)?;
-            if rows.is_empty() {
-                return Err(PulsoraError::Ingestion("No data rows found".to_string()));
+            let (column_block, ids, min_ts, max_ts, timestamps) =
+                tokio::task::spawn_blocking(move || {
+                    ingestion::process_csv_bulk(&csv_data, &schema_clone, &id_manager_clone)
+                })
+                .await
+                .map_err(|e| PulsoraError::Internal(e.to_string()))??;
+
+            let row_count = column_block.row_count as u64;
+            if row_count > 0 {
+                // Write directly to RocksDB
+                ingestion::write_column_block_to_rocksdb(
+                    &self.db,
+                    &table_owned,
+                    &column_block,
+                    &ids,
+                    min_ts,
+                    max_ts,
+                    timestamps.as_deref(),
+                )?;
             }
 
-            // Get or create schema (pass ALL rows for better type inference)
-            let schema = {
-                let mut schemas = self.schemas.write().await;
-                schemas.get_or_create_schema(table, &rows)?
-            };
+            let processing_time_ms = start_time.elapsed().as_millis() as u64;
+            info!(
+                "Ingested {} rows into table '{}' in {}ms (Fast Path)",
+                row_count, table, processing_time_ms
+            );
 
-            let id_manager = {
-                let mut id_managers = self.id_managers.write().await;
-                id_managers.get_or_create(table)?.clone()
-            };
+            return Ok(IngestionStats {
+                rows_inserted: row_count,
+                processing_time_ms,
+            });
+        }
 
-            let mut processed = Vec::with_capacity(rows.len());
-            for mut row in rows {
-                // Handle ID assignment
-                let row_id = if let Some(id_str) = row.get(&schema.id_column) {
-                    if id_str.trim().is_empty() {
-                        crate::storage::id_manager::RowId::Auto
-                    } else {
-                        let parsed_id = crate::storage::id_manager::RowId::from_string(id_str)?;
-                        if let crate::storage::id_manager::RowId::User(id) = parsed_id {
-                            id_manager.register_user_id(id)?;
-                        }
-                        parsed_id
-                    }
-                } else {
-                    crate::storage::id_manager::RowId::Auto
-                };
+        // SLOW PATH: Schema inference needed
+        let rows = ingestion::parse_csv(&csv_data)?;
+        if rows.is_empty() {
+            return Err(PulsoraError::Ingestion("No data rows found".to_string()));
+        }
 
-                let actual_id = row_id.resolve(&id_manager);
-                row.insert(schema.id_column.clone(), actual_id.to_string());
-                schema.validate_row(&row)?;
-                processed.push((actual_id, row));
-            }
-
-            (processed, schema)
+        // Get or create schema (pass ALL rows for better type inference)
+        let schema = {
+            let mut schemas = self.schemas.write().await;
+            schemas.get_or_create_schema(table, &rows)?
         };
 
-        self.ingest_processed_rows(table, processed_rows, schema, start_time)
+        let id_manager = {
+            let mut id_managers = self.id_managers.write().await;
+            id_managers.get_or_create(table)?.clone()
+        };
+
+        let mut processed = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            // Handle ID assignment
+            let row_id = if let Some(id_str) = row.get(&schema.id_column) {
+                if id_str.trim().is_empty() {
+                    crate::storage::id_manager::RowId::Auto
+                } else {
+                    let parsed_id = crate::storage::id_manager::RowId::from_string(id_str)?;
+                    if let crate::storage::id_manager::RowId::User(id) = parsed_id {
+                        id_manager.register_user_id(id)?;
+                    }
+                    parsed_id
+                }
+            } else {
+                crate::storage::id_manager::RowId::Auto
+            };
+
+            let actual_id = row_id.resolve(&id_manager);
+            row.insert(schema.id_column.clone(), actual_id.to_string());
+            schema.validate_row(&row)?;
+            processed.push((actual_id, row));
+        }
+
+        self.ingest_processed_rows(table, processed, schema, start_time)
             .await
     }
 

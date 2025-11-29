@@ -41,6 +41,8 @@ pub enum PulsoraError {
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 impl From<serde_json::Error> for PulsoraError {
