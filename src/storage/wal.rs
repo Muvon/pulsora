@@ -216,7 +216,7 @@ mod tests {
 
         let mut row = HashMap::new();
         row.insert("col".to_string(), "val".to_string());
-        wal.append_batch(&vec![(1, row)]).unwrap();
+        wal.append_batch(&[(1, row)]).unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

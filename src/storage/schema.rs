@@ -223,10 +223,8 @@ impl SchemaManager {
             if dtype == DataType::Id {
                 id_column = name.clone();
                 has_id = true;
-            } else if dtype == DataType::Timestamp {
-                if timestamp_column.is_none() {
-                    timestamp_column = Some(name.clone());
-                }
+            } else if dtype == DataType::Timestamp && timestamp_column.is_none() {
+                timestamp_column = Some(name.clone());
             }
 
             columns.push(Column {

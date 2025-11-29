@@ -33,6 +33,11 @@ max_open_files = 1000             # Maximum open files (default: 1000)
 # CSV ingestion performance tuning
 max_csv_size_mb = 512             # Maximum CSV file size in MB (default: 512)
 batch_size = 10000                # Batch size for database writes (default: 10000)
+ingestion_threads = 0             # Parallel ingestion threads (0 = auto-detect, default: 0)
+
+[query]
+# Query execution performance tuning
+query_threads = 0                 # Parallel query threads (0 = auto-detect, default: 0)
 
 [performance]
 # Storage engine optimizations
@@ -122,6 +127,7 @@ Controls CSV data ingestion behavior and limits.
 |-----------|------|---------|-------------|
 | `max_csv_size_mb` | Integer | `512` | Maximum size of CSV files to accept (MB) |
 | `batch_size` | Integer | `10000` | Number of rows to process in each batch |
+| `ingestion_threads` | Integer | `0` | Number of threads for parallel ingestion (0 = auto-detect) |
 
 **Tuning Guidelines:**
 
@@ -137,6 +143,33 @@ Controls CSV data ingestion behavior and limits.
 - **Balanced:** 10000-25000 rows
 - **SSD storage:** Higher batch sizes work well
 - **HDD storage:** Lower batch sizes reduce I/O pressure
+
+**ingestion_threads:**
+- **0 (Auto):** Uses all available CPU cores (recommended)
+- **1:** Sequential processing (lowest CPU usage, slower)
+- **4-8:** Good balance for most systems
+- **16+:** For high-core-count servers with heavy write workloads
+- Controls parallelism for CSV parsing, compression, and batch writing
+- Higher values increase CPU usage but improve throughput
+
+### [query] - Query Execution Settings
+
+Controls query execution and read performance.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query_threads` | Integer | `0` | Number of threads for parallel query execution (0 = auto-detect) |
+
+**Tuning Guidelines:**
+
+**query_threads:**
+- **0 (Auto):** Uses all available CPU cores (recommended)
+- **1:** Sequential block processing (lowest CPU usage)
+- **4-8:** Good balance for most query workloads
+- **16+:** For high-concurrency read scenarios
+- Controls parallelism for block decompression and filtering
+- Independent from `ingestion_threads` for separate read/write tuning
+- Adaptive parallelism: automatically uses sequential processing for small queries (< 4 blocks)
 
 ### [performance] - Optimization Settings
 

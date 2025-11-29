@@ -105,9 +105,17 @@ pub fn process_rows_parallel(
     schema: &Schema,
     id_manager: &Arc<IdManager>,
 ) -> Result<Vec<(u64, HashMap<String, String>)>> {
-    rows.into_par_iter()
-        .map(|row| process_single_row(row, schema, id_manager))
-        .collect()
+    // ADAPTIVE PARALLELISM: Only use parallel processing when beneficial
+    if rows.len() >= 100 && rayon::current_num_threads() > 1 {
+        rows.into_par_iter()
+            .map(|row| process_single_row(row, schema, id_manager))
+            .collect()
+    } else {
+        // Sequential processing for small batches or single-threaded config
+        rows.into_iter()
+            .map(|row| process_single_row(row, schema, id_manager))
+            .collect()
+    }
 }
 
 pub fn parse_arrow(arrow_data: &[u8]) -> Result<Vec<HashMap<String, String>>> {
@@ -178,6 +186,7 @@ pub fn parse_protobuf(proto_data: &[u8]) -> Result<Vec<HashMap<String, String>>>
     Ok(batch.rows.into_iter().map(|r| r.values).collect())
 }
 
+#[allow(clippy::type_complexity)]
 pub fn process_csv_bulk(
     csv_data: &str,
     schema: &Schema,
@@ -627,10 +636,21 @@ pub fn insert_rows(
     // Each chunk creates its column block independently
     use rayon::prelude::*;
 
-    let chunk_results: Result<Vec<_>> = chunks
-        .par_iter()
-        .map(|chunk| write_batch_to_rocksdb(db, table, schema, chunk))
-        .collect();
+    // ADAPTIVE PARALLELISM: Only use parallel processing when beneficial
+    let use_parallel = chunks.len() >= 4 && rayon::current_num_threads() > 1;
+
+    let chunk_results: Result<Vec<_>> = if use_parallel {
+        chunks
+            .par_iter()
+            .map(|chunk| write_batch_to_rocksdb(db, table, schema, chunk))
+            .collect()
+    } else {
+        // Sequential processing for small workloads or single-threaded config
+        chunks
+            .iter()
+            .map(|chunk| write_batch_to_rocksdb(db, table, schema, chunk))
+            .collect()
+    };
 
     // Process results and write batches
     let chunk_results = chunk_results?;

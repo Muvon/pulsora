@@ -691,23 +691,23 @@ section {
 		grid-template-columns: 1fr;
 		gap: 3rem;
 	}
-	
+
 	.hero-title {
 		font-size: 3rem;
 	}
-	
+
 	.features-grid {
 		grid-template-columns: 1fr;
 	}
-	
+
 	.quickstart-grid {
 		grid-template-columns: 1fr;
 	}
-	
+
 	.usecases-grid {
 		grid-template-columns: repeat(2, 1fr);
 	}
-	
+
 	.tech-grid {
 		grid-template-columns: repeat(2, 1fr);
 	}
@@ -718,69 +718,69 @@ section {
 		flex-direction: column;
 		gap: 1rem;
 	}
-	
+
 	.nav-links {
 		gap: 1rem;
 		flex-wrap: wrap;
 		justify-content: center;
 	}
-	
+
 	.github-stars {
 		order: -1;
 		width: 100%;
 		justify-content: center;
 	}
-	
+
 	.hero {
 		padding: 8rem 0 4rem;
 	}
-	
+
 	.hero-title {
 		font-size: 2.5rem;
 	}
-	
+
 	.hero-desc {
 		font-size: 1.1rem;
 	}
-	
+
 	.hero-cta {
 		flex-direction: column;
 	}
-	
+
 	.hero-stats {
 		flex-direction: column;
 		gap: 1.5rem;
 	}
-	
+
 	.section-header h2 {
 		font-size: 2rem;
 	}
-	
+
 	.section-header p {
 		font-size: 1.1rem;
 	}
-	
+
 	.usecases-grid {
 		grid-template-columns: 1fr;
 	}
-	
+
 	.tech-grid {
 		grid-template-columns: 1fr;
 	}
-	
+
 	.footer-content {
 		grid-template-columns: 1fr;
 		gap: 2rem;
 	}
-	
+
 	.footer-links {
 		grid-template-columns: 1fr;
 	}
-	
+
 	.cta-content h2 {
 		font-size: 2rem;
 	}
-	
+
 	.cta-buttons {
 		flex-direction: column;
 		align-items: stretch;

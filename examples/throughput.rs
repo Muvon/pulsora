@@ -47,7 +47,9 @@ async fn main() {
     // Increase buffer size to avoid too many flushes during test
     config.storage.buffer_size = 100_000;
     config.storage.flush_interval_ms = 0; // Disable time-based flush for consistent block sizes
+                                          // Set BOTH ingestion and query threads from --threads parameter
     config.ingestion.ingestion_threads = threads;
+    config.query.query_threads = threads;
 
     #[cfg(debug_assertions)]
     {

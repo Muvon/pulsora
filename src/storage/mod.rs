@@ -62,10 +62,41 @@ pub struct StorageEngine {
     pub id_managers: Arc<RwLock<IdManagerRegistry>>,
     pub buffers: Arc<RwLock<HashMap<String, TableBuffer>>>,
     config: Config,
+    #[allow(dead_code)] // Used during initialization to configure Rayon
+    ingestion_threads: usize,
+    query_threads: usize,
 }
 
 impl StorageEngine {
     pub async fn new(config: &Config) -> Result<Self> {
+        // Configure Rayon thread pool for parallel processing (used for ingestion)
+        // This must be done before any parallel operations
+        let ingestion_thread_count = if config.ingestion.ingestion_threads == 0 {
+            rayon::current_num_threads() // Auto-detect (default: num CPUs)
+        } else {
+            config.ingestion.ingestion_threads
+        };
+
+        // Try to configure global thread pool (only works if not already initialized)
+        // Ignore error if already initialized (e.g., in tests)
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(ingestion_thread_count)
+            .build_global();
+
+        info!(
+            "Rayon thread pool configured: {} threads for ingestion",
+            rayon::current_num_threads()
+        );
+
+        // Determine query thread count
+        let query_thread_count = if config.query.query_threads == 0 {
+            rayon::current_num_threads() // Auto-detect (same as ingestion by default)
+        } else {
+            config.query.query_threads
+        };
+
+        info!("Query parallelism: {} threads", query_thread_count);
+
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.storage.data_dir)?;
 
@@ -159,6 +190,8 @@ impl StorageEngine {
             id_managers: Arc::new(RwLock::new(IdManagerRegistry::new(Arc::clone(&db_arc)))),
             buffers: Arc::new(RwLock::new(HashMap::new())),
             config: config.clone(),
+            ingestion_threads: ingestion_thread_count,
+            query_threads: query_thread_count,
         };
 
         // Recover WALs if enabled
@@ -710,6 +743,7 @@ impl StorageEngine {
             end.clone(),
             limit,
             offset,
+            self.query_threads,
         )?;
 
         // Merge with buffer data and deduplicate

@@ -89,6 +89,9 @@ max_csv_size_mb = 100
 batch_size = 5000
 ingestion_threads = 4
 
+[query]
+query_threads = 0
+
 [performance]
 compression = "zstd"
 cache_size_mb = 512

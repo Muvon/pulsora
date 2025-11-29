@@ -21,6 +21,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub ingestion: IngestionConfig,
+    pub query: QueryConfig,
     pub performance: PerformanceConfig,
     pub logging: LoggingConfig,
 }
@@ -59,6 +60,12 @@ pub struct IngestionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryConfig {
+    #[serde(default)]
+    pub query_threads: usize, // 0 means auto-detect
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceConfig {
     pub compression: String,
     pub cache_size_mb: usize,
@@ -93,6 +100,9 @@ impl Default for Config {
                 max_csv_size_mb: 512,
                 batch_size: 10000,
                 ingestion_threads: 0, // 0 means auto-detect
+            },
+            query: QueryConfig {
+                query_threads: 0, // 0 means auto-detect
             },
             performance: PerformanceConfig {
                 compression: "lz4".to_string(),

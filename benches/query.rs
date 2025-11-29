@@ -91,6 +91,7 @@ fn bench_time_range_queries(c: &mut Criterion) {
                             None,
                             Some(1000),
                             None,
+                            0,
                         )
                         .unwrap(),
                     )
@@ -104,18 +105,16 @@ fn bench_time_range_queries(c: &mut Criterion) {
             &(&storage, &schema),
             |b, (storage, schema)| {
                 b.iter(|| {
-                    black_box(
-                        query::execute_query(
-                            &storage.db,
-                            "benchmark_table",
-                            schema,
-                            Some("2024-01-01 10:00:00".to_string()),
-                            Some("2024-01-01 10:01:40".to_string()), // ~10% of 1000 seconds
-                            Some(1000),
-                            None,
-                        )
-                        .unwrap(),
-                    )
+                    black_box(query::execute_query(
+                        &storage.db,
+                        "benchmark_table",
+                        schema,
+                        Some("2024-01-01 10:00:00".to_string()),
+                        Some("2024-01-01 10:01:40".to_string()), // ~10% of 1000 seconds
+                        Some(1000),
+                        None,
+                        0, // Auto-detect threads
+                    ))
                 })
             },
         );
@@ -135,6 +134,7 @@ fn bench_time_range_queries(c: &mut Criterion) {
                             None,
                             Some(1000),
                             None,
+                            0, // Auto-detect threads
                         )
                         .unwrap(),
                     )
@@ -173,6 +173,7 @@ fn bench_pagination(c: &mut Criterion) {
                             None,
                             Some(*limit),
                             Some(0),
+                            0,
                         )
                         .unwrap(),
                     )
@@ -195,6 +196,7 @@ fn bench_pagination(c: &mut Criterion) {
                             None,
                             Some(*limit),
                             Some(5000), // Middle of 10k dataset
+                            0,          // Auto-detect threads
                         )
                         .unwrap(),
                     )
@@ -232,6 +234,7 @@ fn bench_query_result_sizes(c: &mut Criterion) {
                             None,
                             Some(*result_size),
                             None,
+                            0,
                         )
                         .unwrap(),
                     )
@@ -281,6 +284,7 @@ fn bench_concurrent_queries(c: &mut Criterion) {
                                         None,
                                         Some(100),
                                         None,
+                                        0,
                                     )
                                     .unwrap()
                                 })
