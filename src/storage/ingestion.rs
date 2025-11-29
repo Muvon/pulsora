@@ -84,12 +84,14 @@ pub fn write_batch_to_rocksdb(
     }
 
     // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
-    // Block index key: [table_hash:u32][B][min_timestamp:i64]
-    let mut block_index_key = Vec::with_capacity(13);
+    // Block index key: [table_hash:u32][B][min_timestamp:i64][block_id]
+    // Appending block_id ensures uniqueness even if timestamps collide
+    let mut block_index_key = Vec::with_capacity(13 + block_id.len());
     let table_hash = calculate_table_hash(table);
     block_index_key.extend_from_slice(&table_hash.to_be_bytes());
     block_index_key.push(b'B'); // Block marker to distinguish from row keys
     block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
+    block_index_key.extend_from_slice(block_id.as_bytes());
 
     // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
     let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);

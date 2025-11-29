@@ -161,11 +161,8 @@ pub fn execute_query(
         iter_read_opts,
     );
 
-    let mut results = Vec::with_capacity(limit);
-    let mut skipped_rows = 0usize;
-
     // OPTIMIZATION: Collect block metadata first for potential parallel processing
-    let mut block_metadata = Vec::new();
+    let mut block_metadata: Vec<(Vec<u8>, i64, i64, usize)> = Vec::new();
 
     // Scan block index
     for item in iter {
@@ -228,157 +225,226 @@ pub fn execute_query(
             value[pos + 15],
         ]);
 
+        let row_count = u32::from_le_bytes([
+            value[pos + 16],
+            value[pos + 17],
+            value[pos + 18],
+            value[pos + 19],
+        ]) as usize;
+
         // Skip blocks entirely outside our range
         if block_max_ts < start_ts || block_min_ts > end_ts {
             continue;
         }
 
         // Collect block metadata for processing
-        block_metadata.push((block_id.to_vec(), block_min_ts, block_max_ts));
+        block_metadata.push((block_id.to_vec(), block_min_ts, block_max_ts, row_count));
     }
 
     // OPTIMIZATION: Process blocks with potential parallelization
-    for (block_id, block_min_ts, block_max_ts) in block_metadata {
-        // Fetch and decompress the block
-        let mut fetch_opts = ReadOptions::default();
-        fetch_opts.set_verify_checksums(false);
-        fetch_opts.fill_cache(true);
+    // println!("DEBUG: Found {} blocks in index", block_metadata.len());
 
-        if let Ok(Some(block_data)) = db.get_opt(&block_id, &fetch_opts) {
-            if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                // Get block row count for bulk offset handling
-                let block_row_count = block.row_count();
+    // Calculate global offsets and prepare tasks
+    let mut tasks = Vec::with_capacity(block_metadata.len());
+    let mut current_skipped = 0;
+    let mut current_taken = 0;
 
-                // OPTIMIZATION 1: Bulk offset skipping at block level
-                if skipped_rows + block_row_count <= offset {
-                    // Skip entire block
-                    skipped_rows += block_row_count;
-                    continue;
-                }
-
-                // OPTIMIZATION 2: Calculate how many rows to skip within this block
-                let skip_in_block = offset.saturating_sub(skipped_rows);
-
-                // OPTIMIZATION 3: Calculate how many rows we can take from this block
-                let remaining_limit = limit - results.len();
-                let available_in_block = block_row_count - skip_in_block;
-                let take_from_block = remaining_limit.min(available_in_block);
-
-                // Use slice-based processing for better performance
-                // Use slice-based processing for better performance
-                if let Ok(json_values) = block.to_json_slice(schema, skip_in_block, take_from_block)
-                {
-                    for (i, json_row) in json_values.into_iter().enumerate() {
-                        let actual_row_idx = skip_in_block + i;
-
-                        // VALIDITY CHECK: Ensure this is the latest version of the row
-                        let mut is_latest = true;
-                        let id_opt = json_row.get(&schema.id_column).and_then(|v| v.as_u64());
-
-                        if let Some(id) = id_opt {
-                            let id_key = generate_id_key(table, id);
-                            if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts) {
-                                if let Ok((latest_block_id, latest_row_idx)) =
-                                    parse_reference_data(&ref_data)
-                                {
-                                    if latest_block_id != block_id
-                                        || latest_row_idx != actual_row_idx
-                                    {
-                                        is_latest = false;
-                                    }
-                                }
-                            }
-                        }
-
-                        if !is_latest {
-                            continue;
-                        }
-
-                        // TIMESTAMP CHECK
-                        let mut include_row = true;
-                        if block_min_ts < start_ts || block_max_ts > end_ts {
-                            if let Some(ts_field) = schema.get_timestamp_column() {
-                                if let Some(ts_value) = json_row.get(ts_field) {
-                                    let ts_millis = match ts_value {
-                                        Value::Number(n) => n.as_i64(),
-                                        Value::String(s) => {
-                                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
-                                            {
-                                                Some(dt.timestamp_millis())
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        _ => None,
-                                    };
-
-                                    if let Some(ts) = ts_millis {
-                                        include_row = ts >= start_ts && ts <= end_ts;
-                                    }
-                                }
-                            }
-                        }
-
-                        if include_row {
-                            results.push(json_row);
-                            if results.len() >= limit {
-                                return Ok(results);
-                            }
-                        }
-                    }
-
-                    // Update skipped count
-                    skipped_rows = offset;
-                } else if let Ok(json_values) = block.to_json_values(schema) {
-                    for (i, json_row) in json_values.into_iter().enumerate() {
-                        if i < skip_in_block {
-                            continue;
-                        }
-
-                        // VALIDITY CHECK
-                        let mut is_latest = true;
-                        let id_opt = json_row.get(&schema.id_column).and_then(|v| v.as_u64());
-                        if let Some(id) = id_opt {
-                            let id_key = generate_id_key(table, id);
-                            if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts) {
-                                if let Ok((latest_block_id, latest_row_idx)) =
-                                    parse_reference_data(&ref_data)
-                                {
-                                    if latest_block_id != block_id || latest_row_idx != i {
-                                        is_latest = false;
-                                    }
-                                }
-                            }
-                        }
-                        if !is_latest {
-                            continue;
-                        }
-
-                        // Check timestamp bounds if block spans our range
-                        if block_min_ts < start_ts || block_max_ts > end_ts {
-                            if let Some(ts_field) = schema.get_timestamp_column() {
-                                if let Some(Value::Number(ts_val)) = json_row.get(ts_field) {
-                                    if let Some(ts) = ts_val.as_i64() {
-                                        if ts < start_ts || ts > end_ts {
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        results.push(json_row);
-                        if results.len() >= limit {
-                            return Ok(results);
-                        }
-                    }
-                    skipped_rows = offset;
-                }
-            }
+    for (block_id, block_min_ts, block_max_ts, row_count) in block_metadata {
+        // If we haven't reached the offset yet
+        if current_skipped + row_count <= offset {
+            current_skipped += row_count;
+            continue;
         }
 
-        // Early exit if we have enough results
+        // If we have enough results
+        if current_taken >= limit {
+            break;
+        }
+
+        let skip_in_block = offset.saturating_sub(current_skipped);
+        let remaining_limit = limit - current_taken;
+        let available_in_block = row_count - skip_in_block;
+        let take_from_block = remaining_limit.min(available_in_block);
+
+        if take_from_block > 0 {
+            tasks.push((
+                block_id,
+                block_min_ts,
+                block_max_ts,
+                skip_in_block,
+                take_from_block,
+            ));
+            current_taken += take_from_block;
+        }
+
+        current_skipped += row_count;
+    }
+
+    use rayon::prelude::*;
+
+    let results_batches: Result<Vec<Vec<Value>>> = tasks
+        .par_iter()
+        .map(
+            |(block_id, block_min_ts, block_max_ts, skip_in_block, take_from_block)| {
+                let skip_in_block = *skip_in_block;
+                let take_from_block = *take_from_block;
+                let block_min_ts = *block_min_ts;
+                let block_max_ts = *block_max_ts;
+
+                // Fetch and decompress the block
+                let mut fetch_opts = ReadOptions::default();
+                fetch_opts.set_verify_checksums(false);
+                fetch_opts.fill_cache(true);
+
+                let mut batch_results = Vec::with_capacity(take_from_block);
+
+                if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
+                    if let Ok(block) = ColumnBlock::deserialize(&block_data) {
+                        // Use slice-based processing for better performance
+                        if let Ok(json_values) =
+                            block.to_json_slice(schema, skip_in_block, take_from_block)
+                        {
+                            // Create read options for validity checks
+                            let mut read_opts = ReadOptions::default();
+                            read_opts.set_verify_checksums(false);
+                            read_opts.fill_cache(true);
+
+                            // OPTIMIZATION: Use MultiGet for validity checks
+                            let mut keys = Vec::with_capacity(json_values.len());
+                            let mut key_indices = Vec::with_capacity(json_values.len());
+
+                            for (i, json_row) in json_values.iter().enumerate() {
+                                if let Some(id) =
+                                    json_row.get(&schema.id_column).and_then(|v| v.as_u64())
+                                {
+                                    keys.push(generate_id_key(table, id));
+                                    key_indices.push(i);
+                                }
+                            }
+
+                            let ref_results = db.multi_get(&keys);
+                            let mut is_valid = vec![true; json_values.len()];
+
+                            for (k_idx, result) in ref_results.into_iter().enumerate() {
+                                let json_idx = key_indices[k_idx];
+                                let actual_row_idx = skip_in_block + json_idx;
+
+                                if let Ok(Some(ref_data)) = result {
+                                    if let Ok((latest_block_id, latest_row_idx)) =
+                                        parse_reference_data(&ref_data)
+                                    {
+                                        if latest_block_id != *block_id
+                                            || latest_row_idx != actual_row_idx
+                                        {
+                                            is_valid[json_idx] = false;
+                                        }
+                                    }
+                                }
+                            }
+
+                            for (i, json_row) in json_values.into_iter().enumerate() {
+                                if !is_valid[i] {
+                                    continue;
+                                }
+
+                                // TIMESTAMP CHECK
+                                let mut include_row = true;
+                                if block_min_ts < start_ts || block_max_ts > end_ts {
+                                    if let Some(ts_field) = schema.get_timestamp_column() {
+                                        if let Some(ts_value) = json_row.get(ts_field) {
+                                            let ts_millis = match ts_value {
+                                                Value::Number(n) => n.as_i64(),
+                                                Value::String(s) => {
+                                                    if let Ok(dt) =
+                                                        chrono::DateTime::parse_from_rfc3339(s)
+                                                    {
+                                                        Some(dt.timestamp_millis())
+                                                    } else {
+                                                        None
+                                                    }
+                                                }
+                                                _ => None,
+                                            };
+
+                                            if let Some(ts) = ts_millis {
+                                                include_row = ts >= start_ts && ts <= end_ts;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if include_row {
+                                    batch_results.push(json_row);
+                                }
+                            }
+                        } else if let Ok(json_values) = block.to_json_values(schema) {
+                            // Fallback for blocks that don't support slicing
+                            // Create read options for validity checks
+                            let mut read_opts = ReadOptions::default();
+                            read_opts.set_verify_checksums(false);
+                            read_opts.fill_cache(true);
+
+                            for (i, json_row) in json_values.into_iter().enumerate() {
+                                if i < skip_in_block {
+                                    continue;
+                                }
+                                if batch_results.len() >= take_from_block {
+                                    break;
+                                }
+
+                                let actual_row_idx = i;
+
+                                // VALIDITY CHECK
+                                let mut is_latest = true;
+                                let id_opt =
+                                    json_row.get(&schema.id_column).and_then(|v| v.as_u64());
+                                if let Some(id) = id_opt {
+                                    let id_key = generate_id_key(table, id);
+                                    if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts) {
+                                        if let Ok((latest_block_id, latest_row_idx)) =
+                                            parse_reference_data(&ref_data)
+                                        {
+                                            if latest_block_id != *block_id
+                                                || latest_row_idx != actual_row_idx
+                                            {
+                                                is_latest = false;
+                                            }
+                                        }
+                                    }
+                                }
+                                if !is_latest {
+                                    continue;
+                                }
+
+                                // Check timestamp bounds
+                                if block_min_ts < start_ts || block_max_ts > end_ts {
+                                    if let Some(ts_field) = schema.get_timestamp_column() {
+                                        if let Some(Value::Number(ts_val)) = json_row.get(ts_field)
+                                        {
+                                            if let Some(ts) = ts_val.as_i64() {
+                                                if ts < start_ts || ts > end_ts {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                batch_results.push(json_row);
+                            }
+                        }
+                    }
+                }
+                Ok(batch_results)
+            },
+        )
+        .collect();
+
+    let mut results = Vec::with_capacity(limit);
+    for batch in results_batches? {
+        results.extend(batch);
         if results.len() >= limit {
+            results.truncate(limit);
             break;
         }
     }

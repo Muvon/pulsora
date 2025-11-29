@@ -1,3 +1,43 @@
+# Benchmarking Guide
+
+## Quick Throughput Test
+
+To measure raw ingestion and query throughput (RPS) on your machine:
+
+```bash
+cargo run --example throughput --release
+```
+
+This runs a scenario with:
+- 500,000 rows ingestion (10k batches)
+- Full table scan query
+- Parallel query execution enabled
+
+Expected results (on modern hardware):
+- Ingestion: ~80k - 100k rows/sec
+- Query: ~300k - 500k rows/sec
+
+## Micro-benchmarks
+
+For detailed performance analysis of specific components:
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run specific benchmark
+cargo bench --bench ingestion
+cargo bench --bench query
+cargo bench --bench end_to_end
+```
+
+## Tuning for Performance
+
+For maximum throughput during benchmarking:
+1. Set `flush_interval_ms = 0` to disable time-based flushing (creates larger, more efficient blocks).
+2. Increase `buffer_size` (e.g., 100,000 or more).
+3. Ensure `release` mode is used.
+
 # Pulsora Benchmarking Guide
 
 ## Overview
