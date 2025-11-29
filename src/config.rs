@@ -170,3 +170,7 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "config_test.rs"]
+mod config_test;

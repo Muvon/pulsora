@@ -81,7 +81,7 @@ impl<T> ApiResponse<T> {
     }
 }
 
-pub async fn start(config: Config) -> Result<()> {
+pub async fn create_app(config: Config) -> Result<Router> {
     // Initialize storage engine
     let storage = Arc::new(StorageEngine::new(&config).await?);
     let config = Arc::new(config);
@@ -92,7 +92,7 @@ pub async fn start(config: Config) -> Result<()> {
     };
 
     // Build router with middleware
-    let app = Router::new()
+    Ok(Router::new()
         .route("/health", get(health_check))
         .route("/tables", get(list_tables))
         .route("/tables/{table}/ingest", post(ingest_data))
@@ -105,7 +105,11 @@ pub async fn start(config: Config) -> Result<()> {
             access_logging_middleware,
         ))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state))
+}
+
+pub async fn start(config: Config) -> Result<()> {
+    let app = create_app(config.clone()).await?;
 
     // Start server
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -719,3 +723,7 @@ async fn access_logging_middleware(
 
     response
 }
+
+#[cfg(test)]
+#[path = "server_test.rs"]
+mod server_test;

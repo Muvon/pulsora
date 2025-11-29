@@ -144,3 +144,89 @@ impl WriteAheadLog {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_wal_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let table = "test_wal_creation";
+
+        let wal = WriteAheadLog::new(data_dir, table);
+        assert!(wal.is_ok());
+
+        let wal_path = temp_dir.path().join("wal").join(format!(
+            "{}.wal",
+            crate::storage::calculate_table_hash(table)
+        ));
+
+        // Wait for async file creation
+        let mut exists = false;
+        for _ in 0..10 {
+            if wal_path.exists() {
+                exists = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(exists, "WAL file was not created");
+    }
+
+    #[tokio::test]
+    async fn test_wal_append_and_replay() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let table = "test_wal_append";
+
+        let wal = WriteAheadLog::new(data_dir, table).unwrap();
+
+        let mut row1 = HashMap::new();
+        row1.insert("col1".to_string(), "val1".to_string());
+
+        let mut row2 = HashMap::new();
+        row2.insert("col1".to_string(), "val2".to_string());
+
+        let rows = vec![(1, row1.clone()), (2, row2.clone())];
+
+        wal.append_batch(&rows).unwrap();
+
+        // Wait for async write
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Replay
+        let replayed = wal.replay().unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].0, 1);
+        assert_eq!(replayed[0].1, row1);
+        assert_eq!(replayed[1].0, 2);
+        assert_eq!(replayed[1].1, row2);
+    }
+
+    #[tokio::test]
+    async fn test_wal_truncate() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_str().unwrap();
+        let table = "test_wal_truncate";
+
+        let wal = WriteAheadLog::new(data_dir, table).unwrap();
+
+        let mut row = HashMap::new();
+        row.insert("col".to_string(), "val".to_string());
+        wal.append_batch(&vec![(1, row)]).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let replayed = wal.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+
+        wal.truncate().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let replayed_after = wal.replay().unwrap();
+        assert_eq!(replayed_after.len(), 0);
+    }
+}
