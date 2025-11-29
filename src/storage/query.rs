@@ -329,52 +329,50 @@ pub fn execute_query(
 
                     // Update skipped count
                     skipped_rows = offset;
-                } else {
-                    if let Ok(json_values) = block.to_json_values(schema) {
-                        for (i, json_row) in json_values.into_iter().enumerate() {
-                            if i < skip_in_block {
-                                continue;
-                            }
+                } else if let Ok(json_values) = block.to_json_values(schema) {
+                    for (i, json_row) in json_values.into_iter().enumerate() {
+                        if i < skip_in_block {
+                            continue;
+                        }
 
-                            // VALIDITY CHECK
-                            let mut is_latest = true;
-                            let id_opt = json_row.get(&schema.id_column).and_then(|v| v.as_u64());
-                            if let Some(id) = id_opt {
-                                let id_key = generate_id_key(table, id);
-                                if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts) {
-                                    if let Ok((latest_block_id, latest_row_idx)) =
-                                        parse_reference_data(&ref_data)
-                                    {
-                                        if latest_block_id != block_id || latest_row_idx != i {
-                                            is_latest = false;
-                                        }
+                        // VALIDITY CHECK
+                        let mut is_latest = true;
+                        let id_opt = json_row.get(&schema.id_column).and_then(|v| v.as_u64());
+                        if let Some(id) = id_opt {
+                            let id_key = generate_id_key(table, id);
+                            if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts) {
+                                if let Ok((latest_block_id, latest_row_idx)) =
+                                    parse_reference_data(&ref_data)
+                                {
+                                    if latest_block_id != block_id || latest_row_idx != i {
+                                        is_latest = false;
                                     }
                                 }
-                            }
-                            if !is_latest {
-                                continue;
-                            }
-
-                            // Check timestamp bounds if block spans our range
-                            if block_min_ts < start_ts || block_max_ts > end_ts {
-                                if let Some(ts_field) = schema.get_timestamp_column() {
-                                    if let Some(Value::Number(ts_val)) = json_row.get(ts_field) {
-                                        if let Some(ts) = ts_val.as_i64() {
-                                            if ts < start_ts || ts > end_ts {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            results.push(json_row);
-                            if results.len() >= limit {
-                                return Ok(results);
                             }
                         }
-                        skipped_rows = offset;
+                        if !is_latest {
+                            continue;
+                        }
+
+                        // Check timestamp bounds if block spans our range
+                        if block_min_ts < start_ts || block_max_ts > end_ts {
+                            if let Some(ts_field) = schema.get_timestamp_column() {
+                                if let Some(Value::Number(ts_val)) = json_row.get(ts_field) {
+                                    if let Some(ts) = ts_val.as_i64() {
+                                        if ts < start_ts || ts > end_ts {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        results.push(json_row);
+                        if results.len() >= limit {
+                            return Ok(results);
+                        }
                     }
+                    skipped_rows = offset;
                 }
             }
         }
@@ -481,24 +479,5 @@ pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Re
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_query_timestamp() {
-        // Unix timestamp (seconds)
-        assert!(parse_query_timestamp("1704110400").is_ok());
-
-        // Unix timestamp (milliseconds)
-        assert!(parse_query_timestamp("1704110400000").is_ok());
-
-        // ISO format
-        assert!(parse_query_timestamp("2024-01-01T10:00:00Z").is_ok());
-
-        // Common format
-        assert!(parse_query_timestamp("2024-01-01 10:00:00").is_ok());
-
-        // Invalid
-        assert!(parse_query_timestamp("invalid").is_err());
-    }
-}
+#[path = "query_test.rs"]
+mod query_test;
