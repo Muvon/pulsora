@@ -748,9 +748,11 @@ pub fn execute_query_csv(
         tasks
             .par_iter()
             .map(
-                |(block_id, _block_min_ts, _block_max_ts, skip_in_block, take_from_block)| {
+                |(block_id, block_min_ts, block_max_ts, skip_in_block, take_from_block)| {
                     let skip_in_block = *skip_in_block;
                     let take_from_block = *take_from_block;
+                    let block_min_ts = *block_min_ts;
+                    let block_max_ts = *block_max_ts;
 
                     let mut fetch_opts = ReadOptions::default();
                     fetch_opts.set_verify_checksums(false);
@@ -758,11 +760,20 @@ pub fn execute_query_csv(
 
                     if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
                         if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                            // Use direct CSV conversion
-                            // Note: We skip validity check for CSV export speed for now
-                            // In a real DB, we would need to implement validity check without JSON conversion
-                            // But for "Full Scan" throughput, this is the optimized path
-                            return block.to_csv(schema, skip_in_block, take_from_block);
+                            if block_min_ts < start_ts || block_max_ts > end_ts {
+                                let indices =
+                                    block.filter_by_timestamp(schema, start_ts, end_ts)?;
+                                let relevant_indices: Vec<usize> = indices
+                                    .into_iter()
+                                    .filter(|&idx| {
+                                        idx >= skip_in_block
+                                            && idx < skip_in_block + take_from_block
+                                    })
+                                    .collect();
+                                return block.to_csv_filtered(schema, &relevant_indices);
+                            } else {
+                                return block.to_csv(schema, skip_in_block, take_from_block);
+                            }
                         }
                     }
                     Ok(String::new())
@@ -773,9 +784,11 @@ pub fn execute_query_csv(
         tasks
             .iter()
             .map(
-                |(block_id, _block_min_ts, _block_max_ts, skip_in_block, take_from_block)| {
+                |(block_id, block_min_ts, block_max_ts, skip_in_block, take_from_block)| {
                     let skip_in_block = *skip_in_block;
                     let take_from_block = *take_from_block;
+                    let block_min_ts = *block_min_ts;
+                    let block_max_ts = *block_max_ts;
 
                     let mut fetch_opts = ReadOptions::default();
                     fetch_opts.set_verify_checksums(false);
@@ -783,7 +796,20 @@ pub fn execute_query_csv(
 
                     if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
                         if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                            return block.to_csv(schema, skip_in_block, take_from_block);
+                            if block_min_ts < start_ts || block_max_ts > end_ts {
+                                let indices =
+                                    block.filter_by_timestamp(schema, start_ts, end_ts)?;
+                                let relevant_indices: Vec<usize> = indices
+                                    .into_iter()
+                                    .filter(|&idx| {
+                                        idx >= skip_in_block
+                                            && idx < skip_in_block + take_from_block
+                                    })
+                                    .collect();
+                                return block.to_csv_filtered(schema, &relevant_indices);
+                            } else {
+                                return block.to_csv(schema, skip_in_block, take_from_block);
+                            }
                         }
                     }
                     Ok(String::new())
@@ -954,9 +980,11 @@ pub fn execute_query_arrow(
         tasks
             .par_iter()
             .map(
-                |(block_id, _block_min_ts, _block_max_ts, skip_in_block, take_from_block)| {
+                |(block_id, block_min_ts, block_max_ts, skip_in_block, take_from_block)| {
                     let skip_in_block = *skip_in_block;
                     let take_from_block = *take_from_block;
+                    let block_min_ts = *block_min_ts;
+                    let block_max_ts = *block_max_ts;
 
                     let mut fetch_opts = ReadOptions::default();
                     fetch_opts.set_verify_checksums(false);
@@ -964,10 +992,24 @@ pub fn execute_query_arrow(
 
                     if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
                         if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                            // Use direct Arrow conversion
-                            return block
-                                .to_arrow(schema, skip_in_block, take_from_block)
-                                .map(Some);
+                            if block_min_ts < start_ts || block_max_ts > end_ts {
+                                let indices =
+                                    block.filter_by_timestamp(schema, start_ts, end_ts)?;
+                                let relevant_indices: Vec<usize> = indices
+                                    .into_iter()
+                                    .filter(|&idx| {
+                                        idx >= skip_in_block
+                                            && idx < skip_in_block + take_from_block
+                                    })
+                                    .collect();
+                                return block
+                                    .to_arrow_filtered(schema, &relevant_indices)
+                                    .map(Some);
+                            } else {
+                                return block
+                                    .to_arrow(schema, skip_in_block, take_from_block)
+                                    .map(Some);
+                            }
                         }
                     }
                     Ok(None)
@@ -978,9 +1020,11 @@ pub fn execute_query_arrow(
         tasks
             .iter()
             .map(
-                |(block_id, _block_min_ts, _block_max_ts, skip_in_block, take_from_block)| {
+                |(block_id, block_min_ts, block_max_ts, skip_in_block, take_from_block)| {
                     let skip_in_block = *skip_in_block;
                     let take_from_block = *take_from_block;
+                    let block_min_ts = *block_min_ts;
+                    let block_max_ts = *block_max_ts;
 
                     let mut fetch_opts = ReadOptions::default();
                     fetch_opts.set_verify_checksums(false);
@@ -988,9 +1032,24 @@ pub fn execute_query_arrow(
 
                     if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
                         if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                            return block
-                                .to_arrow(schema, skip_in_block, take_from_block)
-                                .map(Some);
+                            if block_min_ts < start_ts || block_max_ts > end_ts {
+                                let indices =
+                                    block.filter_by_timestamp(schema, start_ts, end_ts)?;
+                                let relevant_indices: Vec<usize> = indices
+                                    .into_iter()
+                                    .filter(|&idx| {
+                                        idx >= skip_in_block
+                                            && idx < skip_in_block + take_from_block
+                                    })
+                                    .collect();
+                                return block
+                                    .to_arrow_filtered(schema, &relevant_indices)
+                                    .map(Some);
+                            } else {
+                                return block
+                                    .to_arrow(schema, skip_in_block, take_from_block)
+                                    .map(Some);
+                            }
                         }
                     }
                     Ok(None)

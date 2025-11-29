@@ -425,6 +425,82 @@ impl ColumnBlock {
         Ok(output)
     }
 
+    /// Convert specific rows to CSV efficiently
+    pub fn to_csv_filtered(&self, schema: &Schema, indices: &[usize]) -> Result<String> {
+        if indices.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Always use parallel decompression for better performance
+        let decompressed_columns = self.decompress_columns_parallel(schema)?;
+
+        // Pre-allocate output buffer (estimate 100 bytes per row)
+        let mut output = String::with_capacity(indices.len() * 100);
+
+        for &row_idx in indices {
+            if row_idx >= self.row_count {
+                continue;
+            }
+
+            for (col_idx, (_, values, null_bitmap)) in decompressed_columns.iter().enumerate() {
+                if col_idx > 0 {
+                    output.push(',');
+                }
+
+                // Check null
+                let is_null = if let Some(bitmap) = null_bitmap {
+                    let byte_idx = row_idx >> 3;
+                    let bit_idx = row_idx & 7;
+                    byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                } else {
+                    false
+                };
+
+                if !is_null {
+                    // Write value directly to string buffer
+                    match &values[row_idx] {
+                        EncodedValue::Id(v) => {
+                            use std::fmt::Write;
+                            write!(output, "{}", v).unwrap();
+                        }
+                        EncodedValue::Integer(v) => {
+                            use std::fmt::Write;
+                            write!(output, "{}", v).unwrap();
+                        }
+                        EncodedValue::Float(v) => {
+                            use std::fmt::Write;
+                            write!(output, "{}", v).unwrap();
+                        }
+                        EncodedValue::Boolean(v) => {
+                            output.push_str(if *v { "true" } else { "false" });
+                        }
+                        EncodedValue::Timestamp(v) => {
+                            if let Some(datetime) = chrono::DateTime::from_timestamp_millis(*v) {
+                                output.push_str(&datetime.to_rfc3339());
+                            } else {
+                                use std::fmt::Write;
+                                write!(output, "{}", v).unwrap();
+                            }
+                        }
+                        EncodedValue::String(v) => {
+                            // CSV escaping
+                            if v.contains(',') || v.contains('"') || v.contains('\n') {
+                                output.push('"');
+                                output.push_str(&v.replace('"', "\"\""));
+                                output.push('"');
+                            } else {
+                                output.push_str(v);
+                            }
+                        }
+                    }
+                }
+            }
+            output.push('\n');
+        }
+
+        Ok(output)
+    }
+
     /// Convert a slice of rows directly to an Arrow RecordBatch
     /// This avoids all intermediate allocations (HashMap, Value, etc.)
     pub fn to_arrow(&self, schema: &Schema, skip: usize, take: usize) -> Result<RecordBatch> {
@@ -607,6 +683,188 @@ impl ColumnBlock {
             .map_err(|e| PulsoraError::Internal(e.to_string()))
     }
 
+    /// Convert specific rows to Arrow RecordBatch efficiently
+    pub fn to_arrow_filtered(&self, schema: &Schema, indices: &[usize]) -> Result<RecordBatch> {
+        if indices.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(
+                arrow::datatypes::Schema::new(vec![] as Vec<arrow::datatypes::Field>),
+            )));
+        }
+
+        // Always use parallel decompression for better performance
+        let decompressed_columns = self.decompress_columns_parallel(schema)?;
+
+        let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.columns.len());
+        let mut fields = Vec::with_capacity(schema.columns.len());
+
+        for (column, values, null_bitmap) in decompressed_columns {
+            // Create Arrow Field
+            let dt = match column.data_type {
+                DataType::Id => arrow::datatypes::DataType::UInt64,
+                DataType::Integer => arrow::datatypes::DataType::Int64,
+                DataType::Float => arrow::datatypes::DataType::Float64,
+                DataType::Boolean => arrow::datatypes::DataType::Boolean,
+                DataType::Timestamp => arrow::datatypes::DataType::Int64,
+                DataType::String => arrow::datatypes::DataType::Utf8,
+            };
+            fields.push(arrow::datatypes::Field::new(&column.name, dt, true));
+
+            match column.data_type {
+                DataType::Id => {
+                    let mut builder = arrow::array::UInt64Builder::with_capacity(indices.len());
+                    for &row_idx in indices {
+                        if row_idx >= self.row_count {
+                            continue;
+                        }
+                        let is_null = if let Some(bitmap) = null_bitmap {
+                            let byte_idx = row_idx >> 3;
+                            let bit_idx = row_idx & 7;
+                            byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                        } else {
+                            false
+                        };
+
+                        if is_null {
+                            builder.append_null();
+                        } else if let EncodedValue::Id(v) = &values[row_idx] {
+                            builder.append_value(*v);
+                        } else {
+                            builder.append_value(0);
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::Integer => {
+                    let mut builder = arrow::array::Int64Builder::with_capacity(indices.len());
+                    for &row_idx in indices {
+                        if row_idx >= self.row_count {
+                            continue;
+                        }
+                        let is_null = if let Some(bitmap) = null_bitmap {
+                            let byte_idx = row_idx >> 3;
+                            let bit_idx = row_idx & 7;
+                            byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                        } else {
+                            false
+                        };
+
+                        if is_null {
+                            builder.append_null();
+                        } else if let EncodedValue::Integer(v) = &values[row_idx] {
+                            builder.append_value(*v);
+                        } else {
+                            builder.append_value(0);
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::Float => {
+                    let mut builder = arrow::array::Float64Builder::with_capacity(indices.len());
+                    for &row_idx in indices {
+                        if row_idx >= self.row_count {
+                            continue;
+                        }
+                        let is_null = if let Some(bitmap) = null_bitmap {
+                            let byte_idx = row_idx >> 3;
+                            let bit_idx = row_idx & 7;
+                            byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                        } else {
+                            false
+                        };
+
+                        if is_null {
+                            builder.append_null();
+                        } else if let EncodedValue::Float(v) = &values[row_idx] {
+                            builder.append_value(*v);
+                        } else {
+                            builder.append_value(0.0);
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::Boolean => {
+                    let mut builder = arrow::array::BooleanBuilder::with_capacity(indices.len());
+                    for &row_idx in indices {
+                        if row_idx >= self.row_count {
+                            continue;
+                        }
+                        let is_null = if let Some(bitmap) = null_bitmap {
+                            let byte_idx = row_idx >> 3;
+                            let bit_idx = row_idx & 7;
+                            byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                        } else {
+                            false
+                        };
+
+                        if is_null {
+                            builder.append_null();
+                        } else if let EncodedValue::Boolean(v) = &values[row_idx] {
+                            builder.append_value(*v);
+                        } else {
+                            builder.append_value(false);
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::Timestamp => {
+                    let mut builder = arrow::array::Int64Builder::with_capacity(indices.len());
+                    for &row_idx in indices {
+                        if row_idx >= self.row_count {
+                            continue;
+                        }
+                        let is_null = if let Some(bitmap) = null_bitmap {
+                            let byte_idx = row_idx >> 3;
+                            let bit_idx = row_idx & 7;
+                            byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                        } else {
+                            false
+                        };
+
+                        if is_null {
+                            builder.append_null();
+                        } else if let EncodedValue::Timestamp(v) = &values[row_idx] {
+                            builder.append_value(*v);
+                        } else {
+                            builder.append_value(0);
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::String => {
+                    let mut builder = arrow::array::StringBuilder::with_capacity(
+                        indices.len(),
+                        indices.len() * 20,
+                    );
+                    for &row_idx in indices {
+                        if row_idx >= self.row_count {
+                            continue;
+                        }
+                        let is_null = if let Some(bitmap) = null_bitmap {
+                            let byte_idx = row_idx >> 3;
+                            let bit_idx = row_idx & 7;
+                            byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                        } else {
+                            false
+                        };
+
+                        if is_null {
+                            builder.append_null();
+                        } else if let EncodedValue::String(v) = &values[row_idx] {
+                            builder.append_value(v);
+                        } else {
+                            builder.append_value("");
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+            }
+        }
+
+        let arrow_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        RecordBatch::try_new(arrow_schema, arrays)
+            .map_err(|e| PulsoraError::Internal(e.to_string()))
+    }
+
     /// Direct columnar to JSON conversion without intermediate HashMaps
     /// This is 5-10x faster than to_rows() + convert_row_to_json()
     #[allow(dead_code)]
@@ -673,11 +931,38 @@ impl ColumnBlock {
 
         // Manual decompression to get i64 directly
         // This duplicates logic from decompress_column but avoids EncodedValue allocation
-        let mut cursor = std::io::Cursor::new(compressed.as_slice());
-        let base = crate::storage::encoding::decode_varint_signed(&mut cursor)?;
-        let pos = cursor.position() as usize;
+        if compressed.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        crate::storage::compression::decompress_timestamps(base, &compressed[pos..], self.row_count)
+        let marker = compressed[0];
+        let mut cursor = std::io::Cursor::new(compressed.as_slice());
+        cursor.set_position(1);
+
+        if marker == 1 {
+            let base = crate::storage::encoding::decode_varint_signed(&mut cursor)?;
+            let _len = crate::storage::encoding::decode_varint(&mut cursor)?;
+            let pos = cursor.position() as usize;
+            crate::storage::compression::decompress_integers(
+                base,
+                &compressed[pos..],
+                self.row_count,
+            )
+        } else if marker == 4 {
+            let base = crate::storage::encoding::decode_varint(&mut cursor)? as i64;
+            let _len = crate::storage::encoding::decode_varint(&mut cursor)?;
+            let pos = cursor.position() as usize;
+            crate::storage::compression::decompress_timestamps(
+                base,
+                &compressed[pos..],
+                self.row_count,
+            )
+        } else {
+            Err(PulsoraError::Query(format!(
+                "Invalid timestamp column type: {}",
+                marker
+            )))
+        }
     }
 
     /// Filter rows by timestamp range using SIMD-optimized scanning
@@ -690,7 +975,6 @@ impl ColumnBlock {
     ) -> Result<Vec<usize>> {
         let timestamps = self.get_timestamp_values(schema)?;
         let mut indices = Vec::with_capacity(timestamps.len());
-
         use wide::i64x4;
 
         let _start_vec = i64x4::splat(start_ts);
