@@ -386,7 +386,7 @@ pub fn execute_query(
     Ok(results)
 }
 
-fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
+pub fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
     // Try parsing as Unix timestamp first
     if let Ok(ts) = timestamp.parse::<i64>() {
         if ts > 1_000_000_000 && ts < 4_000_000_000 {

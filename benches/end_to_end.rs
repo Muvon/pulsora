@@ -80,14 +80,8 @@ fn bench_http_ingestion(c: &mut Criterion) {
             |b, csv| {
                 b.iter(|| {
                     rt.block_on(async {
-                        // Use a different table name for each iteration to avoid conflicts
-                        let table_name = format!(
-                            "benchmark_table_{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos()
-                        );
+                        // Use a fixed table name to avoid opening too many files
+                        let table_name = "benchmark_table";
                         black_box(
                             storage
                                 .ingest_csv(&table_name, black_box(csv.clone()))
@@ -154,8 +148,8 @@ fn bench_mixed_workload(c: &mut Criterion) {
                                         .unwrap(),
                                 );
                             } else {
-                                // Write operation - use unique table name to avoid conflicts
-                                let table_name = format!("benchmark_table_write_{}", i);
+                                // Write operation - use limited set of tables to avoid file limit
+                                let table_name = format!("benchmark_table_write_{}", i % 10);
                                 let small_csv = generate_market_csv(10, &["AAPL"]);
                                 black_box(
                                     storage.ingest_csv(&table_name, small_csv).await.unwrap(),
@@ -194,15 +188,9 @@ fn bench_table_scaling(c: &mut Criterion) {
             |b, table_count| {
                 b.iter(|| {
                     rt.block_on(async {
-                        // Use unique table names for each iteration
-                        let iteration_id = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_nanos();
-
                         // Create and populate multiple tables
                         for i in 0..*table_count {
-                            let table_name = format!("table_{}_{}", iteration_id, i);
+                            let table_name = format!("table_{}", i);
                             let csv_data = generate_market_csv(100, &["AAPL"]);
 
                             black_box(storage.ingest_csv(&table_name, csv_data).await.unwrap());
@@ -210,7 +198,7 @@ fn bench_table_scaling(c: &mut Criterion) {
 
                         // Query from all tables
                         for i in 0..*table_count {
-                            let table_name = format!("table_{}_{}", iteration_id, i);
+                            let table_name = format!("table_{}", i);
                             black_box(
                                 storage
                                     .query(&table_name, None, None, Some(10), None)
@@ -274,14 +262,8 @@ fn bench_data_types(c: &mut Criterion) {
                             csv_data.push('\n');
                         }
 
-                        // Use unique table name for each iteration
-                        let table_name = format!(
-                            "benchmark_table_{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos()
-                        );
+                        // Use fixed table name per test case
+                        let table_name = format!("benchmark_table_{}", name);
                         black_box(storage.ingest_csv(&table_name, csv_data).await.unwrap())
                     })
                 })

@@ -23,6 +23,17 @@ pub struct StorageConfig {
     pub data_dir: String,
     pub write_buffer_size_mb: usize,
     pub max_open_files: i32,
+    pub buffer_size: usize,
+    pub flush_interval_ms: u64,
+    /// Enable Write-Ahead Log (WAL) for durability.
+    /// If true, buffered rows are written to disk immediately.
+    /// If false, buffered rows are lost on crash.
+    #[serde(default = "default_wal_enabled")]
+    pub wal_enabled: bool,
+}
+
+fn default_wal_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +69,9 @@ impl Default for Config {
                 data_dir: "./data".to_string(),
                 write_buffer_size_mb: 64,
                 max_open_files: 1000,
+                buffer_size: 1000,
+                flush_interval_ms: 1000,
+                wal_enabled: true,
             },
             ingestion: IngestionConfig {
                 max_csv_size_mb: 512,

@@ -34,6 +34,13 @@ Pulsora is a high-performance time series database built with Rust, designed for
 │  │           │                       │                        │
 │  │           ▼                       ▼                        │
 │  │  ┌─────────────────┐    ┌──────────────────┐               │
+│  │  │   Write Buffer  │    │   Write-Ahead    │               │
+│  │  │   (In-Memory)   │    │   Log (WAL)      │               │
+│  │  │   (Dedupe)      │    │   (Durability)   │               │
+│  │  └─────────────────┘    └──────────────────┘               │
+│  │           │                       │                        │
+│  │           ▼                       ▼                        │
+│  │  ┌─────────────────┐    ┌──────────────────┐               │
 │  │  │   Compression   │    │   Encoding       │               │
 │  │  │   Engine        │    │   Engine         │               │
 │  │  │   (Gorilla/XOR) │    │   (Varint/Float) │               │
@@ -129,6 +136,20 @@ pub enum DataType {
 - Date-only formats
 - Automatic timezone handling
 
+### 4. Write Buffer & WAL
+**Location:** `src/storage/buffer.rs`, `src/storage/wal.rs`
+
+**Write Buffer (`TableBuffer`):**
+- Accumulates rows in memory to create large, efficiently compressed blocks.
+- Uses `HashMap` for deduplication (Latest Write Wins).
+- Flushes to RocksDB based on size (`buffer_size`) or time (`flush_interval_ms`).
+- Supports "Batch Only" mode (`flush_interval_ms = 0`) for maximum compression.
+
+**Write-Ahead Log (WAL):**
+- Ensures durability for buffered rows.
+- Appends every row to a local file (`.wal`) before adding to memory.
+- Automatically recovers data on server restart.
+- Truncated after successful flush to RocksDB.
 ### 4. Columnar Storage Engine
 
 **Location:** `src/storage/columnar.rs`
