@@ -19,6 +19,8 @@
 use crate::error::{PulsoraError, Result};
 use crate::storage::encoding::{self, EncodedValue};
 use crate::storage::schema::{DataType, Schema};
+use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Read;
@@ -91,6 +93,145 @@ impl ColumnBlock {
         let column_results = column_results?;
 
         // Build the final HashMaps from parallel results
+        let mut columns = HashMap::with_capacity(schema.columns.len());
+        let mut null_bitmaps = HashMap::with_capacity(schema.columns.len());
+
+        for (name, compressed_data, null_bitmap) in column_results {
+            columns.insert(name.clone(), compressed_data);
+            null_bitmaps.insert(name, null_bitmap);
+        }
+
+        Ok(ColumnBlock {
+            row_count,
+            columns,
+            null_bitmaps,
+        })
+    }
+
+    /// Create a new column block directly from an Arrow RecordBatch (Fast Path)
+    pub fn from_arrow(
+        batch: &RecordBatch,
+        schema: &Schema,
+        ids: &[u64], // Pre-resolved IDs
+    ) -> Result<Self> {
+        let row_count = batch.num_rows();
+        if row_count != ids.len() {
+            return Err(PulsoraError::InvalidData(format!(
+                "Row count mismatch: batch has {}, ids has {}",
+                row_count,
+                ids.len()
+            )));
+        }
+
+        // Process columns in parallel
+        let column_results: Result<Vec<_>> = schema
+            .columns
+            .par_iter()
+            .map(|column| {
+                let mut values = Vec::with_capacity(row_count);
+                let mut null_bitmap = vec![0u8; row_count.div_ceil(8)];
+
+                // Handle ID column specially
+                if column.name == schema.id_column {
+                    for &id in ids.iter() {
+                        values.push(EncodedValue::Id(id));
+                        // IDs are never null in our internal storage
+                    }
+                } else {
+                    // Find corresponding Arrow column
+                    // Note: Arrow column name might match our schema column name
+                    if let Ok(arrow_col) = batch.column_by_name(&column.name).ok_or(()) {
+                        // Convert Arrow array to EncodedValues
+                        for i in 0..row_count {
+                            if arrow_col.is_null(i) {
+                                let byte_idx = i >> 3;
+                                let bit_idx = i & 7;
+                                null_bitmap[byte_idx] |= 1 << bit_idx;
+                                values.push(default_value(&column.data_type));
+                            } else {
+                                let val = match &column.data_type {
+                                    DataType::Integer => {
+                                        // Try to cast to Int64Array
+                                        if let Some(arr) =
+                                            arrow_col.as_any().downcast_ref::<Int64Array>()
+                                        {
+                                            EncodedValue::Integer(arr.value(i))
+                                        } else {
+                                            // Fallback for other integer types if needed, or error
+                                            // For now assume Int64 as per our simple schema
+                                            EncodedValue::Integer(0)
+                                        }
+                                    }
+                                    DataType::Float => {
+                                        if let Some(arr) =
+                                            arrow_col.as_any().downcast_ref::<Float64Array>()
+                                        {
+                                            EncodedValue::Float(arr.value(i))
+                                        } else {
+                                            EncodedValue::Float(0.0)
+                                        }
+                                    }
+                                    DataType::Boolean => {
+                                        if let Some(arr) =
+                                            arrow_col.as_any().downcast_ref::<BooleanArray>()
+                                        {
+                                            EncodedValue::Boolean(arr.value(i))
+                                        } else {
+                                            EncodedValue::Boolean(false)
+                                        }
+                                    }
+                                    DataType::String => {
+                                        if let Some(arr) =
+                                            arrow_col.as_any().downcast_ref::<StringArray>()
+                                        {
+                                            EncodedValue::String(arr.value(i).to_string())
+                                        } else {
+                                            EncodedValue::String(String::new())
+                                        }
+                                    }
+                                    DataType::Timestamp => {
+                                        // Expecting string or int64 for timestamp
+                                        if let Some(arr) =
+                                            arrow_col.as_any().downcast_ref::<Int64Array>()
+                                        {
+                                            EncodedValue::Timestamp(arr.value(i))
+                                        } else if let Some(arr) =
+                                            arrow_col.as_any().downcast_ref::<StringArray>()
+                                        {
+                                            // Parse string timestamp
+                                            use crate::storage::ingestion::parse_timestamp;
+                                            let ts = parse_timestamp(arr.value(i)).unwrap_or(0);
+                                            EncodedValue::Timestamp(ts)
+                                        } else {
+                                            EncodedValue::Timestamp(0)
+                                        }
+                                    }
+                                    DataType::Id => {
+                                        // Should be handled by the special case above, but if it's a secondary ID...
+                                        EncodedValue::Id(0)
+                                    }
+                                };
+                                values.push(val);
+                            }
+                        }
+                    } else {
+                        // Column missing in Arrow batch - fill with defaults/nulls
+                        for i in 0..row_count {
+                            let byte_idx = i >> 3;
+                            let bit_idx = i & 7;
+                            null_bitmap[byte_idx] |= 1 << bit_idx;
+                            values.push(default_value(&column.data_type));
+                        }
+                    }
+                }
+
+                let compressed = compress_column(&values, &column.data_type)?;
+                Ok((column.name.clone(), compressed, null_bitmap))
+            })
+            .collect();
+
+        let column_results = column_results?;
+
         let mut columns = HashMap::with_capacity(schema.columns.len());
         let mut null_bitmaps = HashMap::with_capacity(schema.columns.len());
 

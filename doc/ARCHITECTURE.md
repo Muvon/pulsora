@@ -20,9 +20,9 @@ Pulsora is a high-performance time series database built with Rust, designed for
 │  ┌─────────────────────────────────────────────────────────────┤
 │  │                Storage Engine                               │
 │  │  ┌─────────────────┐    ┌──────────────────┐               │
-│  │  │   Schema        │    │   CSV Ingestion  │               │
+│  │  │   Schema        │    │   Ingestion      │               │
 │  │  │   Management    │    │   Engine         │               │
-│  │  │   (Dynamic)     │    │   (Streaming)    │               │
+│  │  │   (Dynamic)     │    │   (CSV/Arrow/PB) │               │
 │  │  └─────────────────┘    └──────────────────┘               │
 │  │           │                       │                        │
 │  │           ▼                       ▼                        │
@@ -66,8 +66,8 @@ Pulsora is a high-performance time series database built with Rust, designed for
 **Location:** `src/server.rs`
 
 - **Framework:** Axum with Tokio async runtime
-- **Features:** CORS support, JSON responses, structured error handling
-- **Endpoints:** Health check, CSV ingestion, data querying, schema introspection, table management
+- **Features:** CORS support, JSON/Arrow/Protobuf responses, structured error handling
+- **Endpoints:** Health check, Multi-format ingestion, data querying, schema introspection
 - **Middleware:** Access logging with correlation IDs, performance logging
 - **Request Tracing:** UUID-based correlation IDs for request tracking
 
@@ -80,8 +80,8 @@ Pulsora is a high-performance time series database built with Rust, designed for
 **Endpoints:**
 - `GET /health` - Server health and version
 - `GET /tables` - List all tables
-- `POST /tables/{name}/ingest` - CSV data ingestion
-- `GET /tables/{name}/query` - Time-range queries with pagination
+- `POST /tables/{name}/ingest` - Data ingestion (CSV, Arrow IPC, Protobuf)
+- `GET /tables/{name}/query` - Time-range queries (supports JSON, Arrow, Protobuf, CSV output)
 - `GET /tables/{name}/schema` - Schema information
 - `GET /tables/{name}/count` - Row count
 - `GET /tables/{name}/rows/{id}` - Get row by ID
@@ -182,7 +182,8 @@ pub struct ColumnBlock {
 **Location:** `src/storage/ingestion.rs`
 
 **Features:**
-- Streaming CSV processing with configurable batch sizes
+- Multi-format support: CSV, Apache Arrow IPC, Protocol Buffers
+- Streaming processing with configurable batch sizes
 - Block-based ingestion with row pointer generation
 - Data validation against schema with type coercion
 - Efficient binary key encoding for time-ordered storage
@@ -335,15 +336,15 @@ pub struct Config {
 ### Ingestion Flow
 
 ```
-CSV Data → Stream Processing → Parse Headers → Infer/Validate Schema →
-Parse Rows → Group into Chunks → Create ColumnBlocks →
+Input Data (CSV/Arrow/Proto) → Format Parser → Standardize Rows →
+Infer/Validate Schema → Group into Chunks → Create ColumnBlocks →
 Compress Columns → Generate BlockID → Store Block →
 Generate RowPointers → Batch Write to RocksDB → Return Statistics
 ```
 
 **Detailed Steps:**
-1. **Stream Processing:** Handle large CSV uploads with configurable body size limits
-2. **Schema Inference:** Analyze all values (not just first row) for accurate type detection
+1. **Format Parsing:** Detect content type and parse input (Stream CSV, Zero-copy Arrow, or Protobuf)
+2. **Schema Inference:** Analyze values for accurate type detection (automatic for Arrow/Proto)
 3. **Batch Processing:** Group rows into configurable chunks for optimal compression
 4. **Columnar Compression:** Apply type-specific compression algorithms
 5. **Block Storage:** Store compressed blocks with unique identifiers
@@ -353,10 +354,11 @@ Generate RowPointers → Batch Write to RocksDB → Return Statistics
 ### Query Flow
 
 ```
-HTTP Request → Parse Parameters → Build Binary Key Range →
+```
+HTTP Request (Accept Header) → Parse Parameters → Build Binary Key Range →
 RocksDB Iterator → Collect RowPointers → Group by BlockID →
 Batch Fetch Blocks → Decompress & Cache → Extract Rows →
-Convert to JSON → Apply Pagination → HTTP Response
+Serialize (JSON/Arrow/Proto/CSV) → Apply Pagination → HTTP Response
 ```
 
 **Detailed Steps:**
@@ -365,9 +367,8 @@ Convert to JSON → Apply Pagination → HTTP Response
 3. **Iterator Processing:** Use RocksDB iterators for efficient range scans
 4. **Block Grouping:** Minimize I/O by batching requests for same blocks
 5. **Caching:** Cache decompressed blocks to avoid repeated decompression
-6. **JSON Conversion:** Type-aware conversion with proper numeric handling
+6. **Serialization:** Convert internal row format to requested output format (JSON, Arrow Stream, Protobuf, or CSV)
 7. **Pagination:** Efficient offset-based pagination with limit enforcement
-
 ## Storage Design
 
 ### Block-Based Columnar Storage

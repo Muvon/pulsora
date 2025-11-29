@@ -73,4 +73,7 @@ impl TableBuffer {
         self.last_flush = Instant::now();
         Ok(())
     }
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }

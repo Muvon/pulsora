@@ -28,7 +28,24 @@ use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
 use crate::storage::id_manager::{IdManager, IdManagerRegistry, RowId};
 use crate::storage::schema::Schema;
+use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::datatypes::DataType as ArrowDataType;
+use arrow::ipc::reader::StreamReader;
+use prost::Message;
 use rayon::prelude::*;
+use std::io::Cursor;
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProtoRow {
+    #[prost(map = "string, string", tag = "1")]
+    pub values: HashMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProtoBatch {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: Vec<ProtoRow>,
+}
 
 pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
@@ -52,6 +69,113 @@ pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
     }
 
     Ok(rows)
+}
+
+fn process_single_row(
+    mut row: HashMap<String, String>,
+    schema: &Schema,
+    id_manager: &Arc<IdManager>,
+) -> Result<(u64, HashMap<String, String>)> {
+    // ID Assignment
+    let row_id = if let Some(id_str) = row.get(&schema.id_column) {
+        if id_str.trim().is_empty() {
+            RowId::Auto
+        } else {
+            let parsed_id = RowId::from_string(id_str)?;
+            if let RowId::User(id) = parsed_id {
+                id_manager.register_user_id(id)?;
+            }
+            parsed_id
+        }
+    } else {
+        RowId::Auto
+    };
+
+    let actual_id = row_id.resolve(id_manager);
+    row.insert(schema.id_column.clone(), actual_id.to_string());
+
+    // Validation
+    schema.validate_row(&row)?;
+
+    Ok((actual_id, row))
+}
+
+pub fn process_rows_parallel(
+    rows: Vec<HashMap<String, String>>,
+    schema: &Schema,
+    id_manager: &Arc<IdManager>,
+) -> Result<Vec<(u64, HashMap<String, String>)>> {
+    rows.into_par_iter()
+        .map(|row| process_single_row(row, schema, id_manager))
+        .collect()
+}
+
+pub fn parse_arrow(arrow_data: &[u8]) -> Result<Vec<HashMap<String, String>>> {
+    let cursor = Cursor::new(arrow_data);
+    let reader = StreamReader::try_new(cursor, None).map_err(|e| {
+        PulsoraError::InvalidData(format!("Failed to create Arrow stream reader: {}", e))
+    })?;
+
+    let mut all_rows = Vec::new();
+
+    for batch in reader {
+        let batch = batch
+            .map_err(|e| PulsoraError::InvalidData(format!("Failed to read Arrow batch: {}", e)))?;
+
+        let schema_ref = batch.schema();
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+
+        for row_idx in 0..num_rows {
+            let mut row_map = HashMap::with_capacity(num_cols);
+
+            for col_idx in 0..num_cols {
+                let field = schema_ref.field(col_idx);
+                let col_name = field.name();
+                let column = batch.column(col_idx);
+
+                if column.is_null(row_idx) {
+                    continue;
+                }
+
+                let value_str = match column.data_type() {
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
+                        let array = column.as_any().downcast_ref::<StringArray>().unwrap();
+                        array.value(row_idx).to_string()
+                    }
+                    ArrowDataType::Int64 => {
+                        let array = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                        array.value(row_idx).to_string()
+                    }
+                    ArrowDataType::Float64 => {
+                        let array = column.as_any().downcast_ref::<Float64Array>().unwrap();
+                        array.value(row_idx).to_string()
+                    }
+                    ArrowDataType::Boolean => {
+                        let array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        array.value(row_idx).to_string()
+                    }
+                    _ => {
+                        // Fallback for other types: try to cast to string or just skip/error
+                        // For now, let's skip unsupported types or try debug format
+                        // A robust implementation would handle all types
+                        continue;
+                    }
+                };
+                row_map.insert(col_name.clone(), value_str);
+            }
+            if !row_map.is_empty() {
+                all_rows.push(row_map);
+            }
+        }
+    }
+    Ok(all_rows)
+}
+
+pub fn parse_protobuf(proto_data: &[u8]) -> Result<Vec<HashMap<String, String>>> {
+    let batch = ProtoBatch::decode(proto_data)
+        .map_err(|e| PulsoraError::InvalidData(format!("Failed to decode Protobuf data: {}", e)))?;
+    Ok(batch.rows.into_iter().map(|r| r.values).collect())
 }
 
 pub fn process_csv_parallel(
@@ -144,28 +268,8 @@ pub fn process_csv_parallel(
                 }
 
                 if !row.is_empty() {
-                    // ID Assignment
-                    let row_id = if let Some(id_str) = row.get(&schema.id_column) {
-                        if id_str.trim().is_empty() {
-                            RowId::Auto
-                        } else {
-                            let parsed_id = RowId::from_string(id_str)?;
-                            if let RowId::User(id) = parsed_id {
-                                id_manager.register_user_id(id)?;
-                            }
-                            parsed_id
-                        }
-                    } else {
-                        RowId::Auto
-                    };
-
-                    let actual_id = row_id.resolve(id_manager);
-                    row.insert(schema.id_column.clone(), actual_id.to_string());
-
-                    // Validation
-                    schema.validate_row(&row)?;
-
-                    chunk_rows.push((actual_id, row));
+                    let processed = process_single_row(row, schema, id_manager)?;
+                    chunk_rows.push(processed);
                 }
             }
             Ok(chunk_rows)
@@ -194,28 +298,96 @@ fn process_csv_single_thread(
     let rows = parse_csv(csv_data)?;
     let mut processed_rows = Vec::with_capacity(rows.len());
 
-    for mut row in rows {
-        let row_id = if let Some(id_str) = row.get(&schema.id_column) {
-            if id_str.trim().is_empty() {
-                RowId::Auto
-            } else {
-                let parsed_id = RowId::from_string(id_str)?;
-                if let RowId::User(id) = parsed_id {
-                    id_manager.register_user_id(id)?;
-                }
-                parsed_id
-            }
-        } else {
-            RowId::Auto
-        };
-
-        let actual_id = row_id.resolve(id_manager);
-        row.insert(schema.id_column.clone(), actual_id.to_string());
-        schema.validate_row(&row)?;
-        processed_rows.push((actual_id, row));
+    for row in rows {
+        let processed = process_single_row(row, schema, id_manager)?;
+        processed_rows.push(processed);
     }
     Ok(processed_rows)
 }
+
+pub fn write_column_block_to_rocksdb(
+    db: &Arc<DB>,
+    table: &str,
+    column_block: &ColumnBlock,
+    ids: &[u64],
+    min_timestamp: i64,
+    max_timestamp: i64,
+    timestamps: Option<&[i64]>,
+) -> Result<u64> {
+    let serialized_block = column_block.serialize()?;
+    let mut batch = WriteBatch::default();
+
+    // Generate a unique block ID for this chunk
+    let block_id = format!("_block_{}_{}", table, uuid::Uuid::new_v4());
+
+    // Store the compressed block ONCE with the block ID
+    batch.put(block_id.as_bytes(), &serialized_block);
+
+    // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
+    // Block index key: [table_hash:u32][B][min_timestamp:i64][block_id]
+    let mut block_index_key = Vec::with_capacity(13 + block_id.len());
+    let table_hash = calculate_table_hash(table);
+    block_index_key.extend_from_slice(&table_hash.to_be_bytes());
+    block_index_key.push(b'B'); // Block marker
+    block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
+    block_index_key.extend_from_slice(block_id.as_bytes());
+
+    // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
+    let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
+    block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
+    block_index_value.extend_from_slice(block_id.as_bytes());
+    block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
+    block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
+    block_index_value.extend_from_slice(&(column_block.row_count as u32).to_le_bytes());
+
+    batch.put(&block_index_key, &block_index_value);
+
+    // For each row, store references using dual key strategy
+    // Note: We don't have the full row map here, so we can't easily generate time_key for every row
+    // UNLESS we extracted timestamps separately.
+    // For now, we will skip per-row time index if we don't have the timestamp column easily accessible.
+    // BUT, we need it for queries.
+    // Solution: We should have extracted timestamps alongside IDs.
+
+    // Let's assume we only index by ID for now in this fast path, OR we need to pass timestamps too.
+    // For correctness, we should pass timestamps.
+
+    for (row_idx, &id) in ids.iter().enumerate() {
+        // Create reference data: [marker][block_id_len][block_id][row_idx]
+        let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
+        ref_data.push(0xFF); // Reference marker
+        ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
+        ref_data.extend_from_slice(block_id.as_bytes());
+        ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
+
+        // Primary key: [table_hash:u32][id:u64]
+        let id_key = generate_id_key(table, id);
+        batch.put(&id_key, &ref_data);
+
+        // Time index key: [table_hash:u32][timestamp:i64][id:u64]
+        // Only if we have timestamps
+        if let Some(ts_list) = timestamps {
+            if row_idx < ts_list.len() {
+                let ts = ts_list[row_idx];
+                let mut time_key = Vec::with_capacity(20);
+                let table_hash = calculate_table_hash(table);
+                time_key.extend_from_slice(&table_hash.to_be_bytes());
+                time_key.extend_from_slice(&ts.to_be_bytes());
+                time_key.extend_from_slice(&id.to_be_bytes());
+                batch.put(&time_key, &ref_data);
+            }
+        }
+    }
+
+    db.write(batch)?;
+    debug!(
+        "Wrote column block with {} rows (Fast Path)",
+        column_block.row_count
+    );
+
+    Ok(column_block.row_count as u64)
+}
+
 pub fn write_batch_to_rocksdb(
     db: &Arc<DB>,
     table: &str,

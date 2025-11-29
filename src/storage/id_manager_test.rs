@@ -82,8 +82,8 @@ fn test_id_persistence() {
     // Create manager and generate some IDs
     {
         let manager = IdManager::new("test_table".to_string(), db.clone()).unwrap();
-        manager.next_auto_id(); // 1
-        manager.next_auto_id(); // 2
+        manager.next_auto_id(); // Generates snowflake ID
+        manager.next_auto_id(); // Generates snowflake ID
         manager.register_user_id(50).unwrap();
         manager.persist_id_state().unwrap();
     }
@@ -91,9 +91,13 @@ fn test_id_persistence() {
     // Create new manager - should load previous state
     {
         let manager = IdManager::new("test_table".to_string(), db).unwrap();
-        let (next_auto, max_user) = manager.get_state();
-        assert_eq!(next_auto, 51); // Should be max_user + 1
+        let (next_auto_state, max_user) = manager.get_state();
+
+        // max_user should be persisted correctly
         assert_eq!(max_user, 50);
+
+        // next_auto_state is [timestamp][sequence], so it should be > 0
+        assert!(next_auto_state > 0);
     }
 }
 

@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{PulsoraError, Result};
+use arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 
 /// Supported data types for time series data
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -161,6 +162,99 @@ impl SchemaManager {
         self.schemas.insert(table.to_string(), schema.clone());
 
         Ok(schema)
+    }
+
+    pub fn register_schema(&mut self, table: &str, schema: Schema) -> Result<Schema> {
+        self.save_schema_to_db(table, &schema)?;
+        self.schemas.insert(table.to_string(), schema.clone());
+        Ok(schema)
+    }
+
+    pub fn infer_schema_from_arrow(
+        &self,
+        table: &str,
+        arrow_schema: &ArrowSchema,
+    ) -> Result<Schema> {
+        let mut columns = Vec::new();
+        let mut column_order = Vec::new();
+        let mut id_column = "id".to_string();
+        let mut timestamp_column = None;
+        let mut has_id = false;
+
+        for field in arrow_schema.fields() {
+            let name = field.name();
+            let dtype = match field.data_type() {
+                ArrowDataType::Int8
+                | ArrowDataType::Int16
+                | ArrowDataType::Int32
+                | ArrowDataType::Int64 => {
+                    if name.to_lowercase() == "id" {
+                        DataType::Id
+                    } else if name.to_lowercase().contains("timestamp")
+                        || name.to_lowercase() == "ts"
+                        || name.to_lowercase() == "time"
+                    {
+                        DataType::Timestamp
+                    } else {
+                        DataType::Integer
+                    }
+                }
+                ArrowDataType::UInt8
+                | ArrowDataType::UInt16
+                | ArrowDataType::UInt32
+                | ArrowDataType::UInt64 => {
+                    if name.to_lowercase() == "id" {
+                        DataType::Id
+                    } else {
+                        DataType::Integer
+                    }
+                }
+                ArrowDataType::Float16 | ArrowDataType::Float32 | ArrowDataType::Float64 => {
+                    DataType::Float
+                }
+                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => DataType::String,
+                ArrowDataType::Boolean => DataType::Boolean,
+                ArrowDataType::Timestamp(_, _) | ArrowDataType::Date32 | ArrowDataType::Date64 => {
+                    DataType::Timestamp
+                }
+                _ => DataType::String,
+            };
+
+            if dtype == DataType::Id {
+                id_column = name.clone();
+                has_id = true;
+            } else if dtype == DataType::Timestamp {
+                if timestamp_column.is_none() {
+                    timestamp_column = Some(name.clone());
+                }
+            }
+
+            columns.push(Column {
+                name: name.clone(),
+                data_type: dtype,
+                nullable: field.is_nullable(),
+            });
+            column_order.push(name.clone());
+        }
+
+        // Ensure ID column exists
+        if !has_id {
+            columns.push(Column {
+                name: id_column.clone(),
+                data_type: DataType::Id,
+                nullable: false,
+            });
+            column_order.push(id_column.clone());
+        }
+
+        Ok(Schema {
+            table_name: table.to_string(),
+            columns,
+            column_order,
+            timestamp_column,
+            id_column,
+            created_at: Utc::now(),
+        })
     }
 
     fn infer_schema_from_rows(
@@ -454,3 +548,7 @@ impl Schema {
         self.timestamp_column.as_deref()
     }
 }
+
+#[cfg(test)]
+#[path = "schema_test.rs"]
+mod schema_test;

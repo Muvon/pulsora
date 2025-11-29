@@ -269,3 +269,60 @@ fn test_parse_timestamp() {
     assert!(parse_timestamp("1704110400").is_ok()); // Unix timestamp
     assert!(parse_timestamp("invalid").is_err());
 }
+#[test]
+fn test_parse_protobuf() {
+    let mut values1 = HashMap::new();
+    values1.insert("key1".to_string(), "value1".to_string());
+    values1.insert("key2".to_string(), "value2".to_string());
+
+    let mut values2 = HashMap::new();
+    values2.insert("key3".to_string(), "value3".to_string());
+
+    let batch = ProtoBatch {
+        rows: vec![ProtoRow { values: values1 }, ProtoRow { values: values2 }],
+    };
+
+    let mut buf = Vec::new();
+    batch.encode(&mut buf).unwrap();
+
+    let rows = parse_protobuf(&buf).unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("key1"), Some(&"value1".to_string()));
+    assert_eq!(rows[0].get("key2"), Some(&"value2".to_string()));
+    assert_eq!(rows[1].get("key3"), Some(&"value3".to_string()));
+}
+
+#[test]
+fn test_parse_arrow() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let ids = Int64Array::from(vec![1, 2]);
+    let names = StringArray::from(vec!["Alice", "Bob"]);
+
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(names)]).unwrap();
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let rows = parse_arrow(&buf).unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("id"), Some(&"1".to_string()));
+    assert_eq!(rows[0].get("name"), Some(&"Alice".to_string()));
+    assert_eq!(rows[1].get("id"), Some(&"2".to_string()));
+    assert_eq!(rows[1].get("name"), Some(&"Bob".to_string()));
+}
