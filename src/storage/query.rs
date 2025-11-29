@@ -134,7 +134,7 @@ pub fn execute_query(
         i64::MAX
     };
 
-    let limit = limit.unwrap_or(1000).min(10000);
+    let limit = limit.unwrap_or(1000);
     let offset = offset.unwrap_or(0);
 
     // Build block index scan key - start from beginning and filter later
