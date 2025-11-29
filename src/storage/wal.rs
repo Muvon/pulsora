@@ -45,6 +45,27 @@ impl WriteAheadLog {
 
         Ok(())
     }
+    pub fn append_batch(&self, rows: &[(u64, HashMap<String, String>)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut buffer = Vec::new();
+        for (id, row) in rows {
+            let json = serde_json::to_vec(&(id, row)).map_err(|e| {
+                PulsoraError::Ingestion(format!("Failed to serialize WAL entry: {}", e))
+            })?;
+            let len = json.len() as u32;
+            buffer.extend_from_slice(&len.to_le_bytes());
+            buffer.extend_from_slice(&json);
+        }
+
+        let mut file = self.file.lock().unwrap();
+        file.write_all(&buffer)?;
+        file.flush()?; // Ensure durability
+
+        Ok(())
+    }
 
     pub fn replay(&self) -> Result<Vec<(u64, HashMap<String, String>)>> {
         let _file = self.file.lock().unwrap();

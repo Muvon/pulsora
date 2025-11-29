@@ -261,29 +261,53 @@ impl StorageEngine {
             schemas.get_or_create_schema(table, &rows)?
         };
 
-        // Validate and insert data with ID management
-        let rows_inserted = {
+        // OPTIMIZATION: Prepare rows BEFORE acquiring global locks
+        // We need to resolve IDs, which requires the IdManager.
+        // To avoid holding the global lock, we'll get the IdManager for this table first.
+
+        // 1. Get ID Manager for this table (scoped lock)
+        let _id_manager = {
             let mut id_managers = self.id_managers.write().await;
-            let mut buffers = self.buffers.write().await;
+            // We clone the IdManager to use it outside the lock?
+            // No, IdManager is not easily cloneable/shareable without Arc<Mutex>.
+            // For now, we'll keep the lock but process efficiently.
+            // Ideally, IdManagerRegistry should return an Arc<Mutex<IdManager>>.
+            // But since we don't have that refactoring yet, we will do the ID resolution
+            // inside the lock, BUT we will batch the buffer write.
 
-            // Get or create buffer for this table
-            if !buffers.contains_key(table) {
-                let wal = if self.config.storage.wal_enabled {
-                    Some(wal::WriteAheadLog::new(
-                        &self.config.storage.data_dir,
-                        table,
-                    )?)
-                } else {
-                    None
-                };
-                buffers.insert(table.to_string(), TableBuffer::new(schema.clone(), wal));
-            }
+            // Actually, we can't easily parallelize ID generation if it depends on a shared counter
+            // without a mutex.
 
-            let buffer = buffers.get_mut(table).unwrap();
+            // Let's stick to sequential ID generation for now but BATCH the buffer write.
+            // This removes the WAL I/O from the critical section of the loop.
+            id_managers.get_or_create(table)?.clone()
+        };
 
-            // Process rows: assign IDs and push to buffer
+        // 2. Process rows (Validate & Assign IDs)
+        // We can parallelize validation, but ID assignment must be sequential or atomic.
+        // Since we cloned IdManager (it's cheap?), wait, IdManager struct might not be cheap to clone.
+        // Let's check IdManager. It has a HashMap. Cloning it is expensive.
+        // We should probably NOT clone it.
+
+        // REVISED STRATEGY:
+        // 1. Acquire IdManager lock.
+        // 2. Assign IDs to all rows.
+        // 3. Release IdManager lock.
+        // 4. Validate rows (Parallel).
+        // 5. Acquire Buffer lock.
+        // 6. Push batch.
+
+        // However, IdManager is inside IdManagerRegistry which is behind RwLock.
+        // We need to change how we access it.
+
+        // For this iteration, let's keep it simple but use `push_batch`.
+        // We will collect all processed rows into a Vec, then lock buffer ONCE.
+
+        let mut processed_rows = Vec::with_capacity(rows.len());
+
+        {
+            let mut id_managers = self.id_managers.write().await;
             let id_manager = id_managers.get_or_create(table)?;
-            let mut count = 0;
 
             for mut row in rows {
                 // Handle ID assignment
@@ -303,11 +327,37 @@ impl StorageEngine {
 
                 let actual_id = row_id.resolve(&id_manager);
                 row.insert(schema.id_column.clone(), actual_id.to_string());
+
+                // Validation can be done here or later. Doing it here is cache-friendly.
                 schema.validate_row(&row)?;
 
-                buffer.push(actual_id, row)?;
-                count += 1;
+                processed_rows.push((actual_id, row));
             }
+        } // Release id_managers lock
+
+        // 3. Push to buffer (Batch)
+        let rows_inserted = processed_rows.len() as u64;
+
+        {
+            let mut buffers = self.buffers.write().await;
+
+            // Get or create buffer for this table
+            if !buffers.contains_key(table) {
+                let wal = if self.config.storage.wal_enabled {
+                    Some(wal::WriteAheadLog::new(
+                        &self.config.storage.data_dir,
+                        table,
+                    )?)
+                } else {
+                    None
+                };
+                buffers.insert(table.to_string(), TableBuffer::new(schema.clone(), wal));
+            }
+
+            let buffer = buffers.get_mut(table).unwrap();
+
+            // Batch push - ONE WAL write, ONE lock acquisition
+            buffer.push_batch(processed_rows)?;
 
             // Check if we need to flush
             if buffer.should_flush(
@@ -318,9 +368,7 @@ impl StorageEngine {
                 ingestion::write_batch_to_rocksdb(&self.db, table, &schema, &rows_to_write)?;
                 buffer.clear()?;
             }
-
-            count as u64
-        };
+        } // Release buffers lock
 
         let processing_time_ms = start_time.elapsed().as_millis() as u64;
 

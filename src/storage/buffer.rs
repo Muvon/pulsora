@@ -28,6 +28,18 @@ impl TableBuffer {
         self.rows.insert(id, row);
         Ok(())
     }
+    pub fn push_batch(
+        &mut self,
+        rows: Vec<(u64, HashMap<String, String>)>,
+    ) -> crate::error::Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.append_batch(&rows)?;
+        }
+        for (id, row) in rows {
+            self.rows.insert(id, row);
+        }
+        Ok(())
+    }
 
     pub fn should_flush(&self, buffer_size: usize, flush_interval_ms: u64) -> bool {
         if self.rows.len() >= buffer_size {
