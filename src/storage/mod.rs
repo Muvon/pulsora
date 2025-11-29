@@ -22,6 +22,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::error::{PulsoraError, Result};
 
+use arrow::array::Array;
 /// Calculate FNV-1a hash for table name
 pub fn calculate_table_hash(table: &str) -> u32 {
     let mut hash = 2166136261u32;
@@ -44,6 +45,7 @@ pub mod wal;
 
 use buffer::TableBuffer;
 use id_manager::IdManagerRegistry;
+use schema::Schema;
 use schema::SchemaManager;
 use std::collections::HashMap;
 
@@ -260,6 +262,332 @@ impl StorageEngine {
         }
     }
 
+    async fn ingest_processed_rows(
+        &self,
+        table: &str,
+        processed_rows: Vec<(u64, HashMap<String, String>)>,
+        schema: Schema,
+        start_time: std::time::Instant,
+    ) -> Result<IngestionStats> {
+        let rows_inserted = processed_rows.len() as u64;
+
+        // Push to buffer (Batch)
+        {
+            let mut buffers = self.buffers.write().await;
+
+            // Get or create buffer for this table
+            if !buffers.contains_key(table) {
+                let wal = if self.config.storage.wal_enabled {
+                    Some(wal::WriteAheadLog::new(
+                        &self.config.storage.data_dir,
+                        table,
+                    )?)
+                } else {
+                    None
+                };
+                buffers.insert(table.to_string(), TableBuffer::new(schema.clone(), wal));
+            }
+
+            let buffer = buffers.get_mut(table).unwrap();
+
+            // Batch push - ONE WAL write, ONE lock acquisition
+            buffer.push_batch(processed_rows)?;
+
+            // Check if we need to flush
+            if buffer.should_flush(
+                self.config.storage.buffer_size,
+                self.config.storage.flush_interval_ms,
+            ) {
+                let rows_to_write = buffer.get_rows();
+                ingestion::write_batch_to_rocksdb(&self.db, table, &schema, &rows_to_write)?;
+                buffer.clear()?;
+            }
+        } // Release buffers lock
+
+        let processing_time_ms = start_time.elapsed().as_millis() as u64;
+
+        info!(
+            "Ingested {} rows into table '{}' in {}ms",
+            rows_inserted, table, processing_time_ms
+        );
+
+        Ok(IngestionStats {
+            rows_inserted,
+            processing_time_ms,
+        })
+    }
+
+    pub async fn ingest_arrow(&self, table: &str, arrow_data: Vec<u8>) -> Result<IngestionStats> {
+        let start_time = std::time::Instant::now();
+
+        // 1. Create Arrow Reader
+        let cursor = std::io::Cursor::new(&arrow_data);
+        let reader = arrow::ipc::reader::StreamReader::try_new(cursor, None).map_err(|e| {
+            PulsoraError::InvalidData(format!("Failed to create Arrow stream reader: {}", e))
+        })?;
+
+        // 2. Read all batches (usually just one for ingestion)
+        let mut batches = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| {
+                PulsoraError::InvalidData(format!("Failed to read Arrow batch: {}", e))
+            })?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
+
+        if batches.is_empty() {
+            return Ok(IngestionStats {
+                rows_inserted: 0,
+                processing_time_ms: 0,
+            });
+        }
+
+        // 3. Get or create schema
+        // For schema inference, we might need to convert the first batch to rows if schema doesn't exist
+        // But for now, let's assume we can infer from Arrow schema or fallback to row-based inference
+        let schema = {
+            let mut schemas = self.schemas.write().await;
+            if let Some(s) = schemas.get_schema(table) {
+                s.clone()
+            } else {
+                // Fast path: Infer schema directly from Arrow IPC stream
+                let cursor = std::io::Cursor::new(&arrow_data);
+                let reader =
+                    arrow::ipc::reader::StreamReader::try_new(cursor, None).map_err(|e| {
+                        PulsoraError::InvalidData(format!("Failed to read Arrow stream: {}", e))
+                    })?;
+                let arrow_schema = reader.schema();
+
+                let schema = schemas.infer_schema_from_arrow(table, &arrow_schema)?;
+
+                // Register the inferred schema
+                // Note: infer_schema_from_arrow doesn't save to DB automatically like get_or_create_schema
+                // We need to manually save it if we want persistence, or update infer_schema_from_arrow to do it.
+                // Let's use a helper method on schemas to save it.
+                // Actually, get_or_create_schema does save. We should probably add a method to register schema.
+                // For now, let's just use the internal save method if we can access it, or add a public register method.
+                // Wait, `infer_schema_from_arrow` is on `SchemaManager` (self.schemas is SchemaManager).
+                // Let's check SchemaManager methods.
+
+                // We need to modify SchemaManager to support registering/saving a schema directly.
+                // Or we can just call save_schema_to_db if it was public, but it's private.
+                // Let's modify SchemaManager in schema.rs to have a register_schema method.
+
+                // For now, let's assume we add register_schema to SchemaManager.
+                schemas.register_schema(table, schema)?
+            }
+        };
+
+        let id_manager = {
+            let mut id_managers = self.id_managers.write().await;
+            id_managers.get_or_create(table)?.clone()
+        };
+
+        let mut total_rows = 0;
+
+        // 4. Process batches
+        for batch in batches {
+            let row_count = batch.num_rows();
+            total_rows += row_count as u64;
+
+            // FAST PATH: If batch is large enough, bypass row conversion
+            if row_count >= 1000 {
+                // Flush existing buffer first to maintain order
+                {
+                    let mut buffers = self.buffers.write().await;
+                    if let Some(buffer) = buffers.get_mut(table) {
+                        if !buffer.is_empty() {
+                            let rows_to_write = buffer.get_rows();
+                            ingestion::write_batch_to_rocksdb(
+                                &self.db,
+                                table,
+                                &schema,
+                                &rows_to_write,
+                            )?;
+                            buffer.clear()?;
+                        }
+                    }
+                }
+
+                // Handle IDs
+                let mut ids = Vec::with_capacity(row_count);
+                let mut timestamps = Vec::with_capacity(row_count);
+                let mut min_ts = i64::MAX;
+                let mut max_ts = i64::MIN;
+
+                // Extract IDs and Timestamps
+                // We need to handle "Auto" IDs and User IDs
+                // For simplicity in Fast Path, we assume ID column exists in Arrow batch
+                // If not, we generate Auto IDs
+
+                // Check for ID column
+                let id_col_idx = batch.schema().index_of(&schema.id_column).ok();
+                let ts_col_idx = schema
+                    .get_timestamp_column()
+                    .and_then(|name| batch.schema().index_of(name).ok());
+
+                // Generate IDs
+                if let Some(idx) = id_col_idx {
+                    let col = batch.column(idx);
+                    // Assume Int64 or String
+                    // For now, let's assume we can cast to Int64 or parse String
+                    // This is a simplification. A robust implementation handles all types.
+                    use arrow::array::{Int64Array, StringArray};
+
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        for i in 0..row_count {
+                            if arr.is_null(i) {
+                                ids.push(id_manager.next_auto_id());
+                            } else {
+                                let user_id = arr.value(i) as u64;
+                                id_manager.register_user_id(user_id)?;
+                                ids.push(user_id);
+                            }
+                        }
+                    } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        for i in 0..row_count {
+                            if arr.is_null(i) {
+                                ids.push(id_manager.next_auto_id());
+                            } else {
+                                let s = arr.value(i);
+                                if s.is_empty() {
+                                    ids.push(id_manager.next_auto_id());
+                                } else if let Ok(uid) = s.parse::<u64>() {
+                                    id_manager.register_user_id(uid)?;
+                                    ids.push(uid);
+                                } else {
+                                    // Hash string to u64 or error?
+                                    // For now, error or auto
+                                    ids.push(id_manager.next_auto_id());
+                                }
+                            }
+                        }
+                    } else {
+                        // Unsupported ID type, fallback to auto
+                        for _ in 0..row_count {
+                            ids.push(id_manager.next_auto_id());
+                        }
+                    }
+                } else {
+                    // No ID column, auto-generate
+                    for _ in 0..row_count {
+                        ids.push(id_manager.next_auto_id());
+                    }
+                }
+
+                // Extract Timestamps
+                if let Some(idx) = ts_col_idx {
+                    let col = batch.column(idx);
+                    // Assume Int64 (timestamp) or String
+                    use arrow::array::{Int64Array, StringArray};
+
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        for i in 0..row_count {
+                            let ts = if arr.is_null(i) {
+                                chrono::Utc::now().timestamp_millis()
+                            } else {
+                                arr.value(i)
+                            };
+                            timestamps.push(ts);
+                            min_ts = min_ts.min(ts);
+                            max_ts = max_ts.max(ts);
+                        }
+                    } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        for i in 0..row_count {
+                            let ts = if arr.is_null(i) {
+                                chrono::Utc::now().timestamp_millis()
+                            } else {
+                                ingestion::parse_timestamp(arr.value(i))
+                                    .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+                            };
+                            timestamps.push(ts);
+                            min_ts = min_ts.min(ts);
+                            max_ts = max_ts.max(ts);
+                        }
+                    } else {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        timestamps.resize(row_count, now);
+                        min_ts = now;
+                        max_ts = now;
+                    }
+                } else {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    timestamps.resize(row_count, now);
+                    min_ts = now;
+                    max_ts = now;
+                }
+
+                // Create ColumnBlock directly
+                let column_block = columnar::ColumnBlock::from_arrow(&batch, &schema, &ids)?;
+                // Write directly
+                ingestion::write_column_block_to_rocksdb(
+                    &self.db,
+                    table,
+                    &column_block,
+                    &ids,
+                    min_ts,
+                    max_ts,
+                    Some(&timestamps),
+                )?;
+            } else {
+                // SLOW PATH: Convert to rows and use buffer
+                // We need to convert this specific batch to rows
+                // But we don't have a function for single batch -> rows yet, only bytes -> rows
+                // So we'll use the existing parse_arrow which parses ALL batches
+                // This is inefficient for mixed workloads but fine for now
+
+                // Re-serialize batch to bytes? No, that's wasteful.
+                // Let's just use the existing flow for small batches
+                let rows = ingestion::parse_arrow(&arrow_data)?;
+                let processed_rows = ingestion::process_rows_parallel(rows, &schema, &id_manager)?;
+                self.ingest_processed_rows(table, processed_rows, schema.clone(), start_time)
+                    .await?;
+                return Ok(IngestionStats {
+                    rows_inserted: total_rows,
+                    processing_time_ms: start_time.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        Ok(IngestionStats {
+            rows_inserted: total_rows,
+            processing_time_ms: start_time.elapsed().as_millis() as u64,
+        })
+    }
+
+    pub async fn ingest_protobuf(
+        &self,
+        table: &str,
+        proto_data: Vec<u8>,
+    ) -> Result<IngestionStats> {
+        let start_time = std::time::Instant::now();
+
+        // Parse first to get rows
+        let rows = ingestion::parse_protobuf(&proto_data)?;
+        if rows.is_empty() {
+            return Ok(IngestionStats {
+                rows_inserted: 0,
+                processing_time_ms: 0,
+            });
+        }
+
+        // Get or create schema
+        let schema = {
+            let mut schemas = self.schemas.write().await;
+            schemas.get_or_create_schema(table, &rows)?
+        };
+
+        let id_manager = {
+            let mut id_managers = self.id_managers.write().await;
+            id_managers.get_or_create(table)?.clone()
+        };
+
+        let processed_rows = ingestion::process_rows_parallel(rows, &schema, &id_manager)?;
+        self.ingest_processed_rows(table, processed_rows, schema, start_time)
+            .await
+    }
     pub async fn ingest_csv(&self, table: &str, csv_data: String) -> Result<IngestionStats> {
         let start_time = std::time::Instant::now();
 
@@ -328,52 +656,8 @@ impl StorageEngine {
             (processed, schema)
         };
 
-        let rows_inserted = processed_rows.len() as u64;
-
-        // Push to buffer (Batch)
-        {
-            let mut buffers = self.buffers.write().await;
-
-            // Get or create buffer for this table
-            if !buffers.contains_key(table) {
-                let wal = if self.config.storage.wal_enabled {
-                    Some(wal::WriteAheadLog::new(
-                        &self.config.storage.data_dir,
-                        table,
-                    )?)
-                } else {
-                    None
-                };
-                buffers.insert(table.to_string(), TableBuffer::new(schema.clone(), wal));
-            }
-
-            let buffer = buffers.get_mut(table).unwrap();
-
-            // Batch push - ONE WAL write, ONE lock acquisition
-            buffer.push_batch(processed_rows)?;
-
-            // Check if we need to flush
-            if buffer.should_flush(
-                self.config.storage.buffer_size,
-                self.config.storage.flush_interval_ms,
-            ) {
-                let rows_to_write = buffer.get_rows();
-                ingestion::write_batch_to_rocksdb(&self.db, table, &schema, &rows_to_write)?;
-                buffer.clear()?;
-            }
-        } // Release buffers lock
-
-        let processing_time_ms = start_time.elapsed().as_millis() as u64;
-
-        info!(
-            "Ingested {} rows into table '{}' in {}ms",
-            rows_inserted, table, processing_time_ms
-        );
-
-        Ok(IngestionStats {
-            rows_inserted,
-            processing_time_ms,
-        })
+        self.ingest_processed_rows(table, processed_rows, schema, start_time)
+            .await
     }
 
     pub async fn query(

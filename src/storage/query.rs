@@ -409,6 +409,7 @@ pub fn execute_query(
                                 let actual_row_idx = i;
 
                                 // VALIDITY CHECK
+                                // VALIDITY CHECK
                                 let mut is_latest = true;
                                 let id_opt =
                                     json_row.get(&schema.id_column).and_then(|v| v.as_u64());

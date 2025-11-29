@@ -92,12 +92,41 @@ curl -X POST http://localhost:8080/tables/market_data/ingest \
 When `logging.enable_performance_logs = true`, detailed ingestion metrics are logged including throughput, processing time, and data size.
 
 ### Query Data
+### Arrow Data Ingestion
+
+**POST** `/tables/{table_name}/ingest`
+
+Ingests Apache Arrow IPC stream data.
+
+**Headers:**
+- `Content-Type: application/vnd.apache.arrow.stream` or `application/arrow`
+
+**Request Body:**
+Arrow IPC stream binary data.
+
+### Protobuf Data Ingestion
+
+**POST** `/tables/{table_name}/ingest`
+
+Ingests Protocol Buffers data.
+
+**Headers:**
+- `Content-Type: application/x-protobuf` or `application/protobuf`
+
+**Request Body:**
+Protobuf binary data (ProtoBatch message).
 
 **GET** `/tables/{table_name}/query`
 
 Queries data from the specified table with optional time range and pagination. Uses efficient binary key encoding for time-based queries.
 
 **Query Parameters:**
+**Headers:**
+- `Accept: application/json` (default)
+- `Accept: application/vnd.apache.arrow.stream` (Arrow IPC stream)
+- `Accept: application/x-protobuf` (Protobuf)
+- `Accept: text/csv` (CSV)
+
 - `start` (optional): Start timestamp (ISO format, Unix timestamp, or common formats)
 - `end` (optional): End timestamp (ISO format, Unix timestamp, or common formats)
 - `limit` (optional): Maximum number of rows to return (default: 1000, max: 10000)

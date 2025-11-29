@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow::array::Array;
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
-    response::{Json, Response},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -91,7 +95,7 @@ pub async fn start(config: Config) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/tables", get(list_tables))
-        .route("/tables/{table}/ingest", post(ingest_csv))
+        .route("/tables/{table}/ingest", post(ingest_data))
         .route("/tables/{table}/query", get(query_data))
         .route("/tables/{table}/schema", get(get_schema))
         .route("/tables/{table}/count", get(get_table_count))
@@ -130,9 +134,10 @@ async fn health_check() -> Json<ApiResponse<HashMap<String, String>>> {
     Json(ApiResponse::success(status))
 }
 
-async fn ingest_csv(
+async fn ingest_data(
     State(state): State<AppState>,
     Path(table): Path<String>,
+    headers: HeaderMap,
     body: Body,
 ) -> std::result::Result<Json<ApiResponse<HashMap<String, u64>>>, StatusCode> {
     let start_time = Instant::now();
@@ -147,8 +152,8 @@ async fn ingest_csv(
         None
     };
 
-    // Process the CSV data in a streaming fashion
-    let mut csv_data = Vec::new();
+    // Process the data in a streaming fashion
+    let mut data = Vec::new();
     let mut stream = body_stream;
     let mut total_size = 0usize;
 
@@ -170,7 +175,7 @@ async fn ingest_csv(
                     }
                 }
 
-                csv_data.extend_from_slice(&bytes);
+                data.extend_from_slice(&bytes);
             }
             Err(e) => {
                 error!(table = %table, error = %e, "💥 Error reading request body");
@@ -181,26 +186,42 @@ async fn ingest_csv(
 
     let body_read_time = start_time.elapsed();
 
-    // Convert bytes to string
-    let csv_string = match String::from_utf8(csv_data) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(table = %table, error = %e, "💥 Invalid UTF-8 in CSV data");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-
     if state.config.logging.enable_performance_logs {
         info!(
             table = %table,
             size_bytes = total_size,
             size_mb = total_size as f64 / (1024.0 * 1024.0),
             body_read_ms = body_read_time.as_millis(),
-            "📊 Starting CSV ingestion"
+            "📊 Starting ingestion"
         );
     }
 
-    match state.storage.ingest_csv(&table, csv_string).await {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/csv");
+
+    let result = match content_type {
+        "application/vnd.apache.arrow.stream" | "application/arrow" => {
+            state.storage.ingest_arrow(&table, data).await
+        }
+        "application/x-protobuf" | "application/protobuf" => {
+            state.storage.ingest_protobuf(&table, data).await
+        }
+        _ => {
+            // Convert bytes to string for CSV
+            let csv_string = match String::from_utf8(data) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(table = %table, error = %e, "💥 Invalid UTF-8 in CSV data");
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            };
+            state.storage.ingest_csv(&table, csv_string).await
+        }
+    };
+
+    match result {
         Ok(stats) => {
             let total_time = start_time.elapsed();
 
@@ -212,9 +233,11 @@ async fn ingest_csv(
                     total_time_ms = total_time.as_millis(),
                     throughput_rows_per_sec = if total_time.as_secs_f64() > 0.0 {
                         stats.rows_inserted as f64 / total_time.as_secs_f64()
-                    } else { 0.0 },
+                    } else {
+                        0.0
+                    },
                     size_mb = total_size as f64 / (1024.0 * 1024.0),
-                    "✅ CSV ingestion completed successfully"
+                    "✅ Ingestion completed successfully"
                 );
             }
 
@@ -240,8 +263,9 @@ async fn ingest_csv(
 async fn query_data(
     State(state): State<AppState>,
     Path(table): Path<String>,
+    headers: HeaderMap,
     Query(params): Query<QueryParams>,
-) -> std::result::Result<Json<ApiResponse<Vec<serde_json::Value>>>, StatusCode> {
+) -> std::result::Result<Response, StatusCode> {
     let start_time = Instant::now();
 
     if state.config.logging.enable_performance_logs {
@@ -277,12 +301,261 @@ async fn query_data(
                     duration_ms = duration.as_millis(),
                     throughput_rows_per_sec = if duration.as_secs_f64() > 0.0 {
                         result_count as f64 / duration.as_secs_f64()
-                    } else { 0.0 },
+                    } else {
+                        0.0
+                    },
                     "✅ Query completed successfully"
                 );
             }
 
-            Ok(Json(ApiResponse::success(results)))
+            let accept = headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json");
+
+            if accept.contains("application/arrow")
+                || accept.contains("application/vnd.apache.arrow.stream")
+            {
+                // Fetch schema to build Arrow schema
+                let schema_json = match state.storage.get_schema(&table).await {
+                    Ok(s) => s,
+                    Err(_) => return Ok(Json(ApiResponse::success(results)).into_response()),
+                };
+
+                // Parse schema from JSON
+                let schema: crate::storage::schema::Schema =
+                    serde_json::from_value(schema_json).unwrap();
+
+                // Build Arrow Schema
+                let mut fields = Vec::new();
+                for col in &schema.columns {
+                    let dt = match col.data_type {
+                        crate::storage::schema::DataType::Id => DataType::UInt64,
+                        crate::storage::schema::DataType::Integer => DataType::Int64,
+                        crate::storage::schema::DataType::Float => DataType::Float64,
+                        crate::storage::schema::DataType::Boolean => DataType::Boolean,
+                        crate::storage::schema::DataType::Timestamp => DataType::Int64, // Timestamp as Int64 millis
+                        crate::storage::schema::DataType::String => DataType::Utf8,
+                    };
+                    fields.push(Field::new(&col.name, dt, true));
+                }
+                let arrow_schema = Arc::new(ArrowSchema::new(fields));
+
+                // Build Arrays
+                let mut columns: Vec<Arc<dyn Array>> = Vec::new();
+                for col in &schema.columns {
+                    match col.data_type {
+                        crate::storage::schema::DataType::Id => {
+                            let mut builder = arrow::array::UInt64Builder::new();
+                            for row in &results {
+                                if let Some(val) = row.get(&col.name) {
+                                    match val {
+                                        serde_json::Value::Number(n) => {
+                                            builder.append_value(n.as_u64().unwrap_or(0))
+                                        }
+                                        serde_json::Value::String(s) => {
+                                            builder.append_value(s.parse().unwrap_or(0))
+                                        }
+                                        _ => builder.append_null(),
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            }
+                            columns.push(Arc::new(builder.finish()));
+                        }
+                        crate::storage::schema::DataType::Integer => {
+                            let mut builder = arrow::array::Int64Builder::new();
+                            for row in &results {
+                                if let Some(val) = row.get(&col.name) {
+                                    match val {
+                                        serde_json::Value::Number(n) => {
+                                            builder.append_value(n.as_i64().unwrap_or(0))
+                                        }
+                                        serde_json::Value::String(s) => {
+                                            builder.append_value(s.parse().unwrap_or(0))
+                                        }
+                                        _ => builder.append_null(),
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            }
+                            columns.push(Arc::new(builder.finish()));
+                        }
+                        crate::storage::schema::DataType::Float => {
+                            let mut builder = arrow::array::Float64Builder::new();
+                            for row in &results {
+                                if let Some(val) = row.get(&col.name) {
+                                    match val {
+                                        serde_json::Value::Number(n) => {
+                                            builder.append_value(n.as_f64().unwrap_or(0.0))
+                                        }
+                                        serde_json::Value::String(s) => {
+                                            builder.append_value(s.parse().unwrap_or(0.0))
+                                        }
+                                        _ => builder.append_null(),
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            }
+                            columns.push(Arc::new(builder.finish()));
+                        }
+                        crate::storage::schema::DataType::Boolean => {
+                            let mut builder = arrow::array::BooleanBuilder::new();
+                            for row in &results {
+                                if let Some(val) = row.get(&col.name) {
+                                    match val {
+                                        serde_json::Value::Bool(b) => builder.append_value(*b),
+                                        serde_json::Value::String(s) => {
+                                            builder.append_value(s == "true")
+                                        }
+                                        _ => builder.append_null(),
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            }
+                            columns.push(Arc::new(builder.finish()));
+                        }
+                        crate::storage::schema::DataType::Timestamp => {
+                            let mut builder = arrow::array::Int64Builder::new();
+                            for row in &results {
+                                if let Some(val) = row.get(&col.name) {
+                                    match val {
+                                        serde_json::Value::Number(n) => {
+                                            builder.append_value(n.as_i64().unwrap_or(0))
+                                        }
+                                        serde_json::Value::String(s) => {
+                                            // Try to parse timestamp string
+                                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+                                            {
+                                                builder.append_value(dt.timestamp_millis());
+                                            } else if let Ok(ts) = s.parse::<i64>() {
+                                                builder.append_value(ts);
+                                            } else {
+                                                builder.append_null();
+                                            }
+                                        }
+                                        _ => builder.append_null(),
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            }
+                            columns.push(Arc::new(builder.finish()));
+                        }
+                        crate::storage::schema::DataType::String => {
+                            let mut builder = arrow::array::StringBuilder::new();
+                            for row in &results {
+                                if let Some(val) = row.get(&col.name) {
+                                    match val {
+                                        serde_json::Value::String(s) => builder.append_value(s),
+                                        serde_json::Value::Number(n) => {
+                                            builder.append_value(n.to_string())
+                                        }
+                                        serde_json::Value::Bool(b) => {
+                                            builder.append_value(b.to_string())
+                                        }
+                                        _ => builder.append_null(),
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            }
+                            columns.push(Arc::new(builder.finish()));
+                        }
+                    }
+                }
+
+                let batch = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
+
+                let mut buffer = Vec::new();
+                {
+                    let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
+                    writer.write(&batch).unwrap();
+                    writer.finish().unwrap();
+                }
+
+                Ok(Response::builder()
+                    .header("Content-Type", "application/vnd.apache.arrow.stream")
+                    .body(Body::from(buffer))
+                    .unwrap())
+            } else if accept.contains("application/protobuf")
+                || accept.contains("application/x-protobuf")
+            {
+                // Convert to Protobuf
+                // We need to map JSON values to ProtoRow
+                use crate::storage::ingestion::{ProtoBatch, ProtoRow};
+                let mut proto_rows = Vec::with_capacity(results.len());
+                for val in results {
+                    if let serde_json::Value::Object(map) = val {
+                        let mut values = HashMap::new();
+                        for (k, v) in map {
+                            let v_str = match v {
+                                serde_json::Value::String(s) => s,
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                serde_json::Value::Null => String::new(),
+                                _ => v.to_string(),
+                            };
+                            values.insert(k, v_str);
+                        }
+                        proto_rows.push(ProtoRow { values });
+                    }
+                }
+                let batch = ProtoBatch { rows: proto_rows };
+                use prost::Message;
+                let bytes = batch.encode_to_vec();
+
+                Ok(Response::builder()
+                    .header("Content-Type", "application/x-protobuf")
+                    .body(Body::from(bytes))
+                    .unwrap())
+            } else if accept.contains("text/csv") {
+                // Fetch schema to ensure correct column order
+                let schema_json = match state.storage.get_schema(&table).await {
+                    Ok(s) => s,
+                    Err(_) => return Ok(Json(ApiResponse::success(results)).into_response()),
+                };
+
+                let schema: crate::storage::schema::Schema =
+                    serde_json::from_value(schema_json).unwrap();
+                let mut wtr = csv::Writer::from_writer(Vec::new());
+
+                // Write headers
+                let headers: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                wtr.write_record(&headers).unwrap();
+
+                // Write rows
+                for row in results {
+                    let record: Vec<String> = headers
+                        .iter()
+                        .map(|header| {
+                            row.get(header)
+                                .map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Null => String::new(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    _ => v.to_string(),
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    wtr.write_record(&record).unwrap();
+                }
+
+                let data = wtr.into_inner().unwrap();
+
+                Ok(Response::builder()
+                    .header("Content-Type", "text/csv")
+                    .body(Body::from(data))
+                    .unwrap())
+            } else {
+                Ok(Json(ApiResponse::success(results)).into_response())
+            }
         }
         Err(e) => {
             let duration = start_time.elapsed();

@@ -17,14 +17,26 @@ use pulsora::storage::StorageEngine;
 use std::time::Instant;
 use tempfile::TempDir;
 
+use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
+use prost::Message;
+use pulsora::storage::ingestion::{ProtoBatch, ProtoRow};
+use std::collections::HashMap;
+use std::sync::Arc;
 #[tokio::main]
 async fn main() {
     // Parse args
     let args: Vec<String> = std::env::args().collect();
+    let mut format = "csv".to_string();
     let mut threads = 0;
     for i in 0..args.len() {
         if args[i] == "--threads" && i + 1 < args.len() {
             threads = args[i + 1].parse().unwrap_or(0);
+        }
+        if args[i] == "--format" && i + 1 < args.len() {
+            format = args[i + 1].clone();
         }
     }
 
@@ -54,6 +66,7 @@ async fn main() {
     println!("🚀 Starting Throughput Test");
     println!("Rows: {}", total_rows);
     println!("Batch Size: {}", batch_size);
+    println!("Format: {}", format);
     println!(
         "Threads: {}",
         if threads == 0 {
@@ -68,8 +81,23 @@ async fn main() {
     let start_global = Instant::now();
 
     for i in 0..(total_rows / batch_size) {
-        let csv_data = generate_csv_batch(batch_size, i * batch_size);
-        storage.ingest_csv(table_name, csv_data).await.unwrap();
+        match format.as_str() {
+            "arrow" => {
+                let arrow_data = generate_arrow_batch(batch_size, i * batch_size);
+                storage.ingest_arrow(table_name, arrow_data).await.unwrap();
+            }
+            "protobuf" => {
+                let proto_data = generate_protobuf_batch(batch_size, i * batch_size);
+                storage
+                    .ingest_protobuf(table_name, proto_data)
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                let csv_data = generate_csv_batch(batch_size, i * batch_size);
+                storage.ingest_csv(table_name, csv_data).await.unwrap();
+            }
+        }
 
         if (i + 1) % 10 == 0 {
             print!(".");
@@ -79,6 +107,8 @@ async fn main() {
     }
     println!();
 
+    // Flush table to ensure all data is persisted
+    storage.flush_table(table_name).await.unwrap();
     let total_time = start_global.elapsed().as_secs_f64();
     let rps = total_rows as f64 / total_time;
 
@@ -134,4 +164,87 @@ fn generate_csv_batch(rows: usize, offset: usize) -> String {
         ));
     }
     csv
+}
+fn generate_arrow_batch(rows: usize, offset: usize) -> Vec<u8> {
+    let timestamp_array = StringArray::from(
+        (0..rows)
+            .map(|i| {
+                let id = offset + i;
+                let total_seconds = id;
+                let hours = (10 + (total_seconds / 3600)) % 24;
+                let minutes = (total_seconds % 3600) / 60;
+                let seconds = total_seconds % 60;
+                format!("2024-01-01 {:02}:{:02}:{:02}", hours, minutes, seconds)
+            })
+            .collect::<Vec<String>>(),
+    );
+
+    let symbol_array = StringArray::from(vec!["AAPL"; rows]);
+
+    let price_array = Float64Array::from(
+        (0..rows)
+            .map(|i| 150.0 + ((offset + i) as f64 * 0.01))
+            .collect::<Vec<f64>>(),
+    );
+
+    let volume_array = Int64Array::from(
+        (0..rows)
+            .map(|i| (1000 + offset + i) as i64)
+            .collect::<Vec<i64>>(),
+    );
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("timestamp", DataType::Utf8, false),
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("price", DataType::Float64, false),
+        Field::new("volume", DataType::Int64, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(timestamp_array),
+            Arc::new(symbol_array),
+            Arc::new(price_array),
+            Arc::new(volume_array),
+        ],
+    )
+    .unwrap();
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+    buffer
+}
+
+fn generate_protobuf_batch(rows: usize, offset: usize) -> Vec<u8> {
+    let mut proto_rows = Vec::with_capacity(rows);
+
+    for i in 0..rows {
+        let id = offset + i;
+        let total_seconds = id;
+        let hours = (10 + (total_seconds / 3600)) % 24;
+        let minutes = (total_seconds % 3600) / 60;
+        let seconds = total_seconds % 60;
+
+        let mut values = HashMap::new();
+        values.insert(
+            "timestamp".to_string(),
+            format!("2024-01-01 {:02}:{:02}:{:02}", hours, minutes, seconds),
+        );
+        values.insert("symbol".to_string(), "AAPL".to_string());
+        values.insert(
+            "price".to_string(),
+            format!("{:.2}", 150.0 + (id as f64 * 0.01)),
+        );
+        values.insert("volume".to_string(), (1000 + id).to_string());
+
+        proto_rows.push(ProtoRow { values });
+    }
+
+    let batch = ProtoBatch { rows: proto_rows };
+    batch.encode_to_vec()
 }
