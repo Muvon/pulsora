@@ -1,563 +1,327 @@
 <!DOCTYPE html>
 <html lang="en">
-	<head>
-		<meta charset="UTF-8">
-		<meta name="viewport" content="width=device-width, initial-scale=1.0">
-		<title>Pulsora - High-Performance Time-Series Database | Market Data Optimized</title>
-		<meta name="description" content="High-performance time-series database optimized for market data. Columnar storage, advanced compression, sub-millisecond queries, and RESTful API built with Rust.">
-		<meta name="keywords" content="time-series database, market data, columnar storage, compression, RocksDB, Rust database, financial data, high-performance database">
-
-		<!-- Open Graph -->
-		<meta property="og:title" content="Pulsora - High-Performance Time-Series Database">
-		<meta property="og:description" content="Columnar time-series database with advanced compression and sub-millisecond query performance. Built for market data and time-ordered datasets.">
-		<meta property="og:type" content="website">
-		<meta property="og:url" content="https://pulsora.muvon.io">
-
-		<!-- Schema.org structured data -->
-		<script type="application/ld+json">
-		{
-		"@context": "https://schema.org",
-		"@type": "SoftwareApplication",
-		"name": "Pulsora",
-		"description": "High-Performance Time-Series Database",
-		"applicationCategory": "DatabaseApplication",
-		"operatingSystem": "macOS, Linux, Windows",
-		"programmingLanguage": "Rust",
-		"license": "Apache-2.0",
-		"author": {
-		"@type": "Organization",
-		"name": "Muvon Un Limited"
-		}
-		}
-		</script>
-
-		<link rel="stylesheet" href="styles.css">
-		<link rel="preconnect" href="https://fonts.googleapis.com">
-		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-	</head>
-	<body>
-		<!-- Navigation -->
-		<nav class="nav">
-			<div class="nav-container">
-				<div class="nav-brand">
-					<div class="logo">
-						<svg width="126" height="40" viewBox="0 0 126 40" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="16.7757" cy="6.04188" r="6.04188" fill="#76B744"></circle><circle cx="37.5282" cy="31.2601" r="6.04188" fill="#76B744"></circle><path fill-rule="evenodd" clip-rule="evenodd" d="M40.4889 14.7002C40.6847 18.0313 38.1431 20.8904 34.812 21.0862C33.2728 21.1767 31.6218 21.4473 30.5785 22.5826L25.4075 28.2087C24.2377 29.4814 24.1311 31.3703 24.1311 33.099C24.1311 36.4359 21.4261 39.1409 18.0892 39.1409C14.7524 39.1409 12.0473 36.4359 12.0473 33.099C12.0473 33.0689 12.0475 33.0387 12.048 33.0087C12.0696 31.5357 11.9005 29.9507 10.8815 28.8867C9.74425 27.6992 7.93379 27.5495 6.29084 27.615C6.01445 27.6261 5.73401 27.6182 5.45092 27.5904C2.13011 27.2638 -0.297169 24.3069 0.0294542 20.9861C0.356077 17.6653 3.31291 15.238 6.63373 15.5646C9.95454 15.8913 12.3818 18.8481 12.0552 22.1689C11.9519 23.2191 12.1129 24.3374 12.8427 25.0995L13.3778 25.6582C14.5465 26.8785 16.3995 27.0571 18.0892 27.0571C19.5836 27.0571 21.1971 26.8255 22.2084 25.7252L27.3209 20.1627C28.456 18.9277 28.5244 17.0838 28.426 15.4092C28.2302 12.0781 30.7718 9.21903 34.1029 9.02323C37.434 8.82742 40.2931 11.3691 40.4889 14.7002Z" fill="#76B744"></path><path d="M65.6534 17.4566C65.3946 16.9132 64.8877 16.6414 64.1329 16.6414C63.2559 16.6414 62.6664 16.9132 62.3644 17.4566C62.1991 17.7661 62.1164 18.227 62.1164 18.8392V25.6079H59V14.3818H61.987V16.0224C62.368 15.4377 62.7275 15.0215 63.0654 14.7739C63.662 14.3336 64.4348 14.1135 65.3838 14.1135C66.2824 14.1135 67.0085 14.3027 67.562 14.681C68.0078 15.0318 68.3456 15.4824 68.5757 16.0327C68.9783 15.3723 69.4779 14.8874 70.0746 14.5778C70.7072 14.2683 71.4117 14.1135 72.1881 14.1135C72.7057 14.1135 73.2161 14.2098 73.7194 14.4024C74.2226 14.595 74.6791 14.9321 75.0889 15.4136C75.4196 15.8057 75.6424 16.2872 75.7574 16.8581C75.8293 17.2365 75.8653 17.7902 75.8653 18.5193L75.8437 25.6079H72.6949V18.4471C72.6949 18.0206 72.6231 17.6698 72.4793 17.3947C72.2061 16.8719 71.7029 16.6105 70.9696 16.6105C70.1213 16.6105 69.5354 16.9475 69.2119 17.6217C69.0466 17.9794 68.9639 18.4093 68.9639 18.9114V25.6079H65.869V18.9114C65.869 18.2442 65.7972 17.7592 65.6534 17.4566Z" fill="white"></path><path d="M85.5764 24.0189C85.5476 24.0533 85.4757 24.1565 85.3607 24.3285C85.2457 24.5004 85.1091 24.6518 84.951 24.7825C84.4693 25.1952 84.002 25.4772 83.5491 25.6285C83.1034 25.7799 82.5786 25.8555 81.9747 25.8555C80.235 25.8555 79.0632 25.2571 78.4593 24.0602C78.1215 23.3998 77.9525 22.4265 77.9525 21.1402V14.3611H81.1013V21.1402C81.1013 21.7799 81.1804 22.2614 81.3385 22.5847C81.6189 23.1556 82.1688 23.4411 82.9884 23.4411C84.038 23.4411 84.7569 23.0353 85.1451 22.2236C85.3463 21.7833 85.447 21.2021 85.447 20.4798V14.3611H88.5634V25.6079H85.5764V24.0189Z" fill="white"></path><path d="M89.7233 14.3611H93.174L95.6218 22.6569L98.1236 14.3611H101.423L97.1854 25.6079H93.9396L89.7233 14.3611Z" fill="white"></path><path d="M112.31 15.785C113.302 16.9751 113.798 18.3818 113.798 20.0052C113.798 21.6561 113.302 23.0696 112.31 24.2459C111.318 25.4153 109.812 26 107.792 26C105.771 26 104.265 25.4153 103.273 24.2459C102.281 23.0696 101.785 21.6561 101.785 20.0052C101.785 18.3818 102.281 16.9751 103.273 15.785C104.265 14.595 105.771 14 107.792 14C109.812 14 111.318 14.595 112.31 15.785ZM107.781 16.4867C106.882 16.4867 106.188 16.7928 105.7 17.405C105.218 18.0103 104.977 18.877 104.977 20.0052C104.977 21.1333 105.218 22.0034 105.7 22.6156C106.188 23.2279 106.882 23.534 107.781 23.534C108.679 23.534 109.37 23.2279 109.851 22.6156C110.333 22.0034 110.574 21.1333 110.574 20.0052C110.574 18.877 110.333 18.0103 109.851 17.405C109.37 16.7928 108.679 16.4867 107.781 16.4867Z" fill="white"></path><path d="M120.878 16.5383C119.835 16.5383 119.12 16.9613 118.732 17.8074C118.531 18.2545 118.43 18.8255 118.43 19.5202V25.6079H115.368V14.3818H118.333V16.0224C118.728 15.4445 119.102 15.0284 119.454 14.7739C120.087 14.3199 120.889 14.0929 121.859 14.0929C123.074 14.0929 124.066 14.399 124.835 15.0112C125.612 15.6165 126 16.6242 126 18.0344V25.6079H122.851V18.767C122.851 18.1754 122.769 17.7214 122.603 17.405C122.301 16.8272 121.726 16.5383 120.878 16.5383Z" fill="white"></path></svg>
-					</div>
-					<span class="open-source-badge">OPEN SOURCE</span>
-				</div>
-				<div class="nav-links">
-					<a href="#why-pulsora">Why Pulsora</a>
-					<a href="#performance">Performance</a>
-					<a href="#use-cases">Use Cases</a>
-					<a href="#quick-start">Quick Start</a>
-					<a href="https://github.com/muvon/pulsora/blob/master/doc/API.md">Docs</a>
-					<a href="https://github.com/muvon/pulsora" class="github-link">
-						<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-							<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-						</svg>
-						GitHub
-					</a>
-					<div class="github-stars" id="github-stars">
-						<span class="star-icon">⭐</span>
-						<span class="star-count">Loading...</span>
-					</div>
-				</div>
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Pulsora - Lightning-Fast Time-Series Database</title>
+	<meta name="description" content="Store billions of time-series data points with 10x compression. Sub-millisecond queries. CSV, Arrow, Protobuf support. Built with Rust.">
+	<meta name="keywords" content="time-series database, market data, columnar storage, compression, RocksDB, Rust database">
+	
+	<!-- Open Graph -->
+	<meta property="og:title" content="Pulsora - Lightning-Fast Time-Series Database">
+	<meta property="og:description" content="Store billions of data points with 10x compression. Query in milliseconds.">
+	<meta property="og:type" content="website">
+	<meta property="og:url" content="https://pulsora.muvon.io">
+	
+	<link rel="stylesheet" href="styles.css">
+	<link rel="preconnect" href="https://fonts.googleapis.com">
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+</head>
+<body>
+	<!-- Navigation -->
+	<nav class="nav">
+		<div class="nav-container">
+			<div class="nav-brand">
+				<svg width="126" height="40" viewBox="0 0 126 40" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="16.7757" cy="6.04188" r="6.04188" fill="#76B744"></circle><circle cx="37.5282" cy="31.2601" r="6.04188" fill="#76B744"></circle><path fill-rule="evenodd" clip-rule="evenodd" d="M40.4889 14.7002C40.6847 18.0313 38.1431 20.8904 34.812 21.0862C33.2728 21.1767 31.6218 21.4473 30.5785 22.5826L25.4075 28.2087C24.2377 29.4814 24.1311 31.3703 24.1311 33.099C24.1311 36.4359 21.4261 39.1409 18.0892 39.1409C14.7524 39.1409 12.0473 36.4359 12.0473 33.099C12.0473 33.0689 12.0475 33.0387 12.048 33.0087C12.0696 31.5357 11.9005 29.9507 10.8815 28.8867C9.74425 27.6992 7.93379 27.5495 6.29084 27.615C6.01445 27.6261 5.73401 27.6182 5.45092 27.5904C2.13011 27.2638 -0.297169 24.3069 0.0294542 20.9861C0.356077 17.6653 3.31291 15.238 6.63373 15.5646C9.95454 15.8913 12.3818 18.8481 12.0552 22.1689C11.9519 23.2191 12.1129 24.3374 12.8427 25.0995L13.3778 25.6582C14.5465 26.8785 16.3995 27.0571 18.0892 27.0571C19.5836 27.0571 21.1971 26.8255 22.2084 25.7252L27.3209 20.1627C28.456 18.9277 28.5244 17.0838 28.426 15.4092C28.2302 12.0781 30.7718 9.21903 34.1029 9.02323C37.434 8.82742 40.2931 11.3691 40.4889 14.7002Z" fill="#76B744"></path><path d="M65.6534 17.4566C65.3946 16.9132 64.8877 16.6414 64.1329 16.6414C63.2559 16.6414 62.6664 16.9132 62.3644 17.4566C62.1991 17.7661 62.1164 18.227 62.1164 18.8392V25.6079H59V14.3818H61.987V16.0224C62.368 15.4377 62.7275 15.0215 63.0654 14.7739C63.662 14.3336 64.4348 14.1135 65.3838 14.1135C66.2824 14.1135 67.0085 14.3027 67.562 14.681C68.0078 15.0318 68.3456 15.4824 68.5757 16.0327C68.9783 15.3723 69.4779 14.8874 70.0746 14.5778C70.7072 14.2683 71.4117 14.1135 72.1881 14.1135C72.7057 14.1135 73.2161 14.2098 73.7194 14.4024C74.2226 14.595 74.6791 14.9321 75.0889 15.4136C75.4196 15.8057 75.6424 16.2872 75.7574 16.8581C75.8293 17.2365 75.8653 17.7902 75.8653 18.5193L75.8437 25.6079H72.6949V18.4471C72.6949 18.0206 72.6231 17.6698 72.4793 17.3947C72.2061 16.8719 71.7029 16.6105 70.9696 16.6105C70.1213 16.6105 69.5354 16.9475 69.2119 17.6217C69.0466 17.9794 68.9639 18.4093 68.9639 18.9114V25.6079H65.869V18.9114C65.869 18.2442 65.7972 17.7592 65.6534 17.4566Z" fill="white"></path><path d="M85.5764 24.0189C85.5476 24.0533 85.4757 24.1565 85.3607 24.3285C85.2457 24.5004 85.1091 24.6518 84.951 24.7825C84.4693 25.1952 84.002 25.4772 83.5491 25.6285C83.1034 25.7799 82.5786 25.8555 81.9747 25.8555C80.235 25.8555 79.0632 25.2571 78.4593 24.0602C78.1215 23.3998 77.9525 22.4265 77.9525 21.1402V14.3611H81.1013V21.1402C81.1013 21.7799 81.1804 22.2614 81.3385 22.5847C81.6189 23.1556 82.1688 23.4411 82.9884 23.4411C84.038 23.4411 84.7569 23.0353 85.1451 22.2236C85.3463 21.7833 85.447 21.2021 85.447 20.4798V14.3611H88.5634V25.6079H85.5764V24.0189Z" fill="white"></path><path d="M89.7233 14.3611H93.174L95.6218 22.6569L98.1236 14.3611H101.423L97.1854 25.6079H93.9396L89.7233 14.3611Z" fill="white"></path><path d="M112.31 15.785C113.302 16.9751 113.798 18.3818 113.798 20.0052C113.798 21.6561 113.302 23.0696 112.31 24.2459C111.318 25.4153 109.812 26 107.792 26C105.771 26 104.265 25.4153 103.273 24.2459C102.281 23.0696 101.785 21.6561 101.785 20.0052C101.785 18.3818 102.281 16.9751 103.273 15.785C104.265 14.595 105.771 14 107.792 14C109.812 14 111.318 14.595 112.31 15.785ZM107.781 16.4867C106.882 16.4867 106.188 16.7928 105.7 17.405C105.218 18.0103 104.977 18.877 104.977 20.0052C104.977 21.1333 105.218 22.0034 105.7 22.6156C106.188 23.2279 106.882 23.534 107.781 23.534C108.679 23.534 109.37 23.2279 109.851 22.6156C110.333 22.0034 110.574 21.1333 110.574 20.0052C110.574 18.877 110.333 18.0103 109.851 17.405C109.37 16.7928 108.679 16.4867 107.781 16.4867Z" fill="white"></path><path d="M120.878 16.5383C119.835 16.5383 119.12 16.9613 118.732 17.8074C118.531 18.2545 118.43 18.8255 118.43 19.5202V25.6079H115.368V14.3818H118.333V16.0224C118.728 15.4445 119.102 15.0284 119.454 14.7739C120.087 14.3199 120.889 14.0929 121.859 14.0929C123.074 14.0929 124.066 14.399 124.835 15.0112C125.612 15.6165 126 16.6242 126 18.0344V25.6079H122.851V18.767C122.851 18.1754 122.769 17.7214 122.603 17.405C122.301 16.8272 121.726 16.5383 120.878 16.5383Z" fill="white"></path></svg>
+				<span class="badge">OPEN SOURCE</span>
 			</div>
-		</nav>
+			<div class="nav-links">
+				<a href="#features">Features</a>
+				<a href="#quickstart">Quick Start</a>
+				<a href="https://github.com/muvon/pulsora/blob/master/doc/API.md">Docs</a>
+				<a href="https://github.com/muvon/pulsora" class="github-stars" id="github-stars">
+					<span class="star-icon">⭐</span>
+					<span class="star-count">Loading...</span>
+				</a>
+			</div>
+		</div>
+	</nav>
 
-		<!-- Hero Section -->
-		<header class="hero">
-			<div class="hero-background"></div>
+	<!-- Hero -->
+	<section class="hero">
+		<div class="hero-container">
 			<div class="hero-content">
-				<div class="hero-badge">TIME-SERIES DATABASE</div>
+				<div class="hero-tag">TIME-SERIES DATABASE</div>
 				<h1 class="hero-title">
-					Store Billions of Data Points
-					<span class="hero-highlight">Query in Milliseconds</span>
+					Lightning-Fast Storage<br>
+					<span class="gradient-text">10x Compression</span>
 				</h1>
-				<p class="hero-subtitle">
-					Columnar Storage • Advanced Compression • RESTful API
+				<p class="hero-desc">
+					Store billions of time-series data points with intelligent compression.<br>
+					Query in milliseconds. Built with Rust for maximum performance.
 				</p>
-				<p class="hero-description">
-					Purpose-built for market data and high-frequency time-series.<br>
-					350K+ rows/s ingestion • Sub-millisecond queries • 2-10x compression<br>
-					Built with Rust for reliability and performance.
-				</p>
-				<div class="hero-buttons">
-					<a href="#quick-start" class="btn-primary">Get Started</a>
+				<div class="hero-cta">
+					<a href="#quickstart" class="btn-primary">Get Started</a>
 					<a href="https://github.com/muvon/pulsora" class="btn-secondary">
-						<span class="star-icon">⭐</span>
-						View on GitHub
-					</a>
-				</div>
-				<div class="hero-features">
-					<span>Apache 2.0</span>
-					<span>•</span>
-					<span>RocksDB Backend</span>
-					<span>•</span>
-					<span>CSV • Arrow • Protobuf</span>
-					<span>•</span>
-					<span>Zero Dependencies</span>
-				</div>
-			</div>
-		</header>
-
-		<!-- Performance Stats Banner -->
-		<section class="stats-banner">
-			<div class="container">
-				<div class="stats-grid">
-					<div class="stat">
-						<div class="stat-number">350K+</div>
-						<div class="stat-label">Rows/Second Ingestion</div>
-					</div>
-					<div class="stat">
-						<div class="stat-number">&lt;1ms</div>
-						<div class="stat-label">Query Latency</div>
-					</div>
-					<div class="stat">
-						<div class="stat-number">2-10x</div>
-						<div class="stat-label">Compression Ratio</div>
-					</div>
-					<div class="stat">
-						<div class="stat-number">12M+</div>
-						<div class="stat-label">Rows/Second Scan</div>
-					</div>
-				</div>
-			</div>
-		</section>
-
-		<!-- Why Pulsora -->
-		<section id="why-pulsora" class="why-section">
-			<div class="container">
-				<h2>Why Pulsora?</h2>
-				<p class="section-subtitle">Built specifically for time-series data with real-world performance</p>
-
-				<div class="features-grid">
-					<div class="feature">
-						<div class="feature-icon">⚡</div>
-						<h3>Blazing Fast</h3>
-						<p>Sub-millisecond queries with intelligent block caching. 350K+ rows/s ingestion throughput. Optimized for high-frequency data streams.</p>
-					</div>
-					<div class="feature">
-						<div class="feature-icon">💾</div>
-						<h3>Efficient Storage</h3>
-						<p>2-10x compression with type-specific algorithms: Gorilla XOR for floats, delta-of-delta for timestamps, varint for integers.</p>
-					</div>
-					<div class="feature">
-						<div class="feature-icon">🎯</div>
-						<h3>Simple API</h3>
-						<p>RESTful HTTP interface. No query language to learn. Automatic schema inference. Just POST your CSV and start querying.</p>
-					</div>
-					<div class="feature">
-						<div class="feature-icon">🔄</div>
-						<h3>Multi-Format</h3>
-						<p>Ingest and export CSV, Apache Arrow, Protocol Buffers. Zero-copy operations for maximum efficiency. Seamless integration.</p>
-					</div>
-					<div class="feature">
-						<div class="feature-icon">🏗️</div>
-						<h3>Production Ready</h3>
-						<p>Built on RocksDB for durability. ACID transactions. Crash recovery. Proven LSM-tree architecture for time-series workloads.</p>
-					</div>
-					<div class="feature">
-						<div class="feature-icon">🦀</div>
-						<h3>Rust Powered</h3>
-						<p>Memory safe. Thread safe. No garbage collection pauses. Predictable performance. Cross-platform native binaries.</p>
-					</div>
-				</div>
-			</div>
-		</section>
-
-		<!-- Quick Start -->
-		<section id="quick-start" class="quick-start-section">
-			<div class="container">
-				<h2>Get Started in 3 Steps</h2>
-				<p class="section-subtitle">From zero to querying in under a minute</p>
-
-				<div class="steps-grid">
-					<div class="step-card">
-						<div class="step-number">1</div>
-						<h3>Install</h3>
-						<pre><code>cargo install --git https://github.com/muvon/pulsora.git</code></pre>
-						<p>Or download pre-built binaries from releases</p>
-					</div>
-
-					<div class="step-card">
-						<div class="step-number">2</div>
-						<h3>Start Server</h3>
-						<pre><code>pulsora
-# Server running on http://localhost:8080</code></pre>
-						<p>Optional: Use custom config with <code>-c pulsora.toml</code></p>
-					</div>
-
-					<div class="step-card">
-						<div class="step-number">3</div>
-						<h3>Ingest & Query</h3>
-						<pre><code># Ingest CSV data
-curl -X POST http://localhost:8080/tables/stocks/ingest \
-  -H "Content-Type: text/csv" \
-  --data-binary @data.csv
-
-# Query time range
-curl "http://localhost:8080/tables/stocks/query?start=2024-01-01T10:00:00&limit=100"</code></pre>
-					</div>
-				</div>
-			</div>
-		</section>
-
-		<!-- Use Cases -->
-		<section id="use-cases" class="use-cases-section">
-			<div class="container">
-				<h2>Perfect For</h2>
-				<div class="use-cases-grid">
-					<div class="use-case">
-						<div class="use-case-icon">📈</div>
-						<h3>Financial Market Data</h3>
-						<p>Store tick data, OHLCV bars, order books. High-frequency trading data with microsecond timestamps. Optimized compression for price and volume data.</p>
-					</div>
-					<div class="use-case">
-						<div class="use-case-icon">📊</div>
-						<h3>IoT & Sensor Data</h3>
-						<p>Millions of sensors generating continuous streams. Temperature, pressure, vibration readings. Efficient storage for slowly-changing values.</p>
-					</div>
-					<div class="use-case">
-						<div class="use-case-icon">🔍</div>
-						<h3>Application Metrics</h3>
-						<p>Performance monitoring, request rates, error counts. System metrics, resource utilization. Fast aggregations over time windows.</p>
-					</div>
-					<div class="use-case">
-						<div class="use-case-icon">⚙️</div>
-						<h3>Industrial Telemetry</h3>
-						<p>Manufacturing equipment data, production line metrics. Real-time monitoring with historical analysis. Predictive maintenance datasets.</p>
-					</div>
-				</div>
-			</div>
-		</section>
-
-		<!-- Performance Deep Dive -->
-		<section id="performance" class="performance-section">
-			<div class="container">
-				<h2>Performance Characteristics</h2>
-				<p class="section-subtitle">Real benchmarks from production-like workloads</p>
-
-				<div class="perf-grid">
-					<div class="perf-category">
-						<h3>📥 Ingestion</h3>
-						<div class="perf-items">
-							<div class="perf-item">
-								<div class="perf-metric">350K+ rows/s</div>
-								<div class="perf-desc">CSV ingestion with type inference</div>
-							</div>
-							<div class="perf-item">
-								<div class="perf-metric">400K+ rows/s</div>
-								<div class="perf-desc">Arrow/Protobuf zero-copy parsing</div>
-							</div>
-							<div class="perf-item">
-								<div class="perf-metric">10K batch</div>
-								<div class="perf-desc">Configurable batch sizes</div>
-							</div>
-						</div>
-					</div>
-
-					<div class="perf-category">
-						<h3>🔍 Queries</h3>
-						<div class="perf-items">
-							<div class="perf-item">
-								<div class="perf-metric">&lt;1ms</div>
-								<div class="perf-desc">Range queries with warm cache</div>
-							</div>
-							<div class="perf-item">
-								<div class="perf-metric">7M+ ops/s</div>
-								<div class="perf-desc">Block-cached lookups</div>
-							</div>
-							<div class="perf-item">
-								<div class="perf-metric">12M+ rows/s</div>
-								<div class="perf-desc">Full table scan throughput</div>
-							</div>
-						</div>
-					</div>
-
-					<div class="perf-category">
-						<h3>💾 Compression</h3>
-						<div class="perf-items">
-							<div class="perf-item">
-								<div class="perf-metric">5-10x</div>
-								<div class="perf-desc">Timestamps (delta-of-delta)</div>
-							</div>
-							<div class="perf-item">
-								<div class="perf-metric">2-5x</div>
-								<div class="perf-desc">Floats (Gorilla XOR)</div>
-							</div>
-							<div class="perf-item">
-								<div class="perf-metric">3-8x</div>
-								<div class="perf-desc">Integers (delta + varint)</div>
-							</div>
-						</div>
-					</div>
-				</div>
-
-				<div class="benchmark-note">
-					<p>💡 <strong>Benchmarked on:</strong> Apple M1 Pro, 16GB RAM, NVMe SSD. Run <code>cargo bench</code> to test on your hardware.</p>
-				</div>
-			</div>
-		</section>
-
-		<!-- Architecture Overview -->
-		<section class="architecture-section">
-			<div class="container">
-				<h2>Architecture</h2>
-				<p class="section-subtitle">Proven technologies, optimized for time-series</p>
-
-				<div class="arch-grid">
-					<div class="arch-component">
-						<h4>🗄️ RocksDB Storage</h4>
-						<p>LSM-tree architecture optimized for write-heavy workloads. Binary key encoding: <code>table:timestamp:row_id</code> for efficient range scans.</p>
-					</div>
-					<div class="arch-component">
-						<h4>📊 Columnar Blocks</h4>
-						<p>Data stored by column for maximum compression. Type-specific algorithms: Gorilla, delta-of-delta, varint, dictionary encoding.</p>
-					</div>
-					<div class="arch-component">
-						<h4>🔄 Schema Inference</h4>
-						<p>Automatic type detection from CSV headers. Timestamp column identification. Dynamic schema evolution with validation.</p>
-					</div>
-					<div class="arch-component">
-						<h4>⚡ Block Caching</h4>
-						<p>Intelligent decompression caching. Configurable cache sizes. LRU eviction for optimal memory usage.</p>
-					</div>
-					<div class="arch-component">
-						<h4>🌐 RESTful API</h4>
-						<p>Axum + Tokio async runtime. CORS support. Structured logging. Comprehensive error handling.</p>
-					</div>
-					<div class="arch-component">
-						<h4>🔐 ACID Transactions</h4>
-						<p>WriteBatch for atomic operations. Crash recovery. Consistent snapshots for queries.</p>
-					</div>
-				</div>
-			</div>
-		</section>
-
-		<!-- API Examples -->
-		<section class="api-section">
-			<div class="container">
-				<h2>Simple RESTful API</h2>
-				<p class="section-subtitle">No query language to learn, just HTTP</p>
-
-				<div class="api-examples">
-					<div class="api-example">
-						<h4>Ingest CSV Data</h4>
-						<pre><code>curl -X POST http://localhost:8080/tables/stocks/ingest \
-  -H "Content-Type: text/csv" \
-  --data-binary @market_data.csv
-
-# Automatic schema inference
-# Type detection: Integer, Float, String, Boolean, Timestamp
-# Columnar storage with compression</code></pre>
-					</div>
-
-					<div class="api-example">
-						<h4>Query Time Range</h4>
-						<pre><code>curl "http://localhost:8080/tables/stocks/query?start=2024-01-01T10:00:00&end=2024-01-01T11:00:00&limit=1000"
-
-# Returns JSON by default
-# Sub-millisecond response time
-# Efficient block-based scanning</code></pre>
-					</div>
-
-					<div class="api-example">
-						<h4>Export to Arrow</h4>
-						<pre><code>curl "http://localhost:8080/tables/stocks/query?limit=10000" \
-  -H "Accept: application/vnd.apache.arrow.stream" \
-  > output.arrow
-
-# Zero-copy export
-# Compatible with pandas, polars, DuckDB
-# Efficient columnar format</code></pre>
-					</div>
-
-					<div class="api-example">
-						<h4>Get Schema</h4>
-						<pre><code>curl "http://localhost:8080/tables/stocks/schema"
-
-# Returns inferred schema
-# Column names and types
-# Timestamp column identification</code></pre>
-					</div>
-				</div>
-			</div>
-		</section>
-
-		<!-- Configuration -->
-		<section class="config-section">
-			<div class="container">
-				<h2>Configuration</h2>
-				<p class="section-subtitle">TOML-based configuration with sensible defaults</p>
-
-				<div class="config-example">
-					<pre><code>[server]
-host = "0.0.0.0"
-port = 8080
-
-[storage]
-data_dir = "./data"
-write_buffer_size_mb = 64    # RocksDB write buffer
-max_open_files = 1000         # File descriptor limit
-
-[ingestion]
-max_csv_size_mb = 512         # Maximum CSV file size
-batch_size = 10000            # Rows per batch
-
-[performance]
-compression = "lz4"           # lz4, snappy, zstd
-cache_size_mb = 256           # Block cache size
-
-[logging]
-level = "info"                # debug, info, warn, error
-format = "pretty"             # pretty, json
-enable_access_logs = true
-enable_performance_logs = true</code></pre>
-				</div>
-			</div>
-		</section>
-
-		<!-- Comparison -->
-		<section class="comparison-section">
-			<div class="container">
-				<h2>How Pulsora Compares</h2>
-				<div class="comparison-table-container">
-					<table class="comparison-table">
-						<thead>
-							<tr>
-								<th>Feature</th>
-								<th>Pulsora</th>
-								<th>InfluxDB</th>
-								<th>TimescaleDB</th>
-								<th>QuestDB</th>
-							</tr>
-						</thead>
-						<tbody>
-							<tr>
-								<td>Setup Complexity</td>
-								<td><span class="check">✓</span> Single binary</td>
-								<td>Medium</td>
-								<td>PostgreSQL required</td>
-								<td>Single binary</td>
-							</tr>
-							<tr>
-								<td>Query Interface</td>
-								<td><span class="check">✓</span> REST API</td>
-								<td>InfluxQL/Flux</td>
-								<td>SQL</td>
-								<td>SQL</td>
-							</tr>
-							<tr>
-								<td>Schema</td>
-								<td><span class="check">✓</span> Auto-inferred</td>
-								<td>Tags/Fields</td>
-								<td>Defined</td>
-								<td>Defined</td>
-							</tr>
-							<tr>
-								<td>Compression</td>
-								<td><span class="check">✓</span> 2-10x type-specific</td>
-								<td>~2x</td>
-								<td>~2x</td>
-								<td>Columnar</td>
-							</tr>
-							<tr>
-								<td>Multi-Format</td>
-								<td><span class="check">✓</span> CSV/Arrow/Protobuf</td>
-								<td>Line Protocol</td>
-								<td>SQL</td>
-								<td>CSV/ILP</td>
-							</tr>
-							<tr>
-								<td>Language</td>
-								<td><span class="check">✓</span> Rust</td>
-								<td>Go</td>
-								<td>C/PostgreSQL</td>
-								<td>Java</td>
-							</tr>
-						</tbody>
-					</table>
-				</div>
-			</div>
-		</section>
-
-		<!-- Open Source -->
-		<section class="open-source-section">
-			<div class="container">
-				<h2>Open Source & Community</h2>
-				<div class="os-grid">
-					<div class="os-card">
-						<h4>📜 Apache 2.0 License</h4>
-						<p>Free and open source. Use, modify, and distribute for commercial and non-commercial purposes.</p>
-					</div>
-					<div class="os-card">
-						<h4>🦀 Built with Rust</h4>
-						<p>Memory safe, thread safe, no GC pauses. Cross-platform support for macOS, Linux, and Windows.</p>
-					</div>
-					<div class="os-card">
-						<h4>🤝 Community Driven</h4>
-						<p>Contributions welcome! Issues, PRs, and feedback appreciated. Help improve time-series technology.</p>
-					</div>
-					<div class="os-card">
-						<h4>📚 Comprehensive Docs</h4>
-						<p>API reference, architecture guide, configuration docs, development guide, and benchmarking suite.</p>
-					</div>
-				</div>
-
-				<div class="os-links">
-					<a href="https://github.com/muvon/pulsora" class="os-link-btn">
 						<svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor">
 							<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
 						</svg>
 						View on GitHub
 					</a>
-					<a href="https://github.com/muvon/pulsora/blob/master/doc/API.md" class="os-link-btn secondary">
-						📖 Read Documentation
-					</a>
-					<a href="https://github.com/muvon/pulsora/issues" class="os-link-btn secondary">
-						🐛 Report Issues
-					</a>
 				</div>
-			</div>
-		</section>
-
-		<!-- Footer -->
-		<footer class="footer">
-			<div class="container">
-				<div class="footer-content">
-					<div class="company-info">
-						<div class="footer-logo">
-							<svg width="126" height="40" viewBox="0 0 126 40" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="16.7757" cy="6.04188" r="6.04188" fill="#76B744"></circle><circle cx="37.5282" cy="31.2601" r="6.04188" fill="#76B744"></circle><path fill-rule="evenodd" clip-rule="evenodd" d="M40.4889 14.7002C40.6847 18.0313 38.1431 20.8904 34.812 21.0862C33.2728 21.1767 31.6218 21.4473 30.5785 22.5826L25.4075 28.2087C24.2377 29.4814 24.1311 31.3703 24.1311 33.099C24.1311 36.4359 21.4261 39.1409 18.0892 39.1409C14.7524 39.1409 12.0473 36.4359 12.0473 33.099C12.0473 33.0689 12.0475 33.0387 12.048 33.0087C12.0696 31.5357 11.9005 29.9507 10.8815 28.8867C9.74425 27.6992 7.93379 27.5495 6.29084 27.615C6.01445 27.6261 5.73401 27.6182 5.45092 27.5904C2.13011 27.2638 -0.297169 24.3069 0.0294542 20.9861C0.356077 17.6653 3.31291 15.238 6.63373 15.5646C9.95454 15.8913 12.3818 18.8481 12.0552 22.1689C11.9519 23.2191 12.1129 24.3374 12.8427 25.0995L13.3778 25.6582C14.5465 26.8785 16.3995 27.0571 18.0892 27.0571C19.5836 27.0571 21.1971 26.8255 22.2084 25.7252L27.3209 20.1627C28.456 18.9277 28.5244 17.0838 28.426 15.4092C28.2302 12.0781 30.7718 9.21903 34.1029 9.02323C37.434 8.82742 40.2931 11.3691 40.4889 14.7002Z" fill="#76B744"></path><path d="M65.6534 17.4566C65.3946 16.9132 64.8877 16.6414 64.1329 16.6414C63.2559 16.6414 62.6664 16.9132 62.3644 17.4566C62.1991 17.7661 62.1164 18.227 62.1164 18.8392V25.6079H59V14.3818H61.987V16.0224C62.368 15.4377 62.7275 15.0215 63.0654 14.7739C63.662 14.3336 64.4348 14.1135 65.3838 14.1135C66.2824 14.1135 67.0085 14.3027 67.562 14.681C68.0078 15.0318 68.3456 15.4824 68.5757 16.0327C68.9783 15.3723 69.4779 14.8874 70.0746 14.5778C70.7072 14.2683 71.4117 14.1135 72.1881 14.1135C72.7057 14.1135 73.2161 14.2098 73.7194 14.4024C74.2226 14.595 74.6791 14.9321 75.0889 15.4136C75.4196 15.8057 75.6424 16.2872 75.7574 16.8581C75.8293 17.2365 75.8653 17.7902 75.8653 18.5193L75.8437 25.6079H72.6949V18.4471C72.6949 18.0206 72.6231 17.6698 72.4793 17.3947C72.2061 16.8719 71.7029 16.6105 70.9696 16.6105C70.1213 16.6105 69.5354 16.9475 69.2119 17.6217C69.0466 17.9794 68.9639 18.4093 68.9639 18.9114V25.6079H65.869V18.9114C65.869 18.2442 65.7972 17.7592 65.6534 17.4566Z" fill="white"></path><path d="M85.5764 24.0189C85.5476 24.0533 85.4757 24.1565 85.3607 24.3285C85.2457 24.5004 85.1091 24.6518 84.951 24.7825C84.4693 25.1952 84.002 25.4772 83.5491 25.6285C83.1034 25.7799 82.5786 25.8555 81.9747 25.8555C80.235 25.8555 79.0632 25.2571 78.4593 24.0602C78.1215 23.3998 77.9525 22.4265 77.9525 21.1402V14.3611H81.1013V21.1402C81.1013 21.7799 81.1804 22.2614 81.3385 22.5847C81.6189 23.1556 82.1688 23.4411 82.9884 23.4411C84.038 23.4411 84.7569 23.0353 85.1451 22.2236C85.3463 21.7833 85.447 21.2021 85.447 20.4798V14.3611H88.5634V25.6079H85.5764V24.0189Z" fill="white"></path><path d="M89.7233 14.3611H93.174L95.6218 22.6569L98.1236 14.3611H101.423L97.1854 25.6079H93.9396L89.7233 14.3611Z" fill="white"></path><path d="M112.31 15.785C113.302 16.9751 113.798 18.3818 113.798 20.0052C113.798 21.6561 113.302 23.0696 112.31 24.2459C111.318 25.4153 109.812 26 107.792 26C105.771 26 104.265 25.4153 103.273 24.2459C102.281 23.0696 101.785 21.6561 101.785 20.0052C101.785 18.3818 102.281 16.9751 103.273 15.785C104.265 14.595 105.771 14 107.792 14C109.812 14 111.318 14.595 112.31 15.785ZM107.781 16.4867C106.882 16.4867 106.188 16.7928 105.7 17.405C105.218 18.0103 104.977 18.877 104.977 20.0052C104.977 21.1333 105.218 22.0034 105.7 22.6156C106.188 23.2279 106.882 23.534 107.781 23.534C108.679 23.534 109.37 23.2279 109.851 22.6156C110.333 22.0034 110.574 21.1333 110.574 20.0052C110.574 18.877 110.333 18.0103 109.851 17.405C109.37 16.7928 108.679 16.4867 107.781 16.4867Z" fill="white"></path><path d="M120.878 16.5383C119.835 16.5383 119.12 16.9613 118.732 17.8074C118.531 18.2545 118.43 18.8255 118.43 19.5202V25.6079H115.368V14.3818H118.333V16.0224C118.728 15.4445 119.102 15.0284 119.454 14.7739C120.087 14.3199 120.889 14.0929 121.859 14.0929C123.074 14.0929 124.066 14.399 124.835 15.0112C125.612 15.6165 126 16.6242 126 18.0344V25.6079H122.851V18.767C122.851 18.1754 122.769 17.7214 122.603 17.405C122.301 16.8272 121.726 16.5383 120.878 16.5383Z" fill="white"></path></svg>
-						</div>
-						<p>© 2025 Muvon Un Limited (Hong Kong)</p>
-						<p>High-Performance Time-Series Database</p>
+				<div class="hero-stats">
+					<div class="stat">
+						<div class="stat-value">350K+</div>
+						<div class="stat-label">rows/sec</div>
 					</div>
-					<div class="footer-links">
-						<div class="link-group">
-							<h5>Product</h5>
-							<a href="https://github.com/muvon/pulsora">GitHub</a>
-							<a href="https://github.com/muvon/pulsora/releases">Releases</a>
-							<a href="https://github.com/muvon/pulsora/tree/master/benches">Benchmarks</a>
-						</div>
-						<div class="link-group">
-							<h5>Documentation</h5>
-							<a href="https://github.com/muvon/pulsora/blob/master/README.md">Getting Started</a>
-							<a href="https://github.com/muvon/pulsora/blob/master/doc/API.md">API Reference</a>
-							<a href="https://github.com/muvon/pulsora/blob/master/doc/ARCHITECTURE.md">Architecture</a>
-						</div>
-						<div class="link-group">
-							<h5>Support</h5>
-							<a href="https://github.com/muvon/pulsora/issues">Issues</a>
-							<a href="mailto:opensource@muvon.io">Email</a>
-							<a href="https://muvon.io">Muvon.io</a>
-						</div>
+					<div class="stat">
+						<div class="stat-value">&lt;1ms</div>
+						<div class="stat-label">queries</div>
+					</div>
+					<div class="stat">
+						<div class="stat-value">2-10x</div>
+						<div class="stat-label">compression</div>
 					</div>
 				</div>
 			</div>
-		</footer>
+			<div class="hero-visual">
+				<div class="code-window">
+					<div class="window-header">
+						<div class="window-dots">
+							<span></span><span></span><span></span>
+						</div>
+						<div class="window-title">terminal</div>
+					</div>
+					<div class="window-content">
+						<div class="code-line"><span class="prompt">$</span> pulsora</div>
+						<div class="code-line comment"># Server started on :8080</div>
+						<div class="code-line"><span class="prompt">$</span> curl -X POST http://localhost:8080/tables/stocks/ingest \</div>
+						<div class="code-line">  -H "Content-Type: text/csv" \</div>
+						<div class="code-line">  --data-binary @market_data.csv</div>
+						<div class="code-line success">✓ Ingested 1M rows in 2.8s (357K rows/sec)</div>
+						<div class="code-line success">✓ Compressed 2.1GB → 210MB (10x ratio)</div>
+					</div>
+				</div>
+			</div>
+		</div>
+	</section>
 
-		<script src="script.js"></script>
-	</body>
+	<!-- Key Features -->
+	<section id="features" class="features">
+		<div class="container">
+			<div class="section-header">
+				<h2>Built for Performance</h2>
+				<p>Three core strengths that make Pulsora exceptional</p>
+			</div>
+			<div class="features-grid">
+				<div class="feature-card">
+					<div class="feature-icon">⚡</div>
+					<h3>Lightning Fast</h3>
+					<p class="feature-desc">Sub-millisecond queries with intelligent block caching. 350K+ rows/sec ingestion. Optimized for high-frequency time-series data.</p>
+					<ul class="feature-list">
+						<li>Binary key encoding for efficient range scans</li>
+						<li>Columnar storage with block-level caching</li>
+						<li>Zero-copy operations where possible</li>
+					</ul>
+				</div>
+				<div class="feature-card highlight">
+					<div class="feature-icon">💾</div>
+					<h3>Extreme Compression</h3>
+					<p class="feature-desc">2-10x compression with type-specific algorithms. Store more data in less space without sacrificing query speed.</p>
+					<ul class="feature-list">
+						<li><strong>Gorilla XOR</strong> for floating-point values</li>
+						<li><strong>Delta-of-delta</strong> for timestamps</li>
+						<li><strong>Varint encoding</strong> for integers</li>
+						<li><strong>Dictionary encoding</strong> for strings</li>
+					</ul>
+				</div>
+				<div class="feature-card">
+					<div class="feature-icon">🔄</div>
+					<h3>Multi-Format Support</h3>
+					<p class="feature-desc">Ingest and export in multiple formats. Seamless integration with your existing data pipelines.</p>
+					<ul class="feature-list">
+						<li><strong>CSV</strong> - Universal compatibility</li>
+						<li><strong>Apache Arrow</strong> - Zero-copy columnar</li>
+						<li><strong>Protocol Buffers</strong> - Efficient binary</li>
+						<li><strong>JSON</strong> - Easy debugging</li>
+					</ul>
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<!-- Quick Start -->
+	<section id="quickstart" class="quickstart">
+		<div class="container">
+			<div class="section-header">
+				<h2>Start in 60 Seconds</h2>
+				<p>No complex setup. No configuration files. Just run and go.</p>
+			</div>
+			<div class="quickstart-grid">
+				<div class="quickstart-step">
+					<div class="step-num">1</div>
+					<h3>Install</h3>
+					<div class="code-block">
+						<code>cargo install --git https://github.com/muvon/pulsora.git</code>
+					</div>
+				</div>
+				<div class="quickstart-step">
+					<div class="step-num">2</div>
+					<h3>Run</h3>
+					<div class="code-block">
+						<code>pulsora</code>
+					</div>
+					<p class="step-note">Server starts on localhost:8080</p>
+				</div>
+				<div class="quickstart-step">
+					<div class="step-num">3</div>
+					<h3>Use</h3>
+					<div class="code-block">
+						<code>curl -X POST http://localhost:8080/tables/stocks/ingest \
+  -H "Content-Type: text/csv" \
+  --data-binary @data.csv</code>
+					</div>
+					<p class="step-note">Automatic schema inference</p>
+				</div>
+			</div>
+			<div class="quickstart-features">
+				<div class="qs-feature">
+					<svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+						<path d="M10 0L12.2451 6.90983H19.5106L13.6327 11.1803L15.8779 18.0902L10 13.8197L4.12215 18.0902L6.36729 11.1803L0.489435 6.90983H7.75486L10 0Z" fill="#7CB342"/>
+					</svg>
+					<span>Zero dependencies</span>
+				</div>
+				<div class="qs-feature">
+					<svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+						<path d="M10 0L12.2451 6.90983H19.5106L13.6327 11.1803L15.8779 18.0902L10 13.8197L4.12215 18.0902L6.36729 11.1803L0.489435 6.90983H7.75486L10 0Z" fill="#7CB342"/>
+					</svg>
+					<span>Single binary</span>
+				</div>
+				<div class="qs-feature">
+					<svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+						<path d="M10 0L12.2451 6.90983H19.5106L13.6327 11.1803L15.8779 18.0902L10 13.8197L4.12215 18.0902L6.36729 11.1803L0.489435 6.90983H7.75486L10 0Z" fill="#7CB342"/>
+					</svg>
+					<span>Auto schema inference</span>
+				</div>
+				<div class="qs-feature">
+					<svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+						<path d="M10 0L12.2451 6.90983H19.5106L13.6327 11.1803L15.8779 18.0902L10 13.8197L4.12215 18.0902L6.36729 11.1803L0.489435 6.90983H7.75486L10 0Z" fill="#7CB342"/>
+					</svg>
+					<span>RESTful API</span>
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<!-- Use Cases -->
+	<section class="usecases">
+		<div class="container">
+			<div class="section-header">
+				<h2>Perfect For</h2>
+				<p>Optimized for high-frequency time-series workloads</p>
+			</div>
+			<div class="usecases-grid">
+				<div class="usecase-card">
+					<div class="usecase-icon">📈</div>
+					<h3>Financial Markets</h3>
+					<p>Tick data, OHLCV bars, order books. Microsecond timestamps. Optimized compression for price/volume data.</p>
+				</div>
+				<div class="usecase-card">
+					<div class="usecase-icon">📊</div>
+					<h3>IoT & Sensors</h3>
+					<p>Millions of sensors, continuous streams. Temperature, pressure, vibration. Efficient storage for slowly-changing values.</p>
+				</div>
+				<div class="usecase-card">
+					<div class="usecase-icon">🔍</div>
+					<h3>Metrics & Monitoring</h3>
+					<p>Application performance, request rates, error counts. System metrics, resource utilization. Fast time-window aggregations.</p>
+				</div>
+				<div class="usecase-card">
+					<div class="usecase-icon">⚙️</div>
+					<h3>Industrial Telemetry</h3>
+					<p>Manufacturing equipment, production lines. Real-time monitoring with historical analysis. Predictive maintenance datasets.</p>
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<!-- Tech Stack -->
+	<section class="techstack">
+		<div class="container">
+			<div class="section-header">
+				<h2>Built on Proven Technology</h2>
+				<p>Production-ready architecture with battle-tested components</p>
+			</div>
+			<div class="tech-grid">
+				<div class="tech-item">
+					<div class="tech-icon">🦀</div>
+					<h4>Rust</h4>
+					<p>Memory safe, thread safe, no GC pauses. Predictable performance.</p>
+				</div>
+				<div class="tech-item">
+					<div class="tech-icon">🗄️</div>
+					<h4>RocksDB</h4>
+					<p>LSM-tree storage. ACID transactions. Proven durability.</p>
+				</div>
+				<div class="tech-item">
+					<div class="tech-icon">📦</div>
+					<h4>Columnar Storage</h4>
+					<p>Block-based architecture. Type-specific compression algorithms.</p>
+				</div>
+				<div class="tech-item">
+					<div class="tech-icon">⚡</div>
+					<h4>Axum + Tokio</h4>
+					<p>Async runtime. High-performance HTTP server.</p>
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<!-- CTA -->
+	<section class="cta">
+		<div class="container">
+			<div class="cta-content">
+				<h2>Ready to Get Started?</h2>
+				<p>Open source, Apache 2.0 licensed. Free forever.</p>
+				<div class="cta-buttons">
+					<a href="https://github.com/muvon/pulsora" class="btn-primary large">
+						<svg width="24" height="24" viewBox="0 0 16 16" fill="currentColor">
+							<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+						</svg>
+						View on GitHub
+					</a>
+					<a href="https://github.com/muvon/pulsora/blob/master/doc/API.md" class="btn-secondary large">
+						Read Documentation
+					</a>
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<!-- Footer -->
+	<footer class="footer">
+		<div class="container">
+			<div class="footer-content">
+				<div class="footer-brand">
+					<svg width="126" height="40" viewBox="0 0 126 40" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="16.7757" cy="6.04188" r="6.04188" fill="#76B744"></circle><circle cx="37.5282" cy="31.2601" r="6.04188" fill="#76B744"></circle><path fill-rule="evenodd" clip-rule="evenodd" d="M40.4889 14.7002C40.6847 18.0313 38.1431 20.8904 34.812 21.0862C33.2728 21.1767 31.6218 21.4473 30.5785 22.5826L25.4075 28.2087C24.2377 29.4814 24.1311 31.3703 24.1311 33.099C24.1311 36.4359 21.4261 39.1409 18.0892 39.1409C14.7524 39.1409 12.0473 36.4359 12.0473 33.099C12.0473 33.0689 12.0475 33.0387 12.048 33.0087C12.0696 31.5357 11.9005 29.9507 10.8815 28.8867C9.74425 27.6992 7.93379 27.5495 6.29084 27.615C6.01445 27.6261 5.73401 27.6182 5.45092 27.5904C2.13011 27.2638 -0.297169 24.3069 0.0294542 20.9861C0.356077 17.6653 3.31291 15.238 6.63373 15.5646C9.95454 15.8913 12.3818 18.8481 12.0552 22.1689C11.9519 23.2191 12.1129 24.3374 12.8427 25.0995L13.3778 25.6582C14.5465 26.8785 16.3995 27.0571 18.0892 27.0571C19.5836 27.0571 21.1971 26.8255 22.2084 25.7252L27.3209 20.1627C28.456 18.9277 28.5244 17.0838 28.426 15.4092C28.2302 12.0781 30.7718 9.21903 34.1029 9.02323C37.434 8.82742 40.2931 11.3691 40.4889 14.7002Z" fill="#76B744"></path><path d="M65.6534 17.4566C65.3946 16.9132 64.8877 16.6414 64.1329 16.6414C63.2559 16.6414 62.6664 16.9132 62.3644 17.4566C62.1991 17.7661 62.1164 18.227 62.1164 18.8392V25.6079H59V14.3818H61.987V16.0224C62.368 15.4377 62.7275 15.0215 63.0654 14.7739C63.662 14.3336 64.4348 14.1135 65.3838 14.1135C66.2824 14.1135 67.0085 14.3027 67.562 14.681C68.0078 15.0318 68.3456 15.4824 68.5757 16.0327C68.9783 15.3723 69.4779 14.8874 70.0746 14.5778C70.7072 14.2683 71.4117 14.1135 72.1881 14.1135C72.7057 14.1135 73.2161 14.2098 73.7194 14.4024C74.2226 14.595 74.6791 14.9321 75.0889 15.4136C75.4196 15.8057 75.6424 16.2872 75.7574 16.8581C75.8293 17.2365 75.8653 17.7902 75.8653 18.5193L75.8437 25.6079H72.6949V18.4471C72.6949 18.0206 72.6231 17.6698 72.4793 17.3947C72.2061 16.8719 71.7029 16.6105 70.9696 16.6105C70.1213 16.6105 69.5354 16.9475 69.2119 17.6217C69.0466 17.9794 68.9639 18.4093 68.9639 18.9114V25.6079H65.869V18.9114C65.869 18.2442 65.7972 17.7592 65.6534 17.4566Z" fill="white"></path><path d="M85.5764 24.0189C85.5476 24.0533 85.4757 24.1565 85.3607 24.3285C85.2457 24.5004 85.1091 24.6518 84.951 24.7825C84.4693 25.1952 84.002 25.4772 83.5491 25.6285C83.1034 25.7799 82.5786 25.8555 81.9747 25.8555C80.235 25.8555 79.0632 25.2571 78.4593 24.0602C78.1215 23.3998 77.9525 22.4265 77.9525 21.1402V14.3611H81.1013V21.1402C81.1013 21.7799 81.1804 22.2614 81.3385 22.5847C81.6189 23.1556 82.1688 23.4411 82.9884 23.4411C84.038 23.4411 84.7569 23.0353 85.1451 22.2236C85.3463 21.7833 85.447 21.2021 85.447 20.4798V14.3611H88.5634V25.6079H85.5764V24.0189Z" fill="white"></path><path d="M89.7233 14.3611H93.174L95.6218 22.6569L98.1236 14.3611H101.423L97.1854 25.6079H93.9396L89.7233 14.3611Z" fill="white"></path><path d="M112.31 15.785C113.302 16.9751 113.798 18.3818 113.798 20.0052C113.798 21.6561 113.302 23.0696 112.31 24.2459C111.318 25.4153 109.812 26 107.792 26C105.771 26 104.265 25.4153 103.273 24.2459C102.281 23.0696 101.785 21.6561 101.785 20.0052C101.785 18.3818 102.281 16.9751 103.273 15.785C104.265 14.595 105.771 14 107.792 14C109.812 14 111.318 14.595 112.31 15.785ZM107.781 16.4867C106.882 16.4867 106.188 16.7928 105.7 17.405C105.218 18.0103 104.977 18.877 104.977 20.0052C104.977 21.1333 105.218 22.0034 105.7 22.6156C106.188 23.2279 106.882 23.534 107.781 23.534C108.679 23.534 109.37 23.2279 109.851 22.6156C110.333 22.0034 110.574 21.1333 110.574 20.0052C110.574 18.877 110.333 18.0103 109.851 17.405C109.37 16.7928 108.679 16.4867 107.781 16.4867Z" fill="white"></path><path d="M120.878 16.5383C119.835 16.5383 119.12 16.9613 118.732 17.8074C118.531 18.2545 118.43 18.8255 118.43 19.5202V25.6079H115.368V14.3818H118.333V16.0224C118.728 15.4445 119.102 15.0284 119.454 14.7739C120.087 14.3199 120.889 14.0929 121.859 14.0929C123.074 14.0929 124.066 14.399 124.835 15.0112C125.612 15.6165 126 16.6242 126 18.0344V25.6079H122.851V18.767C122.851 18.1754 122.769 17.7214 122.603 17.405C122.301 16.8272 121.726 16.5383 120.878 16.5383Z" fill="white"></path></svg>
+					<p>© 2025 Muvon Un Limited</p>
+					<p class="footer-tagline">Lightning-Fast Time-Series Database</p>
+				</div>
+				<div class="footer-links">
+					<div class="footer-col">
+						<h5>Product</h5>
+						<a href="https://github.com/muvon/pulsora">GitHub</a>
+						<a href="https://github.com/muvon/pulsora/releases">Releases</a>
+						<a href="https://github.com/muvon/pulsora/tree/master/benches">Benchmarks</a>
+					</div>
+					<div class="footer-col">
+						<h5>Documentation</h5>
+						<a href="https://github.com/muvon/pulsora/blob/master/doc/API.md">API Reference</a>
+						<a href="https://github.com/muvon/pulsora/blob/master/doc/ARCHITECTURE.md">Architecture</a>
+						<a href="https://github.com/muvon/pulsora/blob/master/doc/CONFIGURATION.md">Configuration</a>
+					</div>
+					<div class="footer-col">
+						<h5>Community</h5>
+						<a href="https://github.com/muvon/pulsora/issues">Issues</a>
+						<a href="mailto:opensource@muvon.io">Contact</a>
+						<a href="https://muvon.io">Muvon.io</a>
+					</div>
+				</div>
+			</div>
+		</div>
+	</footer>
+
+	<script src="script.js"></script>
+</body>
 </html>
