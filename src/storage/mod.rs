@@ -735,14 +735,22 @@ impl StorageEngine {
             .get_schema(table)
             .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
 
+        // Calculate limit for DB query to ensure we get enough data for offset + limit
+        // We don't pass offset to DB query because we need to merge with buffer first
+        let db_limit = if let Some(l) = limit {
+            Some(offset.unwrap_or(0) + l)
+        } else {
+            None
+        };
+
         let db_results = query::execute_query(
             &self.db,
             table,
             schema,
             start.clone(),
             end.clone(),
-            limit,
-            offset,
+            db_limit,
+            None, // Don't apply offset in DB query
             self.query_threads,
         )?;
 
@@ -820,9 +828,19 @@ impl StorageEngine {
         // Sort by timestamp if possible
         if let Some(ts_col) = schema.get_timestamp_column() {
             results.sort_by(|a, b| {
-                let ts_a = a.get(ts_col).and_then(|v| v.as_str()).unwrap_or("");
-                let ts_b = b.get(ts_col).and_then(|v| v.as_str()).unwrap_or("");
-                ts_a.cmp(ts_b)
+                let get_ts = |v: &serde_json::Value| -> i64 {
+                    match v.get(ts_col) {
+                        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+                        Some(serde_json::Value::String(s)) => {
+                            ingestion::parse_timestamp(s).unwrap_or(0)
+                        }
+                        _ => 0,
+                    }
+                };
+
+                let ts_a = get_ts(a);
+                let ts_b = get_ts(b);
+                ts_a.cmp(&ts_b)
             });
         }
 

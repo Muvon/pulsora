@@ -797,32 +797,13 @@ pub fn execute_query_csv(
                     if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
                         if let Ok(block) = ColumnBlock::deserialize(&block_data) {
                             if block_min_ts < start_ts || block_max_ts > end_ts {
-                                let indices =
-                                    block.filter_by_timestamp(schema, start_ts, end_ts)?;
-
-                                // Optimization: If all rows match, use fast path
-                                if indices.len() == block.row_count {
-                                    return block.to_csv(schema, skip_in_block, take_from_block);
-                                }
-
-                                let relevant_indices: Vec<usize> = indices
-                                    .into_iter()
-                                    .filter(|&idx| {
-                                        idx >= skip_in_block
-                                            && idx < skip_in_block + take_from_block
-                                    })
-                                    .collect();
-
-                                // Optimization: If relevant indices are contiguous, use fast path
-                                if !relevant_indices.is_empty() {
-                                    let first = relevant_indices[0];
-                                    let last = relevant_indices[relevant_indices.len() - 1];
-                                    if relevant_indices.len() == (last - first + 1) {
-                                        return block.to_csv(schema, first, relevant_indices.len());
-                                    }
-                                }
-
-                                return block.to_csv_filtered(schema, &relevant_indices);
+                                return block.to_csv_query(
+                                    schema,
+                                    start_ts,
+                                    end_ts,
+                                    skip_in_block,
+                                    take_from_block,
+                                );
                             } else {
                                 return block.to_csv(schema, skip_in_block, take_from_block);
                             }
@@ -1049,37 +1030,14 @@ pub fn execute_query_arrow(
                     if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
                         if let Ok(block) = ColumnBlock::deserialize(&block_data) {
                             if block_min_ts < start_ts || block_max_ts > end_ts {
-                                let indices =
-                                    block.filter_by_timestamp(schema, start_ts, end_ts)?;
-
-                                // Optimization: If all rows match, use fast path
-                                if indices.len() == block.row_count {
-                                    return block
-                                        .to_arrow(schema, skip_in_block, take_from_block)
-                                        .map(Some);
-                                }
-
-                                let relevant_indices: Vec<usize> = indices
-                                    .into_iter()
-                                    .filter(|&idx| {
-                                        idx >= skip_in_block
-                                            && idx < skip_in_block + take_from_block
-                                    })
-                                    .collect();
-
-                                // Optimization: If relevant indices are contiguous, use fast path
-                                if !relevant_indices.is_empty() {
-                                    let first = relevant_indices[0];
-                                    let last = relevant_indices[relevant_indices.len() - 1];
-                                    if relevant_indices.len() == (last - first + 1) {
-                                        return block
-                                            .to_arrow(schema, first, relevant_indices.len())
-                                            .map(Some);
-                                    }
-                                }
-
                                 return block
-                                    .to_arrow_filtered(schema, &relevant_indices)
+                                    .to_arrow_query(
+                                        schema,
+                                        start_ts,
+                                        end_ts,
+                                        skip_in_block,
+                                        take_from_block,
+                                    )
                                     .map(Some);
                             } else {
                                 return block

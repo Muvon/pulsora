@@ -135,7 +135,11 @@ pub fn fast_parse_i64(s: &str) -> Option<i64> {
         i += 1;
     }
 
-    Some(if negative { -result } else { result })
+    Some(if negative {
+        result.wrapping_neg()
+    } else {
+        result
+    })
 }
 
 /// Encode an unsigned integer using variable-length encoding - optimized version
