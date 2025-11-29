@@ -3,6 +3,13 @@ use std::path::PathBuf;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 mod config;
 mod error;
 mod server;
