@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::array::Array;
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -339,6 +335,64 @@ async fn query_data(
         }
     }
 
+    // FAST PATH: Arrow Export
+    if accept.contains("application/arrow")
+        || accept.contains("application/vnd.apache.arrow.stream")
+    {
+        if state.config.logging.enable_performance_logs {
+            debug!(
+                table = %table,
+                start = ?params.start,
+                end = ?params.end,
+                limit = ?params.limit,
+                offset = ?params.offset,
+                "🔍 Starting Arrow query execution"
+            );
+        }
+
+        match state
+            .storage
+            .query_arrow(
+                &table,
+                params.start,
+                params.end,
+                params.limit,
+                params.offset,
+            )
+            .await
+        {
+            Ok(arrow_data) => {
+                let duration = start_time.elapsed();
+                // We don't easily know row count without parsing, so skip it or estimate
+                // For now, just log success
+
+                if state.config.logging.enable_performance_logs {
+                    info!(
+                        table = %table,
+                        size_bytes = arrow_data.len(),
+                        duration_ms = duration.as_millis(),
+                        "✅ Arrow Query completed successfully"
+                    );
+                }
+
+                return Ok(Response::builder()
+                    .header("Content-Type", "application/vnd.apache.arrow.stream")
+                    .body(Body::from(arrow_data))
+                    .unwrap());
+            }
+            Err(e) => {
+                let duration = start_time.elapsed();
+                error!(
+                    table = %table,
+                    error = %e,
+                    duration_ms = duration.as_millis(),
+                    "💥 Arrow Query error"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
     if state.config.logging.enable_performance_logs {
         debug!(
             table = %table,
@@ -382,172 +436,16 @@ async fn query_data(
             if accept.contains("application/arrow")
                 || accept.contains("application/vnd.apache.arrow.stream")
             {
-                // Fetch schema to build Arrow schema
-                let schema_json = match state.storage.get_schema(&table).await {
-                    Ok(s) => s,
-                    Err(_) => return Ok(Json(ApiResponse::success(results)).into_response()),
-                };
+                // This path should have been handled by the FAST PATH above
+                // But if we fall through (e.g. query returned results but fast path failed?),
+                // we can still try to convert.
+                // However, since we removed the manual conversion logic to avoid duplication,
+                // we should probably just return JSON or error.
+                // Or better, since we handle Arrow in FAST PATH, this branch is unreachable
+                // for Arrow unless something weird happens.
 
-                // Parse schema from JSON
-                let schema: crate::storage::schema::Schema =
-                    serde_json::from_value(schema_json).unwrap();
-
-                // Build Arrow Schema
-                let mut fields = Vec::new();
-                for col in &schema.columns {
-                    let dt = match col.data_type {
-                        crate::storage::schema::DataType::Id => DataType::UInt64,
-                        crate::storage::schema::DataType::Integer => DataType::Int64,
-                        crate::storage::schema::DataType::Float => DataType::Float64,
-                        crate::storage::schema::DataType::Boolean => DataType::Boolean,
-                        crate::storage::schema::DataType::Timestamp => DataType::Int64, // Timestamp as Int64 millis
-                        crate::storage::schema::DataType::String => DataType::Utf8,
-                    };
-                    fields.push(Field::new(&col.name, dt, true));
-                }
-                let arrow_schema = Arc::new(ArrowSchema::new(fields));
-
-                // Build Arrays
-                let mut columns: Vec<Arc<dyn Array>> = Vec::new();
-                for col in &schema.columns {
-                    match col.data_type {
-                        crate::storage::schema::DataType::Id => {
-                            let mut builder = arrow::array::UInt64Builder::new();
-                            for row in &results {
-                                if let Some(val) = row.get(&col.name) {
-                                    match val {
-                                        serde_json::Value::Number(n) => {
-                                            builder.append_value(n.as_u64().unwrap_or(0))
-                                        }
-                                        serde_json::Value::String(s) => {
-                                            builder.append_value(s.parse().unwrap_or(0))
-                                        }
-                                        _ => builder.append_null(),
-                                    }
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            columns.push(Arc::new(builder.finish()));
-                        }
-                        crate::storage::schema::DataType::Integer => {
-                            let mut builder = arrow::array::Int64Builder::new();
-                            for row in &results {
-                                if let Some(val) = row.get(&col.name) {
-                                    match val {
-                                        serde_json::Value::Number(n) => {
-                                            builder.append_value(n.as_i64().unwrap_or(0))
-                                        }
-                                        serde_json::Value::String(s) => {
-                                            builder.append_value(s.parse().unwrap_or(0))
-                                        }
-                                        _ => builder.append_null(),
-                                    }
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            columns.push(Arc::new(builder.finish()));
-                        }
-                        crate::storage::schema::DataType::Float => {
-                            let mut builder = arrow::array::Float64Builder::new();
-                            for row in &results {
-                                if let Some(val) = row.get(&col.name) {
-                                    match val {
-                                        serde_json::Value::Number(n) => {
-                                            builder.append_value(n.as_f64().unwrap_or(0.0))
-                                        }
-                                        serde_json::Value::String(s) => {
-                                            builder.append_value(s.parse().unwrap_or(0.0))
-                                        }
-                                        _ => builder.append_null(),
-                                    }
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            columns.push(Arc::new(builder.finish()));
-                        }
-                        crate::storage::schema::DataType::Boolean => {
-                            let mut builder = arrow::array::BooleanBuilder::new();
-                            for row in &results {
-                                if let Some(val) = row.get(&col.name) {
-                                    match val {
-                                        serde_json::Value::Bool(b) => builder.append_value(*b),
-                                        serde_json::Value::String(s) => {
-                                            builder.append_value(s == "true")
-                                        }
-                                        _ => builder.append_null(),
-                                    }
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            columns.push(Arc::new(builder.finish()));
-                        }
-                        crate::storage::schema::DataType::Timestamp => {
-                            let mut builder = arrow::array::Int64Builder::new();
-                            for row in &results {
-                                if let Some(val) = row.get(&col.name) {
-                                    match val {
-                                        serde_json::Value::Number(n) => {
-                                            builder.append_value(n.as_i64().unwrap_or(0))
-                                        }
-                                        serde_json::Value::String(s) => {
-                                            // Try to parse timestamp string
-                                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
-                                            {
-                                                builder.append_value(dt.timestamp_millis());
-                                            } else if let Ok(ts) = s.parse::<i64>() {
-                                                builder.append_value(ts);
-                                            } else {
-                                                builder.append_null();
-                                            }
-                                        }
-                                        _ => builder.append_null(),
-                                    }
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            columns.push(Arc::new(builder.finish()));
-                        }
-                        crate::storage::schema::DataType::String => {
-                            let mut builder = arrow::array::StringBuilder::new();
-                            for row in &results {
-                                if let Some(val) = row.get(&col.name) {
-                                    match val {
-                                        serde_json::Value::String(s) => builder.append_value(s),
-                                        serde_json::Value::Number(n) => {
-                                            builder.append_value(n.to_string())
-                                        }
-                                        serde_json::Value::Bool(b) => {
-                                            builder.append_value(b.to_string())
-                                        }
-                                        _ => builder.append_null(),
-                                    }
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            columns.push(Arc::new(builder.finish()));
-                        }
-                    }
-                }
-
-                let batch = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
-
-                let mut buffer = Vec::new();
-                {
-                    let mut writer = StreamWriter::try_new(&mut buffer, &arrow_schema).unwrap();
-                    writer.write(&batch).unwrap();
-                    writer.finish().unwrap();
-                }
-
-                Ok(Response::builder()
-                    .header("Content-Type", "application/vnd.apache.arrow.stream")
-                    .body(Body::from(buffer))
-                    .unwrap())
+                // Let's just remove this branch or make it a fallback
+                Ok(Json(ApiResponse::success(results)).into_response())
             } else if accept.contains("application/protobuf")
                 || accept.contains("application/x-protobuf")
             {

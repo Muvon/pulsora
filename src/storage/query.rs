@@ -17,6 +17,7 @@
 //! This module handles time-range queries, pagination, and result formatting
 //! for efficient retrieval of time-series data from RocksDB.
 
+use arrow::record_batch::RecordBatch;
 use chrono::DateTime;
 use rocksdb::{Direction, IteratorMode, ReadOptions, DB};
 use serde_json::Value;
@@ -461,6 +462,7 @@ fn generate_id_key_from_hash(table_hash: u32, id: u64) -> [u8; 12] {
 }
 
 /// Process a single block with optimized filtering and JSON conversion
+#[allow(clippy::too_many_arguments)]
 fn process_block_filtered(
     db: &DB,
     table: &str,
@@ -672,16 +674,31 @@ pub fn execute_query_csv(
         let block_id = &value[4..4 + block_id_len];
         let pos = 4 + block_id_len;
         let block_min_ts = i64::from_le_bytes([
-            value[pos], value[pos + 1], value[pos + 2], value[pos + 3],
-            value[pos + 4], value[pos + 5], value[pos + 6], value[pos + 7],
+            value[pos],
+            value[pos + 1],
+            value[pos + 2],
+            value[pos + 3],
+            value[pos + 4],
+            value[pos + 5],
+            value[pos + 6],
+            value[pos + 7],
         ]);
         let block_max_ts = i64::from_le_bytes([
-            value[pos + 8], value[pos + 9], value[pos + 10], value[pos + 11],
-            value[pos + 12], value[pos + 13], value[pos + 14], value[pos + 15],
+            value[pos + 8],
+            value[pos + 9],
+            value[pos + 10],
+            value[pos + 11],
+            value[pos + 12],
+            value[pos + 13],
+            value[pos + 14],
+            value[pos + 15],
         ]);
 
         let row_count = u32::from_le_bytes([
-            value[pos + 16], value[pos + 17], value[pos + 18], value[pos + 19],
+            value[pos + 16],
+            value[pos + 17],
+            value[pos + 18],
+            value[pos + 19],
         ]) as usize;
 
         if block_max_ts < start_ts || block_min_ts > end_ts {
@@ -777,5 +794,218 @@ pub fn execute_query_csv(
 
     results_batches
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_query_arrow(
+    db: &Arc<DB>,
+    table: &str,
+    schema: &Schema,
+    start: Option<String>,
+    end: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    query_threads: usize,
+) -> Result<Vec<RecordBatch>> {
+    let start_ts = if let Some(s) = start.as_deref() {
+        parse_query_timestamp(s)?
+    } else {
+        0i64
+    };
+
+    let end_ts = if let Some(e) = end.as_deref() {
+        parse_query_timestamp(e)?
+    } else {
+        i64::MAX
+    };
+
+    let limit = limit.unwrap_or(1000);
+    let offset = offset.unwrap_or(0);
+
+    // Build block index scan key
+    let table_hash = calculate_table_hash(table);
+    let mut start_key = Vec::with_capacity(5);
+    start_key.extend_from_slice(&table_hash.to_be_bytes());
+    start_key.push(b'B');
+
+    let mut read_opts = ReadOptions::default();
+    read_opts.set_verify_checksums(false);
+    read_opts.fill_cache(true);
+    read_opts.set_readahead_size(4 * 1024 * 1024);
+
+    let mut iter_read_opts = ReadOptions::default();
+    iter_read_opts.set_verify_checksums(false);
+    iter_read_opts.fill_cache(true);
+    iter_read_opts.set_readahead_size(4 * 1024 * 1024);
+
+    let iter = db.iterator_opt(
+        IteratorMode::From(&start_key, Direction::Forward),
+        iter_read_opts,
+    );
+
+    let mut block_metadata: Vec<(Vec<u8>, i64, i64, usize)> = Vec::new();
+
+    for item in iter {
+        let (key, value) = match item {
+            Ok((k, v)) => (k, v),
+            Err(_) => continue,
+        };
+
+        if key.len() < 5 || key[4] != b'B' {
+            continue;
+        }
+
+        let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
+        if key_table_hash != table_hash {
+            break;
+        }
+
+        if key.len() >= 13 {
+            let block_min_ts = i64::from_be_bytes([
+                key[5], key[6], key[7], key[8], key[9], key[10], key[11], key[12],
+            ]);
+            if block_min_ts > end_ts {
+                break;
+            }
+        }
+
+        if value.len() < 24 {
+            continue;
+        }
+
+        let block_id_len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+        if value.len() < 4 + block_id_len + 16 + 4 {
+            continue;
+        }
+
+        let block_id = &value[4..4 + block_id_len];
+        let pos = 4 + block_id_len;
+        let block_min_ts = i64::from_le_bytes([
+            value[pos],
+            value[pos + 1],
+            value[pos + 2],
+            value[pos + 3],
+            value[pos + 4],
+            value[pos + 5],
+            value[pos + 6],
+            value[pos + 7],
+        ]);
+        let block_max_ts = i64::from_le_bytes([
+            value[pos + 8],
+            value[pos + 9],
+            value[pos + 10],
+            value[pos + 11],
+            value[pos + 12],
+            value[pos + 13],
+            value[pos + 14],
+            value[pos + 15],
+        ]);
+
+        let row_count = u32::from_le_bytes([
+            value[pos + 16],
+            value[pos + 17],
+            value[pos + 18],
+            value[pos + 19],
+        ]) as usize;
+
+        if block_max_ts < start_ts || block_min_ts > end_ts {
+            continue;
+        }
+
+        block_metadata.push((block_id.to_vec(), block_min_ts, block_max_ts, row_count));
+    }
+
+    let mut tasks = Vec::with_capacity(block_metadata.len());
+    let mut current_skipped = 0;
+    let mut current_taken = 0;
+
+    for (block_id, block_min_ts, block_max_ts, row_count) in block_metadata {
+        if current_skipped + row_count <= offset {
+            current_skipped += row_count;
+            continue;
+        }
+
+        if current_taken >= limit {
+            break;
+        }
+
+        let skip_in_block = offset.saturating_sub(current_skipped);
+        let remaining_limit = limit - current_taken;
+        let available_in_block = row_count - skip_in_block;
+        let take_from_block = remaining_limit.min(available_in_block);
+
+        if take_from_block > 0 {
+            tasks.push((
+                block_id,
+                block_min_ts,
+                block_max_ts,
+                skip_in_block,
+                take_from_block,
+            ));
+            current_taken += take_from_block;
+        }
+
+        current_skipped += row_count;
+    }
+
+    use rayon::prelude::*;
+    let use_parallel = tasks.len() >= 4 && query_threads > 1;
+
+    let results_batches: Result<Vec<Option<RecordBatch>>> = if use_parallel {
+        tasks
+            .par_iter()
+            .map(
+                |(block_id, _block_min_ts, _block_max_ts, skip_in_block, take_from_block)| {
+                    let skip_in_block = *skip_in_block;
+                    let take_from_block = *take_from_block;
+
+                    let mut fetch_opts = ReadOptions::default();
+                    fetch_opts.set_verify_checksums(false);
+                    fetch_opts.fill_cache(true);
+
+                    if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
+                        if let Ok(block) = ColumnBlock::deserialize(&block_data) {
+                            // Use direct Arrow conversion
+                            return block
+                                .to_arrow(schema, skip_in_block, take_from_block)
+                                .map(Some);
+                        }
+                    }
+                    Ok(None)
+                },
+            )
+            .collect()
+    } else {
+        tasks
+            .iter()
+            .map(
+                |(block_id, _block_min_ts, _block_max_ts, skip_in_block, take_from_block)| {
+                    let skip_in_block = *skip_in_block;
+                    let take_from_block = *take_from_block;
+
+                    let mut fetch_opts = ReadOptions::default();
+                    fetch_opts.set_verify_checksums(false);
+                    fetch_opts.fill_cache(true);
+
+                    if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
+                        if let Ok(block) = ColumnBlock::deserialize(&block_data) {
+                            return block
+                                .to_arrow(schema, skip_in_block, take_from_block)
+                                .map(Some);
+                        }
+                    }
+                    Ok(None)
+                },
+            )
+            .collect()
+    };
+
+    let mut batches = Vec::with_capacity(tasks.len());
+    for batch in (results_batches?).into_iter().flatten() {
+        batches.push(batch);
+    }
+
+    Ok(batches)
+}
+#[cfg(test)]
 #[path = "query_test.rs"]
 mod query_test;

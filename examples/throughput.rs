@@ -136,6 +136,26 @@ async fn main() {
             .unwrap();
         // Count newlines to estimate rows (minus header)
         csv_result.lines().count().saturating_sub(1)
+    } else if format == "arrow" {
+        let arrow_bytes = storage
+            .query_arrow(
+                table_name,
+                None,
+                None,
+                Some(total_rows), // Limit
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Parse Arrow stream to count rows
+        let cursor = std::io::Cursor::new(&arrow_bytes);
+        let reader = arrow::ipc::reader::StreamReader::try_new(cursor, None).unwrap();
+        let mut count = 0;
+        for batch in reader {
+            count += batch.unwrap().num_rows();
+        }
+        count
     } else {
         let results = storage
             .query(

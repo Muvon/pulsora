@@ -888,6 +888,59 @@ impl StorageEngine {
         Ok(csv)
     }
 
+    /// Execute query and return results as Arrow IPC stream bytes
+    /// This avoids intermediate JSON allocation for better performance
+    pub async fn query_arrow(
+        &self,
+        table: &str,
+        start: Option<String>,
+        end: Option<String>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let schemas = self.schemas.read().await;
+        let schema = schemas
+            .get_schema(table)
+            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+
+        // Use optimized Arrow query execution
+        let batches = query::execute_query_arrow(
+            &self.db,
+            table,
+            schema,
+            start,
+            end,
+            limit,
+            offset,
+            self.query_threads,
+        )?;
+
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Serialize batches to Arrow IPC stream
+        let mut buffer = Vec::new();
+        {
+            let arrow_schema = batches[0].schema();
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &arrow_schema)
+                .map_err(|e| {
+                    PulsoraError::Internal(format!("Failed to create Arrow writer: {}", e))
+                })?;
+
+            for batch in batches {
+                writer.write(&batch).map_err(|e| {
+                    PulsoraError::Internal(format!("Failed to write Arrow batch: {}", e))
+                })?;
+            }
+            writer.finish().map_err(|e| {
+                PulsoraError::Internal(format!("Failed to finish Arrow stream: {}", e))
+            })?;
+        }
+
+        Ok(buffer)
+    }
+
     pub async fn get_table_count(&self, table: &str) -> Result<u64> {
         // Check if table exists by checking schema
         let schemas = self.schemas.read().await;
@@ -927,7 +980,6 @@ impl StorageEngine {
 
         Ok(count)
     }
-
     pub async fn get_schema(&self, table: &str) -> Result<serde_json::Value> {
         let schemas = self.schemas.read().await;
         let schema = schemas
