@@ -150,9 +150,15 @@ pub fn execute_query(
     read_opts.fill_cache(true);
     read_opts.set_readahead_size(4 * 1024 * 1024); // 4MB readahead for blocks
 
+    // Create separate options for iterator since it consumes them
+    let mut iter_read_opts = ReadOptions::default();
+    iter_read_opts.set_verify_checksums(false);
+    iter_read_opts.fill_cache(true);
+    iter_read_opts.set_readahead_size(4 * 1024 * 1024);
+
     let iter = db.iterator_opt(
         IteratorMode::From(&start_key, Direction::Forward),
-        read_opts,
+        iter_read_opts,
     );
 
     let mut results = Vec::with_capacity(limit);
@@ -238,7 +244,7 @@ pub fn execute_query(
         fetch_opts.set_verify_checksums(false);
         fetch_opts.fill_cache(true);
 
-        if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
+        if let Ok(Some(block_data)) = db.get_opt(&block_id, &fetch_opts) {
             if let Ok(block) = ColumnBlock::deserialize(&block_data) {
                 // Get block row count for bulk offset handling
                 let block_row_count = block.row_count();
@@ -259,22 +265,43 @@ pub fn execute_query(
                 let take_from_block = remaining_limit.min(available_in_block);
 
                 // Use slice-based processing for better performance
+                // Use slice-based processing for better performance
                 if let Ok(json_values) = block.to_json_slice(schema, skip_in_block, take_from_block)
                 {
-                    // Block is entirely within timestamp range - add all rows directly
-                    if block_min_ts >= start_ts && block_max_ts <= end_ts {
-                        results.extend(json_values);
-                    } else {
-                        // Need individual timestamp checking only if block spans our range
-                        if let Some(ts_field) = schema.get_timestamp_column() {
-                            for json_row in json_values {
-                                let mut include_row = true;
+                    for (i, json_row) in json_values.into_iter().enumerate() {
+                        let actual_row_idx = skip_in_block + i;
 
+                        // VALIDITY CHECK: Ensure this is the latest version of the row
+                        let mut is_latest = true;
+                        let id_opt = json_row.get(&schema.id_column).and_then(|v| v.as_u64());
+
+                        if let Some(id) = id_opt {
+                            let id_key = generate_id_key(table, id);
+                            if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts) {
+                                if let Ok((latest_block_id, latest_row_idx)) =
+                                    parse_reference_data(&ref_data)
+                                {
+                                    if latest_block_id != block_id
+                                        || latest_row_idx != actual_row_idx
+                                    {
+                                        is_latest = false;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !is_latest {
+                            continue;
+                        }
+
+                        // TIMESTAMP CHECK
+                        let mut include_row = true;
+                        if block_min_ts < start_ts || block_max_ts > end_ts {
+                            if let Some(ts_field) = schema.get_timestamp_column() {
                                 if let Some(ts_value) = json_row.get(ts_field) {
                                     let ts_millis = match ts_value {
                                         Value::Number(n) => n.as_i64(),
                                         Value::String(s) => {
-                                            // Parse ISO timestamp back to millis for comparison
                                             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
                                             {
                                                 Some(dt.timestamp_millis())
@@ -289,29 +316,42 @@ pub fn execute_query(
                                         include_row = ts >= start_ts && ts <= end_ts;
                                     }
                                 }
-
-                                if include_row {
-                                    results.push(json_row);
-                                    if results.len() >= limit {
-                                        return Ok(results);
-                                    }
-                                }
                             }
-                        } else {
-                            // No timestamp field, add all rows
-                            results.extend(json_values);
+                        }
+
+                        if include_row {
+                            results.push(json_row);
+                            if results.len() >= limit {
+                                return Ok(results);
+                            }
                         }
                     }
 
                     // Update skipped count
                     skipped_rows = offset;
                 } else {
-                    // Fallback to old method if slice method fails
                     if let Ok(json_values) = block.to_json_values(schema) {
-                        let mut block_processed = 0;
-                        for json_row in json_values {
-                            if block_processed < skip_in_block {
-                                block_processed += 1;
+                        for (i, json_row) in json_values.into_iter().enumerate() {
+                            if i < skip_in_block {
+                                continue;
+                            }
+
+                            // VALIDITY CHECK
+                            let mut is_latest = true;
+                            let id_opt = json_row.get(&schema.id_column).and_then(|v| v.as_u64());
+                            if let Some(id) = id_opt {
+                                let id_key = generate_id_key(table, id);
+                                if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts) {
+                                    if let Ok((latest_block_id, latest_row_idx)) =
+                                        parse_reference_data(&ref_data)
+                                    {
+                                        if latest_block_id != block_id || latest_row_idx != i {
+                                            is_latest = false;
+                                        }
+                                    }
+                                }
+                            }
+                            if !is_latest {
                                 continue;
                             }
 

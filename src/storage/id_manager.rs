@@ -126,7 +126,7 @@ impl IdManager {
         }
 
         // Persist state periodically (every 100 IDs to reduce I/O)
-        if sequence % 100 == 0 {
+        if sequence.is_multiple_of(100) {
             self.persist_id_state().unwrap_or_else(|e| {
                 warn!("Failed to persist ID state: {}", e);
             });

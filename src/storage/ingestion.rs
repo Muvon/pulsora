@@ -97,7 +97,7 @@ pub fn insert_rows(
     let chunk_results: Result<Vec<_>> = chunks
         .par_iter()
         .enumerate()
-        .map(|(chunk_idx, chunk)| {
+        .map(|(_chunk_idx, chunk)| {
             // Create column block for this chunk (now parallelized internally too!)
             let column_block = ColumnBlock::from_rows(chunk, schema)?;
             let serialized_block = column_block.serialize()?;
@@ -106,7 +106,7 @@ pub fn insert_rows(
 
             // Generate a unique block ID for this chunk
             let timestamp = Utc::now().timestamp_millis();
-            let block_id = format!("_block_{}_{}_{}", table, timestamp, chunk_idx);
+            let block_id = format!("_block_{}_{}", table, uuid::Uuid::new_v4());
 
             // Store the compressed block ONCE with the block ID
             batch.put(block_id.as_bytes(), &serialized_block);
