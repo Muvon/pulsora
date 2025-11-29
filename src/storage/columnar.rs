@@ -344,6 +344,91 @@ impl ColumnBlock {
         Ok(results)
     }
 
+    /// Convert a slice of rows directly to CSV string
+    /// This avoids all intermediate allocations (HashMap, Value, etc.)
+    pub fn to_csv(
+        &self,
+        schema: &Schema,
+        skip: usize,
+        take: usize,
+    ) -> Result<String> {
+        if skip >= self.row_count {
+            return Ok(String::new());
+        }
+
+        let end_idx = (skip + take).min(self.row_count);
+        let actual_take = end_idx - skip;
+
+        // Always use parallel decompression for better performance
+        let decompressed_columns = self.decompress_columns_parallel(schema)?;
+        
+        // Pre-allocate output buffer (estimate 100 bytes per row)
+        let mut output = String::with_capacity(actual_take * 100);
+        
+        // We need to iterate rows, then columns to write CSV line by line
+        // But our data is columnar.
+        // Access pattern: row 0 [col 0, col 1...], row 1 [col 0, col 1...]
+        
+        for row_idx in skip..end_idx {
+            for (col_idx, (_, values, null_bitmap)) in decompressed_columns.iter().enumerate() {
+                if col_idx > 0 {
+                    output.push(',');
+                }
+
+                // Check null
+                let is_null = if let Some(bitmap) = null_bitmap {
+                    let byte_idx = row_idx >> 3;
+                    let bit_idx = row_idx & 7;
+                    byte_idx < bitmap.len() && (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                } else {
+                    false
+                };
+
+                if !is_null {
+                    // Write value directly to string buffer
+                    match &values[row_idx] {
+                        EncodedValue::Id(v) => {
+                            use std::fmt::Write;
+                            write!(output, "{}", v).unwrap();
+                        }
+                        EncodedValue::Integer(v) => {
+                            use std::fmt::Write;
+                            write!(output, "{}", v).unwrap();
+                        }
+                        EncodedValue::Float(v) => {
+                            use std::fmt::Write;
+                            write!(output, "{}", v).unwrap();
+                        }
+                        EncodedValue::Boolean(v) => {
+                            output.push_str(if *v { "true" } else { "false" });
+                        }
+                        EncodedValue::Timestamp(v) => {
+                            if let Some(datetime) = chrono::DateTime::from_timestamp_millis(*v) {
+                                output.push_str(&datetime.to_rfc3339());
+                            } else {
+                                use std::fmt::Write;
+                                write!(output, "{}", v).unwrap();
+                            }
+                        }
+                        EncodedValue::String(v) => {
+                            // CSV escaping
+                            if v.contains(',') || v.contains('"') || v.contains('\n') {
+                                output.push('"');
+                                output.push_str(&v.replace('"', "\"\""));
+                                output.push('"');
+                            } else {
+                                output.push_str(v);
+                            }
+                        }
+                    }
+                }
+            }
+            output.push('\n');
+        }
+
+        Ok(output)
+    }
+
     /// Direct columnar to JSON conversion without intermediate HashMaps
     /// This is 5-10x faster than to_rows() + convert_row_to_json()
     pub fn to_json_values(&self, schema: &Schema) -> Result<Vec<serde_json::Value>> {

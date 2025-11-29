@@ -272,6 +272,73 @@ async fn query_data(
 ) -> std::result::Result<Response, StatusCode> {
     let start_time = Instant::now();
 
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+
+    // FAST PATH: CSV Export
+    // Use the optimized query_csv method directly to avoid intermediate allocations
+    if accept.contains("text/csv") {
+        if state.config.logging.enable_performance_logs {
+            debug!(
+                table = %table,
+                start = ?params.start,
+                end = ?params.end,
+                limit = ?params.limit,
+                offset = ?params.offset,
+                "🔍 Starting CSV query execution"
+            );
+        }
+
+        match state
+            .storage
+            .query_csv(
+                &table,
+                params.start,
+                params.end,
+                params.limit,
+                params.offset,
+            )
+            .await
+        {
+            Ok(csv_data) => {
+                let duration = start_time.elapsed();
+                // Estimate row count from newlines (approximate)
+                let row_count = csv_data.lines().count().saturating_sub(1);
+
+                if state.config.logging.enable_performance_logs {
+                    info!(
+                        table = %table,
+                        result_count = row_count,
+                        duration_ms = duration.as_millis(),
+                        throughput_rows_per_sec = if duration.as_secs_f64() > 0.0 {
+                            row_count as f64 / duration.as_secs_f64()
+                        } else {
+                            0.0
+                        },
+                        "✅ CSV Query completed successfully"
+                    );
+                }
+
+                return Ok(Response::builder()
+                    .header("Content-Type", "text/csv")
+                    .body(Body::from(csv_data))
+                    .unwrap());
+            }
+            Err(e) => {
+                let duration = start_time.elapsed();
+                error!(
+                    table = %table,
+                    error = %e,
+                    duration_ms = duration.as_millis(),
+                    "💥 CSV Query error"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
     if state.config.logging.enable_performance_logs {
         debug!(
             table = %table,
@@ -311,11 +378,6 @@ async fn query_data(
                     "✅ Query completed successfully"
                 );
             }
-
-            let accept = headers
-                .get("accept")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json");
 
             if accept.contains("application/arrow")
                 || accept.contains("application/vnd.apache.arrow.stream")

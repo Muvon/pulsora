@@ -123,23 +123,38 @@ async fn main() {
     println!("🔍 Starting Query Test (Full Scan)");
     let start_query = Instant::now();
 
-    // Query all rows
-    let results = storage
-        .query(
-            table_name,
-            None,
-            None,
-            Some(total_rows), // Limit
-            None,
-        )
-        .await
-        .unwrap();
+    let rows_retrieved = if format == "csv" {
+        let csv_result = storage
+            .query_csv(
+                table_name,
+                None,
+                None,
+                Some(total_rows), // Limit
+                None,
+            )
+            .await
+            .unwrap();
+        // Count newlines to estimate rows (minus header)
+        csv_result.lines().count().saturating_sub(1)
+    } else {
+        let results = storage
+            .query(
+                table_name,
+                None,
+                None,
+                Some(total_rows), // Limit
+                None,
+            )
+            .await
+            .unwrap();
+        results.len()
+    };
 
     let query_time = start_query.elapsed().as_secs_f64();
-    let query_rps = results.len() as f64 / query_time;
+    let query_rps = rows_retrieved as f64 / query_time;
 
     println!("✅ Query Complete");
-    println!("Rows Retrieved: {}", results.len());
+    println!("Rows Retrieved: {}", rows_retrieved);
     println!("Query Time: {:.2}s", query_time);
     println!("Query RPS: {:.2} rows/sec", query_rps);
     println!("--------------------------------");

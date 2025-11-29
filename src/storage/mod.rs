@@ -844,6 +844,50 @@ impl StorageEngine {
         Ok(results)
     }
 
+    /// Execute query and return results as CSV string
+    /// This avoids intermediate JSON allocation for better performance
+    pub async fn query_csv(
+        &self,
+        table: &str,
+        start: Option<String>,
+        end: Option<String>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<String> {
+        let schemas = self.schemas.read().await;
+        let schema = schemas
+            .get_schema(table)
+            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+
+        // Use optimized CSV query execution
+        let csv_chunks = query::execute_query_csv(
+            &self.db,
+            table,
+            schema,
+            start,
+            end,
+            limit,
+            offset,
+            self.query_threads,
+        )?;
+
+        // Estimate total size
+        let total_len: usize = csv_chunks.iter().map(|s| s.len()).sum();
+        let mut csv = String::with_capacity(total_len + 1024);
+
+        // Write header
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        csv.push_str(&columns.join(","));
+        csv.push('\n');
+
+        // Append chunks
+        for chunk in csv_chunks {
+            csv.push_str(&chunk);
+        }
+
+        Ok(csv)
+    }
+
     pub async fn get_table_count(&self, table: &str) -> Result<u64> {
         // Check if table exists by checking schema
         let schemas = self.schemas.read().await;
