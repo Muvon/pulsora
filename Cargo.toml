@@ -59,6 +59,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.18", features = ["v4"] }
 atty = "0.2"
+wide = "0.8.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

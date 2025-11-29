@@ -308,159 +308,18 @@ pub fn execute_query(
             .par_iter()
             .map(
                 |(block_id, block_min_ts, block_max_ts, skip_in_block, take_from_block)| {
-                    let skip_in_block = *skip_in_block;
-                    let take_from_block = *take_from_block;
-                    let block_min_ts = *block_min_ts;
-                    let block_max_ts = *block_max_ts;
-
-                    // Fetch and decompress the block
-                    let mut fetch_opts = ReadOptions::default();
-                    fetch_opts.set_verify_checksums(false);
-                    fetch_opts.fill_cache(true);
-
-                    let mut batch_results = Vec::with_capacity(take_from_block);
-
-                    if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
-                        if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                            // Use slice-based processing for better performance
-                            if let Ok(json_values) =
-                                block.to_json_slice(schema, skip_in_block, take_from_block)
-                            {
-                                // Create read options for validity checks
-                                let mut read_opts = ReadOptions::default();
-                                read_opts.set_verify_checksums(false);
-                                read_opts.fill_cache(true);
-
-                                // OPTIMIZATION: Use MultiGet for validity checks
-                                let mut keys = Vec::with_capacity(json_values.len());
-                                let mut key_indices = Vec::with_capacity(json_values.len());
-
-                                for (i, json_row) in json_values.iter().enumerate() {
-                                    if let Some(id) =
-                                        json_row.get(&schema.id_column).and_then(|v| v.as_u64())
-                                    {
-                                        keys.push(generate_id_key(table, id));
-                                        key_indices.push(i);
-                                    }
-                                }
-
-                                let ref_results = db.multi_get(&keys);
-                                let mut is_valid = vec![true; json_values.len()];
-
-                                for (k_idx, result) in ref_results.into_iter().enumerate() {
-                                    let json_idx = key_indices[k_idx];
-                                    let actual_row_idx = skip_in_block + json_idx;
-
-                                    if let Ok(Some(ref_data)) = result {
-                                        if let Ok((latest_block_id, latest_row_idx)) =
-                                            parse_reference_data(&ref_data)
-                                        {
-                                            if latest_block_id != *block_id
-                                                || latest_row_idx != actual_row_idx
-                                            {
-                                                is_valid[json_idx] = false;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                for (i, json_row) in json_values.into_iter().enumerate() {
-                                    if !is_valid[i] {
-                                        continue;
-                                    }
-
-                                    // TIMESTAMP CHECK
-                                    let mut include_row = true;
-                                    if block_min_ts < start_ts || block_max_ts > end_ts {
-                                        if let Some(ts_field) = schema.get_timestamp_column() {
-                                            if let Some(ts_value) = json_row.get(ts_field) {
-                                                let ts_millis = match ts_value {
-                                                    Value::Number(n) => n.as_i64(),
-                                                    Value::String(s) => {
-                                                        if let Ok(dt) =
-                                                            chrono::DateTime::parse_from_rfc3339(s)
-                                                        {
-                                                            Some(dt.timestamp_millis())
-                                                        } else {
-                                                            None
-                                                        }
-                                                    }
-                                                    _ => None,
-                                                };
-
-                                                if let Some(ts) = ts_millis {
-                                                    include_row = ts >= start_ts && ts <= end_ts;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if include_row {
-                                        batch_results.push(json_row);
-                                    }
-                                }
-                            } else if let Ok(json_values) = block.to_json_values(schema) {
-                                // Fallback for blocks that don't support slicing
-                                // Create read options for validity checks
-                                let mut read_opts = ReadOptions::default();
-                                read_opts.set_verify_checksums(false);
-                                read_opts.fill_cache(true);
-
-                                for (i, json_row) in json_values.into_iter().enumerate() {
-                                    if i < skip_in_block {
-                                        continue;
-                                    }
-                                    if batch_results.len() >= take_from_block {
-                                        break;
-                                    }
-
-                                    let actual_row_idx = i;
-
-                                    // VALIDITY CHECK
-                                    // VALIDITY CHECK
-                                    let mut is_latest = true;
-                                    let id_opt =
-                                        json_row.get(&schema.id_column).and_then(|v| v.as_u64());
-                                    if let Some(id) = id_opt {
-                                        let id_key = generate_id_key(table, id);
-                                        if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts)
-                                        {
-                                            if let Ok((latest_block_id, latest_row_idx)) =
-                                                parse_reference_data(&ref_data)
-                                            {
-                                                if latest_block_id != *block_id
-                                                    || latest_row_idx != actual_row_idx
-                                                {
-                                                    is_latest = false;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !is_latest {
-                                        continue;
-                                    }
-
-                                    // Check timestamp bounds
-                                    if block_min_ts < start_ts || block_max_ts > end_ts {
-                                        if let Some(ts_field) = schema.get_timestamp_column() {
-                                            if let Some(Value::Number(ts_val)) =
-                                                json_row.get(ts_field)
-                                            {
-                                                if let Some(ts) = ts_val.as_i64() {
-                                                    if ts < start_ts || ts > end_ts {
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    batch_results.push(json_row);
-                                }
-                            }
-                        }
-                    }
-                    Ok(batch_results)
+                    process_block_filtered(
+                        db,
+                        table,
+                        schema,
+                        block_id,
+                        *block_min_ts,
+                        *block_max_ts,
+                        *skip_in_block,
+                        *take_from_block,
+                        start_ts,
+                        end_ts,
+                    )
                 },
             )
             .collect()
@@ -469,139 +328,19 @@ pub fn execute_query(
         tasks
             .iter()
             .map(
-                |(block_id, _block_min_ts, _block_max_ts, skip_in_block, take_from_block)| {
-                    let skip_in_block = *skip_in_block;
-                    let take_from_block = *take_from_block;
-
-                    // Fetch and decompress the block
-                    let mut fetch_opts = ReadOptions::default();
-                    fetch_opts.set_verify_checksums(false);
-                    fetch_opts.fill_cache(true);
-
-                    let mut batch_results = Vec::with_capacity(take_from_block);
-
-                    if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
-                        if let Ok(block) = ColumnBlock::deserialize(&block_data) {
-                            // Use slice-based processing for better performance
-                            if let Ok(json_values) =
-                                block.to_json_slice(schema, skip_in_block, take_from_block)
-                            {
-                                // Create read options for validity checks
-                                let mut read_opts = ReadOptions::default();
-                                read_opts.set_verify_checksums(false);
-                                read_opts.fill_cache(true);
-
-                                // OPTIMIZATION: Use MultiGet for validity checks
-                                let mut keys = Vec::with_capacity(json_values.len());
-                                let mut key_indices = Vec::with_capacity(json_values.len());
-
-                                for (i, json_row) in json_values.iter().enumerate() {
-                                    if let Some(id) =
-                                        json_row.get(&schema.id_column).and_then(|v| v.as_u64())
-                                    {
-                                        keys.push(generate_id_key(table, id));
-                                        key_indices.push(i);
-                                    }
-                                }
-
-                                let ref_results = db.multi_get(&keys);
-                                let mut is_valid = vec![true; json_values.len()];
-
-                                for (k_idx, result) in ref_results.into_iter().enumerate() {
-                                    let json_idx = key_indices[k_idx];
-                                    let actual_row_idx = skip_in_block + json_idx;
-
-                                    if let Ok(Some(ref_data)) = result {
-                                        if let Ok((latest_block_id, latest_row_idx)) =
-                                            parse_reference_data(&ref_data)
-                                        {
-                                            if latest_block_id != *block_id
-                                                || latest_row_idx != actual_row_idx
-                                            {
-                                                is_valid[json_idx] = false;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                for (i, json_row) in json_values.into_iter().enumerate() {
-                                    if !is_valid[i] {
-                                        continue;
-                                    }
-
-                                    let mut include_row = true;
-
-                                    // Apply timestamp filtering if needed
-                                    if start_ts > 0 || end_ts < i64::MAX {
-                                        if let Some(ts_col) = schema.get_timestamp_column() {
-                                            if let Some(ts_value) = json_row.get(ts_col) {
-                                                let ts_millis = match ts_value {
-                                                    Value::Number(n) => n.as_i64(),
-                                                    Value::String(s) => {
-                                                        parse_query_timestamp(s).ok()
-                                                    }
-                                                    _ => None,
-                                                };
-
-                                                if let Some(ts) = ts_millis {
-                                                    include_row = ts >= start_ts && ts <= end_ts;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if include_row {
-                                        batch_results.push(json_row);
-                                    }
-                                }
-                            } else if let Ok(json_values) = block.to_json_values(schema) {
-                                // Fallback for blocks that don't support slicing
-                                // Create read options for validity checks
-                                let mut read_opts = ReadOptions::default();
-                                read_opts.set_verify_checksums(false);
-                                read_opts.fill_cache(true);
-
-                                for (i, json_row) in json_values.into_iter().enumerate() {
-                                    if i < skip_in_block {
-                                        continue;
-                                    }
-                                    if batch_results.len() >= take_from_block {
-                                        break;
-                                    }
-
-                                    let actual_row_idx = i;
-
-                                    // VALIDITY CHECK
-                                    // VALIDITY CHECK
-                                    let mut is_latest = true;
-                                    let id_opt =
-                                        json_row.get(&schema.id_column).and_then(|v| v.as_u64());
-                                    if let Some(id) = id_opt {
-                                        let id_key = generate_id_key(table, id);
-                                        if let Ok(Some(ref_data)) = db.get_opt(&id_key, &read_opts)
-                                        {
-                                            if let Ok((latest_block_id, latest_row_idx)) =
-                                                parse_reference_data(&ref_data)
-                                            {
-                                                if latest_block_id != *block_id
-                                                    || latest_row_idx != actual_row_idx
-                                                {
-                                                    is_latest = false;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if !is_latest {
-                                        continue;
-                                    }
-
-                                    batch_results.push(json_row);
-                                }
-                            }
-                        }
-                    }
-                    Ok(batch_results)
+                |(block_id, block_min_ts, block_max_ts, skip_in_block, take_from_block)| {
+                    process_block_filtered(
+                        db,
+                        table,
+                        schema,
+                        block_id,
+                        *block_min_ts,
+                        *block_max_ts,
+                        *skip_in_block,
+                        *take_from_block,
+                        start_ts,
+                        end_ts,
+                    )
                 },
             )
             .collect()
@@ -711,6 +450,142 @@ pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Re
     Ok(Value::Object(json_obj))
 }
 
+/// Process a single block with optimized filtering and JSON conversion
+/// Generate primary key from hash for ID-based lookup: [table_hash:u32][id:u64]
+/// Returns stack-allocated array to avoid heap allocation
+fn generate_id_key_from_hash(table_hash: u32, id: u64) -> [u8; 12] {
+    let mut key = [0u8; 12];
+    key[0..4].copy_from_slice(&table_hash.to_be_bytes());
+    key[4..12].copy_from_slice(&id.to_be_bytes());
+    key
+}
+
+/// Process a single block with optimized filtering and JSON conversion
+fn process_block_filtered(
+    db: &DB,
+    table: &str,
+    schema: &Schema,
+    block_id: &[u8],
+    block_min_ts: i64,
+    block_max_ts: i64,
+    skip_in_block: usize,
+    take_from_block: usize,
+    start_ts: i64,
+    end_ts: i64,
+) -> Result<Vec<Value>> {
+    let mut fetch_opts = ReadOptions::default();
+    fetch_opts.set_verify_checksums(false);
+    fetch_opts.fill_cache(true);
+
+    if let Ok(Some(block_data)) = db.get_opt(block_id, &fetch_opts) {
+        if let Ok(block) = ColumnBlock::deserialize(&block_data) {
+            // OPTIMIZATION: Calculate hash once
+            let table_hash = calculate_table_hash(table);
+
+            // Check if we need filtering
+            if block_min_ts < start_ts || block_max_ts > end_ts {
+                // Filtered path
+                let indices = block.filter_by_timestamp(schema, start_ts, end_ts)?;
+                let relevant_indices: Vec<usize> = indices
+                    .into_iter()
+                    .filter(|&idx| idx >= skip_in_block && idx < skip_in_block + take_from_block)
+                    .collect();
+
+                if relevant_indices.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let json_values = block.to_json_filtered(schema, &relevant_indices)?;
+
+                // Validity Check
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_verify_checksums(false);
+                read_opts.fill_cache(true);
+
+                let mut keys = Vec::with_capacity(json_values.len());
+                let mut key_indices = Vec::with_capacity(json_values.len());
+
+                for (i, json_row) in json_values.iter().enumerate() {
+                    if let Some(id) = json_row.get(&schema.id_column).and_then(|v| v.as_u64()) {
+                        keys.push(generate_id_key_from_hash(table_hash, id));
+                        key_indices.push(i);
+                    }
+                }
+
+                let ref_results = db.multi_get(&keys);
+                let mut is_valid = vec![true; json_values.len()];
+
+                for (k_idx, result) in ref_results.into_iter().enumerate() {
+                    let json_idx = key_indices[k_idx];
+                    let actual_row_idx = relevant_indices[json_idx];
+
+                    if let Ok(Some(ref_data)) = result {
+                        if let Ok((latest_block_id, latest_row_idx)) =
+                            parse_reference_data(&ref_data)
+                        {
+                            if latest_block_id != block_id || latest_row_idx != actual_row_idx {
+                                is_valid[json_idx] = false;
+                            }
+                        }
+                    }
+                }
+
+                let mut batch_results = Vec::with_capacity(json_values.len());
+                for (i, json_row) in json_values.into_iter().enumerate() {
+                    if is_valid[i] {
+                        batch_results.push(json_row);
+                    }
+                }
+                return Ok(batch_results);
+            } else {
+                // Full slice path (faster for full scans)
+                let json_values = block.to_json_slice(schema, skip_in_block, take_from_block)?;
+
+                // Validity Check
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_verify_checksums(false);
+                read_opts.fill_cache(true);
+
+                let mut keys = Vec::with_capacity(json_values.len());
+                let mut key_indices = Vec::with_capacity(json_values.len());
+
+                for (i, json_row) in json_values.iter().enumerate() {
+                    if let Some(id) = json_row.get(&schema.id_column).and_then(|v| v.as_u64()) {
+                        keys.push(generate_id_key_from_hash(table_hash, id));
+                        key_indices.push(i);
+                    }
+                }
+
+                let ref_results = db.multi_get(&keys);
+                let mut is_valid = vec![true; json_values.len()];
+
+                for (k_idx, result) in ref_results.into_iter().enumerate() {
+                    let json_idx = key_indices[k_idx];
+                    let actual_row_idx = skip_in_block + json_idx;
+
+                    if let Ok(Some(ref_data)) = result {
+                        if let Ok((latest_block_id, latest_row_idx)) =
+                            parse_reference_data(&ref_data)
+                        {
+                            if latest_block_id != block_id || latest_row_idx != actual_row_idx {
+                                is_valid[json_idx] = false;
+                            }
+                        }
+                    }
+                }
+
+                let mut batch_results = Vec::with_capacity(json_values.len());
+                for (i, json_row) in json_values.into_iter().enumerate() {
+                    if is_valid[i] {
+                        batch_results.push(json_row);
+                    }
+                }
+                return Ok(batch_results);
+            }
+        }
+    }
+    Ok(Vec::new())
+}
 #[cfg(test)]
 #[path = "query_test.rs"]
 mod query_test;

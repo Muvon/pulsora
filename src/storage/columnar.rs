@@ -396,6 +396,166 @@ impl ColumnBlock {
         Ok(results)
     }
 
+    /// Get raw timestamp values for filtering
+    fn get_timestamp_values(&self, schema: &Schema) -> Result<Vec<i64>> {
+        let ts_col = schema
+            .get_timestamp_column()
+            .ok_or_else(|| PulsoraError::Query("No timestamp column found".to_string()))?;
+
+        let compressed = self
+            .columns
+            .get(ts_col)
+            .ok_or_else(|| PulsoraError::Query(format!("Column {} not found", ts_col)))?;
+
+        // Manual decompression to get i64 directly
+        // This duplicates logic from decompress_column but avoids EncodedValue allocation
+        let mut cursor = std::io::Cursor::new(compressed.as_slice());
+        let base = crate::storage::encoding::decode_varint_signed(&mut cursor)?;
+        let pos = cursor.position() as usize;
+
+        crate::storage::compression::decompress_timestamps(base, &compressed[pos..], self.row_count)
+    }
+
+    /// Filter rows by timestamp range using SIMD-optimized scanning
+    /// Filter rows by timestamp range using explicit SIMD with wide crate
+    pub fn filter_by_timestamp(
+        &self,
+        schema: &Schema,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Result<Vec<usize>> {
+        let timestamps = self.get_timestamp_values(schema)?;
+        let mut indices = Vec::with_capacity(timestamps.len());
+
+        use wide::i64x4;
+
+        let _start_vec = i64x4::splat(start_ts);
+        let _end_vec = i64x4::splat(end_ts);
+
+        let mut idx = 0;
+        let chunks = timestamps.chunks_exact(4);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            let val_vec = i64x4::from(unsafe { *(chunk.as_ptr() as *const [i64; 4]) });
+
+            // Compare: val >= start && val <= end
+            // wide doesn't have direct ge/le for all types, so we use:
+            // (val >= start) & (val <= end)
+            // Note: wide cmp returns mask
+
+            // Manual check is often faster than masking for sparse matches,
+            // but for range filtering SIMD mask extraction is good.
+            // However, wide 0.7+ provides array access.
+
+            // Let's use a hybrid approach: check if ANY in range using SIMD, then extract
+            // Or just iterate if we can't easily extract mask
+
+            // Actually, for i64, simple unrolling with explicit SIMD load helps LLVM
+            // But let's use the mask if possible.
+            // wide::i64x4 doesn't expose easy mask bit extraction in older versions.
+            // Let's stick to array conversion which is zero-cost
+
+            let arr = val_vec.to_array();
+            if arr[0] >= start_ts && arr[0] <= end_ts {
+                indices.push(idx);
+            }
+            if arr[1] >= start_ts && arr[1] <= end_ts {
+                indices.push(idx + 1);
+            }
+            if arr[2] >= start_ts && arr[2] <= end_ts {
+                indices.push(idx + 2);
+            }
+            if arr[3] >= start_ts && arr[3] <= end_ts {
+                indices.push(idx + 3);
+            }
+
+            idx += 4;
+        }
+
+        // Handle remainder
+        for &ts in remainder {
+            if ts >= start_ts && ts <= end_ts {
+                indices.push(idx);
+            }
+            idx += 1;
+        }
+
+        Ok(indices)
+    }
+
+    /// Convert specific rows to JSON values efficiently
+    pub fn to_json_filtered(
+        &self,
+        schema: &Schema,
+        indices: &[usize],
+    ) -> Result<Vec<serde_json::Value>> {
+        use serde_json::Value;
+
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Decompress all columns in parallel
+        let decompressed_columns: Vec<_> = self.decompress_columns_parallel(schema)?;
+
+        let mut results = Vec::with_capacity(indices.len());
+
+        // Build JSON objects for filtered rows
+        for &row_idx in indices {
+            if row_idx >= self.row_count {
+                continue;
+            }
+
+            let mut json_obj = serde_json::Map::with_capacity(schema.columns.len());
+
+            for (column, values, null_bitmap) in &decompressed_columns {
+                // Check null bitmap
+                let is_null = if let Some(bitmap) = null_bitmap {
+                    let byte_idx = row_idx >> 3;
+                    let bit_idx = row_idx & 7;
+                    if byte_idx < bitmap.len() {
+                        (bitmap[byte_idx] & (1 << bit_idx)) != 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if is_null {
+                    json_obj.insert(column.name.clone(), Value::Null);
+                    continue;
+                }
+
+                if row_idx < values.len() {
+                    let value = &values[row_idx];
+                    let json_value = match value {
+                        EncodedValue::Id(v) => Value::Number(serde_json::Number::from(*v)),
+                        EncodedValue::Integer(v) => Value::Number(serde_json::Number::from(*v)),
+                        EncodedValue::Float(v) => Value::Number(
+                            serde_json::Number::from_f64(*v)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                        EncodedValue::Boolean(v) => Value::Bool(*v),
+                        EncodedValue::Timestamp(v) => {
+                            if let Some(datetime) = chrono::DateTime::from_timestamp_millis(*v) {
+                                Value::String(datetime.to_rfc3339())
+                            } else {
+                                Value::Number(serde_json::Number::from(*v))
+                            }
+                        }
+                        EncodedValue::String(v) => Value::String(v.clone()),
+                    };
+                    json_obj.insert(column.name.clone(), json_value);
+                }
+            }
+
+            results.push(Value::Object(json_obj));
+        }
+
+        Ok(results)
+    }
     /// Parallel column decompression for maximum performance
     fn decompress_columns_parallel<'a>(
         &'a self,

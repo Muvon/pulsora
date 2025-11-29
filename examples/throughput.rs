@@ -143,6 +143,33 @@ async fn main() {
     println!("Query Time: {:.2}s", query_time);
     println!("Query RPS: {:.2} rows/sec", query_rps);
     println!("--------------------------------");
+    // --- FILTERED QUERY ---
+    println!("🔍 Starting Filtered Query Test (Last 10%)");
+    let start_filtered = Instant::now();
+
+    // Query last 10% of rows
+    // Data starts at 2024-01-01 00:00:00
+    // Total 1M seconds = ~11.5 days
+    // Let's query the last day
+    let results_filtered = storage
+        .query(
+            table_name,
+            Some("2024-01-10 00:00:00".to_string()),
+            None,
+            Some(total_rows),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let filtered_time = start_filtered.elapsed().as_secs_f64();
+    let filtered_rps = results_filtered.len() as f64 / filtered_time;
+
+    println!("✅ Filtered Query Complete");
+    println!("Rows Retrieved: {}", results_filtered.len());
+    println!("Query Time: {:.2}s", filtered_time);
+    println!("Query RPS: {:.2} rows/sec", filtered_rps);
+    println!("--------------------------------");
 }
 
 fn generate_csv_batch(rows: usize, offset: usize) -> String {
@@ -152,12 +179,14 @@ fn generate_csv_batch(rows: usize, offset: usize) -> String {
     for i in 0..rows {
         let id = offset + i;
         let total_seconds = id;
-        let hours = (10 + (total_seconds / 3600)) % 24;
+        let day = 1 + (total_seconds / 86400);
+        let hours = (total_seconds / 3600) % 24;
         let minutes = (total_seconds % 3600) / 60;
         let seconds = total_seconds % 60;
 
         csv.push_str(&format!(
-            "2024-01-01 {:02}:{:02}:{:02},AAPL,{:.2},{}\n",
+            "2024-01-{:02} {:02}:{:02}:{:02},AAPL,{:.2},{}\n",
+            day,
             hours,
             minutes,
             seconds,
