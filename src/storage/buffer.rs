@@ -21,13 +21,6 @@ impl TableBuffer {
         }
     }
 
-    pub fn push(&mut self, id: u64, row: HashMap<String, String>) -> crate::error::Result<()> {
-        if let Some(wal) = &self.wal {
-            wal.append(id, &row)?;
-        }
-        self.rows.insert(id, row);
-        Ok(())
-    }
     pub fn push_batch(
         &mut self,
         rows: Vec<(u64, HashMap<String, String>)>,

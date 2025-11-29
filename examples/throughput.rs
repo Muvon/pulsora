@@ -5,6 +5,15 @@ use tempfile::TempDir;
 
 #[tokio::main]
 async fn main() {
+    // Parse args
+    let args: Vec<String> = std::env::args().collect();
+    let mut threads = 0;
+    for i in 0..args.len() {
+        if args[i] == "--threads" && i + 1 < args.len() {
+            threads = args[i + 1].parse().unwrap_or(0);
+        }
+    }
+
     // Setup
     let temp_dir = TempDir::new().unwrap();
     let mut config = Config::default();
@@ -12,16 +21,33 @@ async fn main() {
     // Increase buffer size to avoid too many flushes during test
     config.storage.buffer_size = 100_000;
     config.storage.flush_interval_ms = 0; // Disable time-based flush for consistent block sizes
+    config.ingestion.ingestion_threads = threads;
 
+    #[cfg(debug_assertions)]
+    {
+        println!("⚠️  WARNING: Running in DEBUG mode. Performance will be 10-100x slower.");
+        println!(
+            "⚠️  Use '--release' flag: cargo run --example throughput --release -- --threads 8"
+        );
+        println!("--------------------------------");
+    }
     let storage = StorageEngine::new(&config).await.unwrap();
 
-    let total_rows = 500_000;
-    let batch_size = 10_000;
+    let total_rows = 1_000_000;
+    let batch_size = 50_000;
     let table_name = "throughput_test";
 
     println!("🚀 Starting Throughput Test");
     println!("Rows: {}", total_rows);
     println!("Batch Size: {}", batch_size);
+    println!(
+        "Threads: {}",
+        if threads == 0 {
+            "Auto".to_string()
+        } else {
+            threads.to_string()
+        }
+    );
     println!("--------------------------------");
 
     // --- INGESTION ---

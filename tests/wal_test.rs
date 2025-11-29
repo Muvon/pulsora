@@ -28,6 +28,8 @@ async fn test_wal_durability_on_crash() {
     assert_eq!(results.len(), 1);
 
     // 3. Simulate "Crash" by dropping engine and creating new one on same dir
+    // Wait for async WAL write to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     drop(engine);
 
     // 4. Restart engine

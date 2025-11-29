@@ -40,6 +40,8 @@ fn default_wal_enabled() -> bool {
 pub struct IngestionConfig {
     pub max_csv_size_mb: usize,
     pub batch_size: usize,
+    #[serde(default)]
+    pub ingestion_threads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +78,7 @@ impl Default for Config {
             ingestion: IngestionConfig {
                 max_csv_size_mb: 512,
                 batch_size: 10000,
+                ingestion_threads: 0, // 0 means auto-detect
             },
             performance: PerformanceConfig {
                 compression: "lz4".to_string(),

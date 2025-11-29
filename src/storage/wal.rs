@@ -1,13 +1,20 @@
 use crate::error::{PulsoraError, Result};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+
+#[derive(Debug)]
+enum WalOp {
+    Write(Vec<u8>),
+    Truncate,
+}
 
 #[derive(Debug)]
 pub struct WriteAheadLog {
-    file: Arc<Mutex<File>>,
+    sender: mpsc::UnboundedSender<WalOp>,
     path: PathBuf,
 }
 
@@ -18,33 +25,49 @@ impl WriteAheadLog {
 
         let table_hash = crate::storage::calculate_table_hash(table);
         let path = wal_dir.join(format!("{}.wal", table_hash));
+        let path_clone = path.clone();
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
 
-        Ok(Self {
-            file: Arc::new(Mutex::new(file)),
-            path,
-        })
+        // Spawn background writer
+        tokio::spawn(async move {
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path_clone)
+                .await
+                .expect("Failed to open WAL file");
+
+            while let Some(op) = receiver.recv().await {
+                match op {
+                    WalOp::Write(data) => {
+                        if let Err(e) = file.write_all(&data).await {
+                            tracing::error!("Failed to write to WAL: {}", e);
+                        }
+                        // We sync periodically or rely on OS?
+                        // For max throughput, we rely on OS page cache + periodic sync or just write.
+                        // If we want strict durability, we should sync.
+                        // But "Async WAL" usually implies eventual durability or group commit.
+                        // Let's sync every write for now but since it's async it won't block ingestion.
+                        if let Err(e) = file.sync_data().await {
+                            tracing::error!("Failed to sync WAL: {}", e);
+                        }
+                    }
+                    WalOp::Truncate => {
+                        if let Err(e) = file.set_len(0).await {
+                            tracing::error!("Failed to truncate WAL: {}", e);
+                        }
+                        if let Err(e) = file.sync_all().await {
+                            tracing::error!("Failed to sync WAL after truncate: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self { sender, path })
     }
 
-    pub fn append(&self, id: u64, row: &HashMap<String, String>) -> Result<()> {
-        let json = serde_json::to_vec(&(id, row)).map_err(|e| {
-            PulsoraError::Ingestion(format!("Failed to serialize WAL entry: {}", e))
-        })?;
-
-        let len = json.len() as u32;
-        let mut file = self.file.lock().unwrap();
-
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(&json)?;
-        file.flush()?; // Ensure durability
-
-        Ok(())
-    }
     pub fn append_batch(&self, rows: &[(u64, HashMap<String, String>)]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -60,16 +83,16 @@ impl WriteAheadLog {
             buffer.extend_from_slice(&json);
         }
 
-        let mut file = self.file.lock().unwrap();
-        file.write_all(&buffer)?;
-        file.flush()?; // Ensure durability
+        self.sender
+            .send(WalOp::Write(buffer))
+            .map_err(|_| PulsoraError::Ingestion("Failed to send to WAL writer".to_string()))?;
 
         Ok(())
     }
 
     pub fn replay(&self) -> Result<Vec<(u64, HashMap<String, String>)>> {
-        let _file = self.file.lock().unwrap();
         // Re-open file for reading from start
+        // Note: This might race if background writer is writing, but replay is usually done at startup.
         let mut reader = BufReader::new(File::open(&self.path)?);
         let mut rows = Vec::new();
         let mut len_buf = [0u8; 4];
@@ -101,9 +124,9 @@ impl WriteAheadLog {
     }
 
     pub fn truncate(&self) -> Result<()> {
-        let file = self.file.lock().unwrap();
-        file.set_len(0)?;
-        file.sync_all()?;
+        self.sender
+            .send(WalOp::Truncate)
+            .map_err(|_| PulsoraError::Ingestion("Failed to send to WAL writer".to_string()))?;
         Ok(())
     }
 }

@@ -12,8 +12,9 @@ use tracing::debug;
 use crate::error::{PulsoraError, Result};
 use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
-use crate::storage::id_manager::{IdManagerRegistry, RowId};
+use crate::storage::id_manager::{IdManager, IdManagerRegistry, RowId};
 use crate::storage::schema::Schema;
+use rayon::prelude::*;
 
 pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
@@ -39,6 +40,168 @@ pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
     Ok(rows)
 }
 
+pub fn process_csv_parallel(
+    csv_data: &str,
+    schema: &Schema,
+    id_manager: &Arc<IdManager>,
+    threads: usize,
+) -> Result<Vec<(u64, HashMap<String, String>)>> {
+    // 1. Extract header
+    let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
+    let headers = reader.headers()?.clone();
+    let header_count = headers.len();
+
+    // Find where the data starts (after the first newline)
+    let data_start = match csv_data.find('\n') {
+        Some(i) => i + 1,
+        None => return Ok(Vec::new()),
+    };
+
+    if data_start >= csv_data.len() {
+        return Ok(Vec::new());
+    }
+
+    let data_str = &csv_data[data_start..];
+    let data_len = data_str.len();
+
+    // 2. Determine chunk size
+    let num_threads = if threads == 0 {
+        rayon::current_num_threads()
+    } else {
+        threads
+    };
+
+    // If data is small, don't bother splitting
+    if data_len < 1024 * 1024 || num_threads <= 1 {
+        return process_csv_single_thread(csv_data, schema, id_manager);
+    }
+
+    let target_chunk_size = data_len / num_threads;
+    let mut chunks = Vec::with_capacity(num_threads);
+    let mut start = 0;
+
+    // 3. Split into chunks respecting quotes
+    while start < data_len {
+        let mut end = std::cmp::min(start + target_chunk_size, data_len);
+        let mut in_quote = false;
+
+        // Scan from start to find the split point
+        let mut current = start;
+        let bytes = data_str.as_bytes();
+
+        while current < data_len {
+            let b = bytes[current];
+            if b == b'"' {
+                in_quote = !in_quote;
+            } else if b == b'\n' && !in_quote && current >= end {
+                end = current;
+                break;
+            }
+            current += 1;
+        }
+
+        if current >= data_len {
+            end = data_len;
+        }
+
+        if start < end {
+            chunks.push(&data_str[start..end]);
+        }
+        start = end + 1; // Skip the newline
+    }
+
+    // 4. Process chunks in parallel
+    let results: Result<Vec<Vec<_>>> = chunks
+        .par_iter()
+        .map(|chunk_str| {
+            let mut chunk_rows = Vec::with_capacity(chunk_str.len() / 100); // Estimate row count
+            let mut reader = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(chunk_str.as_bytes());
+
+            for result in reader.records() {
+                let record = result?;
+                let mut row = HashMap::with_capacity(header_count);
+
+                for (i, field) in record.iter().enumerate() {
+                    if let Some(header) = headers.get(i) {
+                        row.insert(header.to_string(), field.to_string());
+                    }
+                }
+
+                if !row.is_empty() {
+                    // ID Assignment
+                    let row_id = if let Some(id_str) = row.get(&schema.id_column) {
+                        if id_str.trim().is_empty() {
+                            RowId::Auto
+                        } else {
+                            let parsed_id = RowId::from_string(id_str)?;
+                            if let RowId::User(id) = parsed_id {
+                                id_manager.register_user_id(id)?;
+                            }
+                            parsed_id
+                        }
+                    } else {
+                        RowId::Auto
+                    };
+
+                    let actual_id = row_id.resolve(id_manager);
+                    row.insert(schema.id_column.clone(), actual_id.to_string());
+
+                    // Validation
+                    schema.validate_row(&row)?;
+
+                    chunk_rows.push((actual_id, row));
+                }
+            }
+            Ok(chunk_rows)
+        })
+        .collect();
+
+    // 5. Flatten results
+    let mut final_rows = Vec::with_capacity(
+        results
+            .as_ref()
+            .map(|v| v.iter().map(|c| c.len()).sum())
+            .unwrap_or(0),
+    );
+    for chunk_res in results? {
+        final_rows.extend(chunk_res);
+    }
+
+    Ok(final_rows)
+}
+
+fn process_csv_single_thread(
+    csv_data: &str,
+    schema: &Schema,
+    id_manager: &Arc<IdManager>,
+) -> Result<Vec<(u64, HashMap<String, String>)>> {
+    let rows = parse_csv(csv_data)?;
+    let mut processed_rows = Vec::with_capacity(rows.len());
+
+    for mut row in rows {
+        let row_id = if let Some(id_str) = row.get(&schema.id_column) {
+            if id_str.trim().is_empty() {
+                RowId::Auto
+            } else {
+                let parsed_id = RowId::from_string(id_str)?;
+                if let RowId::User(id) = parsed_id {
+                    id_manager.register_user_id(id)?;
+                }
+                parsed_id
+            }
+        } else {
+            RowId::Auto
+        };
+
+        let actual_id = row_id.resolve(id_manager);
+        row.insert(schema.id_column.clone(), actual_id.to_string());
+        schema.validate_row(&row)?;
+        processed_rows.push((actual_id, row));
+    }
+    Ok(processed_rows)
+}
 pub fn write_batch_to_rocksdb(
     db: &Arc<DB>,
     table: &str,

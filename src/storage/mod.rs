@@ -249,66 +249,46 @@ impl StorageEngine {
     pub async fn ingest_csv(&self, table: &str, csv_data: String) -> Result<IngestionStats> {
         let start_time = std::time::Instant::now();
 
-        // Parse CSV and infer/validate schema
-        let rows = ingestion::parse_csv(&csv_data)?;
-        if rows.is_empty() {
-            return Err(PulsoraError::Ingestion("No data rows found".to_string()));
-        }
-
-        // Get or create schema (pass ALL rows for better type inference)
-        let schema = {
-            let mut schemas = self.schemas.write().await;
-            schemas.get_or_create_schema(table, &rows)?
+        // Try to get existing schema first to enable parallel processing
+        let existing_schema = {
+            let schemas = self.schemas.read().await;
+            schemas.get_schema(table).cloned()
         };
 
-        // OPTIMIZATION: Prepare rows BEFORE acquiring global locks
-        // We need to resolve IDs, which requires the IdManager.
-        // To avoid holding the global lock, we'll get the IdManager for this table first.
+        let (processed_rows, schema) = if let Some(schema) = existing_schema {
+            // Parallel path for existing tables
+            let id_manager = {
+                let mut id_managers = self.id_managers.write().await;
+                id_managers.get_or_create(table)?.clone()
+            };
 
-        // 1. Get ID Manager for this table (scoped lock)
-        let _id_manager = {
-            let mut id_managers = self.id_managers.write().await;
-            // We clone the IdManager to use it outside the lock?
-            // No, IdManager is not easily cloneable/shareable without Arc<Mutex>.
-            // For now, we'll keep the lock but process efficiently.
-            // Ideally, IdManagerRegistry should return an Arc<Mutex<IdManager>>.
-            // But since we don't have that refactoring yet, we will do the ID resolution
-            // inside the lock, BUT we will batch the buffer write.
+            let rows = ingestion::process_csv_parallel(
+                &csv_data,
+                &schema,
+                &id_manager,
+                self.config.ingestion.ingestion_threads,
+            )?;
 
-            // Actually, we can't easily parallelize ID generation if it depends on a shared counter
-            // without a mutex.
+            (rows, schema)
+        } else {
+            // Serial path for new tables (need to infer schema)
+            let rows = ingestion::parse_csv(&csv_data)?;
+            if rows.is_empty() {
+                return Err(PulsoraError::Ingestion("No data rows found".to_string()));
+            }
 
-            // Let's stick to sequential ID generation for now but BATCH the buffer write.
-            // This removes the WAL I/O from the critical section of the loop.
-            id_managers.get_or_create(table)?.clone()
-        };
+            // Get or create schema (pass ALL rows for better type inference)
+            let schema = {
+                let mut schemas = self.schemas.write().await;
+                schemas.get_or_create_schema(table, &rows)?
+            };
 
-        // 2. Process rows (Validate & Assign IDs)
-        // We can parallelize validation, but ID assignment must be sequential or atomic.
-        // Since we cloned IdManager (it's cheap?), wait, IdManager struct might not be cheap to clone.
-        // Let's check IdManager. It has a HashMap. Cloning it is expensive.
-        // We should probably NOT clone it.
+            let id_manager = {
+                let mut id_managers = self.id_managers.write().await;
+                id_managers.get_or_create(table)?.clone()
+            };
 
-        // REVISED STRATEGY:
-        // 1. Acquire IdManager lock.
-        // 2. Assign IDs to all rows.
-        // 3. Release IdManager lock.
-        // 4. Validate rows (Parallel).
-        // 5. Acquire Buffer lock.
-        // 6. Push batch.
-
-        // However, IdManager is inside IdManagerRegistry which is behind RwLock.
-        // We need to change how we access it.
-
-        // For this iteration, let's keep it simple but use `push_batch`.
-        // We will collect all processed rows into a Vec, then lock buffer ONCE.
-
-        let mut processed_rows = Vec::with_capacity(rows.len());
-
-        {
-            let mut id_managers = self.id_managers.write().await;
-            let id_manager = id_managers.get_or_create(table)?;
-
+            let mut processed = Vec::with_capacity(rows.len());
             for mut row in rows {
                 // Handle ID assignment
                 let row_id = if let Some(id_str) = row.get(&schema.id_column) {
@@ -327,17 +307,16 @@ impl StorageEngine {
 
                 let actual_id = row_id.resolve(&id_manager);
                 row.insert(schema.id_column.clone(), actual_id.to_string());
-
-                // Validation can be done here or later. Doing it here is cache-friendly.
                 schema.validate_row(&row)?;
-
-                processed_rows.push((actual_id, row));
+                processed.push((actual_id, row));
             }
-        } // Release id_managers lock
 
-        // 3. Push to buffer (Batch)
+            (processed, schema)
+        };
+
         let rows_inserted = processed_rows.len() as u64;
 
+        // Push to buffer (Batch)
         {
             let mut buffers = self.buffers.write().await;
 

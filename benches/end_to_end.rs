@@ -84,7 +84,7 @@ fn bench_http_ingestion(c: &mut Criterion) {
                         let table_name = "benchmark_table";
                         black_box(
                             storage
-                                .ingest_csv(&table_name, black_box(csv.clone()))
+                                .ingest_csv(table_name, black_box(csv.clone()))
                                 .await
                                 .unwrap(),
                         )

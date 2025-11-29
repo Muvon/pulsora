@@ -126,11 +126,6 @@ impl ColumnBlock {
         Ok(rows)
     }
 
-    /// Get the number of rows in this block
-    pub fn row_count(&self) -> usize {
-        self.row_count
-    }
-
     /// Convert a slice of rows to JSON values efficiently
     pub fn to_json_slice(
         &self,
