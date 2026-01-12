@@ -14,10 +14,10 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 
 # Web Framework (Tokio ecosystem)
-axum = "0.8.7"
-tokio = { version = "1.48", features = ["full"] }
+axum = "0.8.8"
+tokio = { version = "1.49", features = ["full"] }
 tower = "0.5.2"
-tower-http = { version = "0.6.7", features = ["fs", "trace", "cors"] }
+tower-http = { version = "0.6.8", features = ["fs", "trace", "cors"] }
 
 # Storage
 rocksdb = "0.24.0"
@@ -31,9 +31,9 @@ bytes = "1.11"
 # Performance Optimizations
 rayon = "1.11"
 
-arrow = "53.0"
-prost = "0.13"
-prost-types = "0.13"
+arrow = "57.2"
+prost = "0.14"
+prost-types = "0.14"
 tikv-jemallocator = "0.6"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -45,7 +45,7 @@ ryu = "1.0"
 
 # Configuration
 config = "0.15.19"
-toml = "0.9.8"
+toml = "0.9.11"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
@@ -57,13 +57,13 @@ thiserror = "2.0.17"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = { version = "1.18", features = ["v4"] }
+uuid = { version = "1.19", features = ["v4"] }
 atty = "0.2"
-wide = "0.8.3"
+wide = "1.1.1"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3.23"
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3.24"
 
 [[bench]]
 name = "ingestion"
