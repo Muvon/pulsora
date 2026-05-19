@@ -229,3 +229,7 @@ jobs:
       with:
         file: ./cobertura.xml
         fail_ci_if_error: false
+
+  brief:
+    uses: muvon/ci-workflow/.github/workflows/brief.yml@master
+    secrets: inherit
