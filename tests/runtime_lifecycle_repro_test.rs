@@ -57,8 +57,8 @@
 //!
 //!   * `repro_short` — quick smoke test, 50 iterations.
 //!   * `repro_long`  — full bench-scale volume, ITERATIONS_LONG cycles,
-//!                     ignored by default so it doesn't slow the test
-//!                     suite. Run explicitly with:
+//!     ignored by default so it doesn't slow the test
+//!     suite. Run explicitly with:
 //!
 //!         cargo test --test runtime_lifecycle_repro_test -- \
 //!             --ignored --nocapture --test-threads=1
@@ -172,7 +172,7 @@ fn run_with_outer_runtime(iterations: usize) {
 
     // Use the outer runtime once for symmetry with the bench's initial
     // `rt.block_on` (which fetches the schema for the bench setup).
-    let _ = outer_rt.block_on(async { tokio::task::yield_now().await });
+    outer_rt.block_on(async { tokio::task::yield_now().await });
 
     for i in 0..iterations {
         if i % 50 == 0 {
