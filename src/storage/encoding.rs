@@ -71,11 +71,11 @@ pub fn fast_parse_f64(s: &str) -> Option<f64> {
 
     // If we consumed the entire string, it's an integer
     if i == bytes.len() && i > start {
-        return Some(if negative {
-            -int_part as f64
-        } else {
-            int_part as f64
-        });
+        // Negate AFTER casting to f64 so `-0` round-trips to `-0.0`. The
+        // integer expression `-int_part` collapses `-0` to `0`, losing the
+        // sign before it can reach the float's sign bit.
+        let val = int_part as f64;
+        return Some(if negative { -val } else { val });
     }
 
     // If there's a decimal point, parse fractional part
@@ -83,18 +83,31 @@ pub fn fast_parse_f64(s: &str) -> Option<f64> {
         i += 1;
         let mut frac_part = 0i64;
         let mut frac_digits = 0;
+        // The fast path reconstructs the value as
+        //   int_part + frac_part / 10^frac_digits
+        // which is correctly rounded only while every operand stays exact:
+        // frac_part ≤ 2^53 (i.e. ≤ 15 decimal digits) and 10^frac_digits is
+        // exactly representable (also ≤ 22 decimal digits). Any input with
+        // more than 15 fractional digits — e.g. f64::MIN_POSITIVE whose
+        // Display form is "0.000…022250738585072014" with 300+ leading
+        // zeros — would silently drop precision and round down to 0.0.
+        // Track that condition and defer to the std parser, which is
+        // correctly rounded for every IEEE 754 input.
+        let mut precision_lost = false;
 
         while i < bytes.len() && bytes[i] >= b'0' && bytes[i] <= b'9' {
             if frac_digits < 15 {
-                // Limit precision to avoid overflow
                 frac_part = frac_part * 10 + (bytes[i] - b'0') as i64;
                 frac_digits += 1;
+            } else {
+                precision_lost = true;
             }
             i += 1;
         }
 
-        // If we consumed everything, build the float
-        if i == bytes.len() {
+        // If we consumed everything and the fast path is provably exact,
+        // build the float here. Otherwise drop through to s.parse().
+        if i == bytes.len() && !precision_lost {
             let mut result = int_part as f64;
             if frac_digits > 0 {
                 result += frac_part as f64 / (10_i64.pow(frac_digits as u32) as f64);

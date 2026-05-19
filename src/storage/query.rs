@@ -376,13 +376,24 @@ pub fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
         return Ok(dt.timestamp_millis());
     }
 
-    // Try common formats
-    let formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"];
+    // Try common datetime formats (with time component).
+    let datetime_formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"];
 
-    for format in &formats {
+    for format in &datetime_formats {
         if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(timestamp, format) {
             return Ok(naive_dt.and_utc().timestamp_millis());
         }
+    }
+
+    // Date-only ("%Y-%m-%d") must go through NaiveDate; NaiveDateTime rejects
+    // it because it has no time component. Mirrors ingestion::parse_timestamp
+    // so query-time and ingest-time accept the same surface.
+    if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d") {
+        return Ok(naive_date
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis());
     }
 
     Err(PulsoraError::Query(format!(
