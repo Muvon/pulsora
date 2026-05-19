@@ -279,8 +279,7 @@ impl StorageEngine {
                     // If either Arc is gone the user has dropped the last
                     // StorageEngine handle; exit the task cleanly so the
                     // runtime can shut down without aborting us.
-                    let (Some(buffers), Some(db)) =
-                        (buffers_weak.upgrade(), db_weak.upgrade())
+                    let (Some(buffers), Some(db)) = (buffers_weak.upgrade(), db_weak.upgrade())
                     else {
                         break;
                     };
