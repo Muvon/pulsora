@@ -791,11 +791,7 @@ impl StorageEngine {
 
         // Calculate limit for DB query to ensure we get enough data for offset + limit
         // We don't pass offset to DB query because we need to merge with buffer first
-        let db_limit = if let Some(l) = limit {
-            Some(offset.unwrap_or(0) + l)
-        } else {
-            None
-        };
+        let db_limit = limit.map(|l| offset.unwrap_or(0) + l);
 
         let db_results = query::execute_query(
             &self.db,
