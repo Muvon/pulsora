@@ -1031,7 +1031,7 @@ impl StorageEngine {
         // restrict the count to id_keys.
         let table_hash = calculate_table_hash(table);
         let mut db_count = 0u64;
-        let mut buffered_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut buffered_ids: HashSet<u64> = HashSet::new();
 
         // Create prefix for this table's keys
         let prefix = table_hash.to_be_bytes();

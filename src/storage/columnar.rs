@@ -918,6 +918,59 @@ impl ColumnBlock {
         Ok(results)
     }
 
+    /// Decompress only the ID column into a flat `Vec<u64>`.
+    ///
+    /// The validity check that query paths perform after REPLACE needs the
+    /// raw IDs at known row positions; full block decompression would be
+    /// wasteful for this single column. The format mirrors
+    /// `compress_id_column`: marker byte `0`, then base id (varint), then
+    /// `(row_count - 1)` zig-zag deltas accumulated to recover each id.
+    pub fn get_id_values(&self, schema: &Schema) -> Result<Vec<u64>> {
+        let id_col = &schema.id_column;
+        let compressed = self
+            .columns
+            .get(id_col)
+            .ok_or_else(|| PulsoraError::Query(format!("Column {} not found", id_col)))?;
+
+        if compressed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let marker = compressed[0];
+        if marker != 0 {
+            return Err(PulsoraError::Query(format!(
+                "Expected ID column marker 0, got {}",
+                marker
+            )));
+        }
+
+        let mut cursor = std::io::Cursor::new(compressed.as_slice());
+        cursor.set_position(1);
+
+        let base_id = crate::storage::encoding::decode_varint(&mut cursor)?;
+        let num_deltas = crate::storage::encoding::decode_varint(&mut cursor)? as usize;
+
+        let mut ids = Vec::with_capacity(self.row_count);
+        ids.push(base_id);
+
+        let mut current = base_id;
+        for _ in 0..num_deltas {
+            let delta = crate::storage::encoding::decode_varint_signed(&mut cursor)?;
+            current = (current as i64).wrapping_add(delta) as u64;
+            ids.push(current);
+        }
+
+        if ids.len() != self.row_count {
+            return Err(PulsoraError::InvalidData(format!(
+                "ID column row count mismatch: expected {}, decoded {}",
+                self.row_count,
+                ids.len()
+            )));
+        }
+
+        Ok(ids)
+    }
+
     /// Get raw timestamp values for filtering
     fn get_timestamp_values(&self, schema: &Schema) -> Result<Vec<i64>> {
         let ts_col = schema
@@ -1104,15 +1157,22 @@ impl ColumnBlock {
 
         Ok(results)
     }
-    /// Parallel column decompression for maximum performance
-    /// Optimized query execution that combines filtering and export to avoid double decompression
+    /// Single-pass CSV serializer: one full-column decompression, one walk
+    /// over rows, inline filters for timestamp range AND row validity.
+    ///
+    /// `validity` is a per-row bitmap precomputed by the caller (typically
+    /// from an `id_key` multi_get). A row is emitted iff `validity[row_idx]`
+    /// is true AND its timestamp falls within `[start_ts, end_ts]`. This is
+    /// the speed-critical path used when the requested time range trims the
+    /// block — it avoids the extra timestamp-column decompression that a
+    /// separate `filter_by_timestamp` pass would do, and the index-indirect
+    /// re-iteration that `to_csv_filtered` would do afterwards.
     pub fn to_csv_query(
         &self,
         schema: &Schema,
         start_ts: i64,
         end_ts: i64,
-        skip: usize,
-        take: usize,
+        validity: &[bool],
     ) -> Result<String> {
         // 1. Decompress all columns in parallel ONCE
         let decompressed_columns = self.decompress_columns_parallel(schema)?;
@@ -1131,11 +1191,14 @@ impl ColumnBlock {
         }
 
         // 3. Filter and Write in one pass
-        let mut output = String::with_capacity(take * 100);
-        let mut skipped = 0;
-        let mut taken = 0;
+        let mut output = String::with_capacity(self.row_count * 100);
 
         for row_idx in 0..self.row_count {
+            // Validity check first — cheapest branch (single bool deref) and
+            // it short-circuits the timestamp lookup for stale rows.
+            if row_idx >= validity.len() || !validity[row_idx] {
+                continue;
+            }
             let include = if let Some(values) = ts_values {
                 let ts = match &values[row_idx] {
                     EncodedValue::Timestamp(t) => *t,
@@ -1148,15 +1211,6 @@ impl ColumnBlock {
             };
 
             if include {
-                if skipped < skip {
-                    skipped += 1;
-                    continue;
-                }
-
-                if taken >= take {
-                    break;
-                }
-
                 // Write Row
                 for (col_idx, (_, values, null_bitmap)) in decompressed_columns.iter().enumerate() {
                     if col_idx > 0 {
@@ -1210,21 +1264,21 @@ impl ColumnBlock {
                     }
                 }
                 output.push('\n');
-                taken += 1;
             }
         }
 
         Ok(output)
     }
 
-    /// Optimized query execution that combines filtering and export to avoid double decompression
+    /// Single-pass Arrow serializer: one full-column decompression, one walk
+    /// over rows to collect surviving indices, then per-column build of the
+    /// output `RecordBatch`. Same filtering rules as `to_csv_query`.
     pub fn to_arrow_query(
         &self,
         schema: &Schema,
         start_ts: i64,
         end_ts: i64,
-        skip: usize,
-        take: usize,
+        validity: &[bool],
     ) -> Result<RecordBatch> {
         // 1. Decompress all columns in parallel ONCE
         let decompressed_columns = self.decompress_columns_parallel(schema)?;
@@ -1242,11 +1296,12 @@ impl ColumnBlock {
             }
         }
 
-        // 3. Collect indices
-        let mut indices = Vec::with_capacity(take);
-        let mut skipped = 0;
-
+        // 3. Collect indices — one walk over rows, validity + ts filter inline.
+        let mut indices = Vec::with_capacity(self.row_count);
         for row_idx in 0..self.row_count {
+            if row_idx >= validity.len() || !validity[row_idx] {
+                continue;
+            }
             let include = if let Some(values) = ts_values {
                 let ts = match &values[row_idx] {
                     EncodedValue::Timestamp(t) => *t,
@@ -1257,16 +1312,7 @@ impl ColumnBlock {
             } else {
                 true
             };
-
             if include {
-                if skipped < skip {
-                    skipped += 1;
-                    continue;
-                }
-
-                if indices.len() >= take {
-                    break;
-                }
                 indices.push(row_idx);
             }
         }
