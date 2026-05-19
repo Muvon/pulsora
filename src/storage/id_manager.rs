@@ -174,19 +174,16 @@ impl IdManager {
                 // [timestamp:41][node:10][sequence:13]
                 let snowflake_id = (new_ts_offset << 23) | (node_id << 13) | new_seq;
 
-                // Ensure we don't conflict with user IDs
+                // Ensure we don't conflict with user IDs. When snowflake falls
+                // at or below the highest user-provided ID we must skip past it,
+                // AND reserve that slot atomically — otherwise concurrent (or
+                // repeated) callers all return the same value and collide.
                 let max_user = self.max_user_id.load(Ordering::Acquire);
                 if snowflake_id <= max_user {
-                    // This is tricky. If user IDs are very high, snowflake might conflict.
-                    // But snowflake is time-based.
-                    // If max_user is huge, we might need to skip ahead?
-                    // Or just return max_user + 1 and update state?
-                    // But that breaks snowflake structure.
-                    // For now, let's assume user IDs are reasonable or we accept the break.
-                    // If we return max_user + 1, we should update max_user?
-                    // Let's just return max_user + 1 to be safe and simple.
-                    // But we should probably log this.
-                    return max_user + 1;
+                    // fetch_add returns the previous value, so reserved == old + 1.
+                    let reserved = self.max_user_id.fetch_add(1, Ordering::AcqRel) + 1;
+                    let _ = self.persist_id_state();
+                    return reserved;
                 }
 
                 // Persist state periodically (every 1000 IDs or on time change)

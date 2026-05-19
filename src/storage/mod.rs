@@ -47,7 +47,7 @@ use buffer::TableBuffer;
 use id_manager::IdManagerRegistry;
 use schema::Schema;
 use schema::SchemaManager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngestionStats {
@@ -921,6 +921,10 @@ impl StorageEngine {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<String> {
+        // The CSV/Arrow query paths read the block index only and do not merge
+        // with the buffer, so flush first to guarantee parity with `query()`.
+        self.flush_table(table).await?;
+
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
@@ -965,6 +969,10 @@ impl StorageEngine {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<u8>> {
+        // The CSV/Arrow query paths read the block index only and do not merge
+        // with the buffer, so flush first to guarantee parity with `query()`.
+        self.flush_table(table).await?;
+
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
@@ -1016,9 +1024,14 @@ impl StorageEngine {
         }
         drop(schemas);
 
-        // Count rows by iterating through table keys
+        // Count rows by iterating through table keys.
+        // Each row writes both an id_key (12 bytes: [hash:u32][id:u64]) AND a
+        // time_key (20 bytes: [hash:u32][ts:i64][id:u64]) sharing the same
+        // 0xFF-prefixed reference value. Counting both would double-count, so
+        // restrict the count to id_keys.
         let table_hash = calculate_table_hash(table);
-        let mut count = 0u64;
+        let mut db_count = 0u64;
+        let mut buffered_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         // Create prefix for this table's keys
         let prefix = table_hash.to_be_bytes();
@@ -1031,9 +1044,9 @@ impl StorageEngine {
                     if key.len() >= 4 {
                         let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
                         if key_table_hash == table_hash {
-                            // Check if this is a row pointer (not a block or schema)
-                            if !value.is_empty() && value[0] == 0xFF {
-                                count += 1;
+                            // id_key length is exactly 12: 4-byte hash + 8-byte id.
+                            if key.len() == 12 && !value.is_empty() && value[0] == 0xFF {
+                                db_count += 1;
                             }
                         } else {
                             // Hash collision or end of our table's data
@@ -1045,7 +1058,30 @@ impl StorageEngine {
             }
         }
 
-        Ok(count)
+        // Include rows still in the in-memory buffer that haven't been flushed.
+        // Rows whose id_key already exists in DB are not double-counted because
+        // buffered IDs that match are detected by direct ID-key probe below.
+        let buffers = self.buffers.read().await;
+        if let Some(buffer) = buffers.get(table) {
+            for id in buffer.rows.keys() {
+                buffered_ids.insert(*id);
+            }
+        }
+        drop(buffers);
+
+        let mut buffer_only = 0u64;
+        for id in &buffered_ids {
+            let mut id_key = Vec::with_capacity(12);
+            id_key.extend_from_slice(&table_hash.to_be_bytes());
+            id_key.extend_from_slice(&id.to_be_bytes());
+            // If the buffered row already has an id_key entry in RocksDB, it was
+            // counted in db_count and the buffered copy is just an update — skip.
+            if self.db.get(&id_key)?.is_none() {
+                buffer_only += 1;
+            }
+        }
+
+        Ok(db_count + buffer_only)
     }
     pub async fn get_schema(&self, table: &str) -> Result<serde_json::Value> {
         let schemas = self.schemas.read().await;
@@ -1065,6 +1101,19 @@ impl StorageEngine {
         let schema = schemas
             .get_schema(table)
             .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+
+        // Latest-write-wins: a row in the in-memory buffer is newer than (or
+        // equal to) any DB-resident copy. Check the buffer first so freshly
+        // ingested rows are reachable by ID without requiring a flush.
+        {
+            let buffers = self.buffers.read().await;
+            if let Some(buffer) = buffers.get(table) {
+                if let Some(row) = buffer.rows.get(&id) {
+                    let json_row = query::convert_row_to_json(row, schema)?;
+                    return Ok(Some(json_row));
+                }
+            }
+        }
 
         if let Some(row) = query::get_row_by_id(&self.db, table, schema, id)? {
             let json_row = query::convert_row_to_json(&row, schema)?;
