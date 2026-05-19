@@ -14,11 +14,10 @@
 
 use crate::error::{PulsoraError, Result};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 
 #[derive(Debug)]
 enum WalOp {
@@ -26,9 +25,37 @@ enum WalOp {
     Truncate,
 }
 
+/// Write-Ahead Log writer.
+///
+/// The writer runs on a dedicated **`std::thread`** with a `std::sync::mpsc`
+/// channel — deliberately *not* a `tokio::spawn`-ed task. The WAL only does
+/// blocking I/O (`write_all`, `sync_data`); wrapping that in a tokio task
+/// tied the WAL's lifetime to whichever runtime was current at construction
+/// time, and the standard pattern of "create a Runtime, ingest, drop the
+/// Runtime, keep the engine" then aborted the task via runtime shutdown.
+/// That abort path races with tokio's internal JoinHandle accounting and
+/// panics with "JoinHandle polled after completion" once enough cycles
+/// stack up (benches, test loops, anything that creates short-lived
+/// runtimes).
+///
+/// Running the writer as a plain OS thread sidesteps all of that. The
+/// thread's only awaitable is `Receiver::recv()` (blocking on the channel)
+/// — when the last `WriteAheadLog` (and therefore the last `Sender`)
+/// drops, `recv()` returns `Err` and the thread exits cleanly. No runtime
+/// involvement, no shutdown race.
+///
+/// The `Sender` lives behind a `Mutex` because `std::sync::mpsc::Sender`
+/// is `Send` but `!Sync`, and we need `WriteAheadLog` itself to be `Sync`
+/// so that `TableBuffer` (which contains `Option<WriteAheadLog>`) stays
+/// `Sync` and the engine's `Arc<RwLock<HashMap<String, TableBuffer>>>`
+/// remains shareable across tokio tasks. The mutex is only ever contended
+/// trivially — callers already hold the engine's buffers write-lock, so
+/// in practice only one thread sends on this channel at a time. The
+/// uncontended mutex acquire is a few nanoseconds, dominated by the
+/// channel send itself.
 #[derive(Debug)]
 pub struct WriteAheadLog {
-    sender: mpsc::UnboundedSender<WalOp>,
+    sender: Mutex<mpsc::Sender<WalOp>>,
     path: PathBuf,
 }
 
@@ -41,45 +68,74 @@ impl WriteAheadLog {
         let path = wal_dir.join(format!("{}.wal", table_hash));
         let path_clone = path.clone();
 
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel::<WalOp>();
 
-        // Spawn background writer
-        tokio::spawn(async move {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path_clone)
-                .await
-                .expect("Failed to open WAL file");
-
-            while let Some(op) = receiver.recv().await {
-                match op {
-                    WalOp::Write(data) => {
-                        if let Err(e) = file.write_all(&data).await {
-                            tracing::error!("Failed to write to WAL: {}", e);
-                        }
-                        // We sync periodically or rely on OS?
-                        // For max throughput, we rely on OS page cache + periodic sync or just write.
-                        // If we want strict durability, we should sync.
-                        // But "Async WAL" usually implies eventual durability or group commit.
-                        // Let's sync every write for now but since it's async it won't block ingestion.
-                        if let Err(e) = file.sync_data().await {
-                            tracing::error!("Failed to sync WAL: {}", e);
-                        }
+        std::thread::Builder::new()
+            .name(format!("wal-writer-{}", table_hash))
+            .spawn(move || {
+                let mut file = match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path_clone)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!(
+                            "WAL writer for {} failed to open file: {}",
+                            path_clone.display(),
+                            e
+                        );
+                        return;
                     }
-                    WalOp::Truncate => {
-                        if let Err(e) = file.set_len(0).await {
-                            tracing::error!("Failed to truncate WAL: {}", e);
+                };
+
+                // recv() returns Err(_) exactly when every Sender has dropped.
+                // The WriteAheadLog owns the only Sender — when it goes out
+                // of scope (engine teardown), this loop exits naturally.
+                while let Ok(op) = receiver.recv() {
+                    match op {
+                        WalOp::Write(data) => {
+                            if let Err(e) = file.write_all(&data) {
+                                tracing::error!("Failed to write to WAL: {}", e);
+                            }
+                            // sync_data fsyncs file contents (not metadata)
+                            // — durability guarantee for crash recovery.
+                            if let Err(e) = file.sync_data() {
+                                tracing::error!("Failed to sync WAL: {}", e);
+                            }
                         }
-                        if let Err(e) = file.sync_all().await {
-                            tracing::error!("Failed to sync WAL after truncate: {}", e);
+                        WalOp::Truncate => {
+                            if let Err(e) = file.set_len(0) {
+                                tracing::error!("Failed to truncate WAL: {}", e);
+                            }
+                            if let Err(e) = file.sync_all() {
+                                tracing::error!("Failed to sync WAL after truncate: {}", e);
+                            }
                         }
                     }
                 }
-            }
-        });
+            })
+            .map_err(|e| {
+                PulsoraError::Ingestion(format!("Failed to spawn WAL writer thread: {}", e))
+            })?;
 
-        Ok(Self { sender, path })
+        Ok(Self {
+            sender: Mutex::new(sender),
+            path,
+        })
+    }
+
+    fn send(&self, op: WalOp) -> Result<()> {
+        // Mutex acquire is uncontended in practice — the engine's buffers
+        // write-lock already serializes WAL access — but exists so that the
+        // Sender's !Sync bound doesn't poison TableBuffer's Sync.
+        let guard = self
+            .sender
+            .lock()
+            .map_err(|_| PulsoraError::Ingestion("WAL sender mutex poisoned".to_string()))?;
+        guard
+            .send(op)
+            .map_err(|_| PulsoraError::Ingestion("WAL writer thread is dead".to_string()))
     }
 
     pub fn append_batch(&self, rows: &[(u64, HashMap<String, String>)]) -> Result<()> {
@@ -97,11 +153,7 @@ impl WriteAheadLog {
             buffer.extend_from_slice(&json);
         }
 
-        self.sender
-            .send(WalOp::Write(buffer))
-            .map_err(|_| PulsoraError::Ingestion("Failed to send to WAL writer".to_string()))?;
-
-        Ok(())
+        self.send(WalOp::Write(buffer))
     }
 
     pub fn replay(&self) -> Result<Vec<(u64, HashMap<String, String>)>> {
@@ -138,10 +190,7 @@ impl WriteAheadLog {
     }
 
     pub fn truncate(&self) -> Result<()> {
-        self.sender
-            .send(WalOp::Truncate)
-            .map_err(|_| PulsoraError::Ingestion("Failed to send to WAL writer".to_string()))?;
-        Ok(())
+        self.send(WalOp::Truncate)
     }
 }
 

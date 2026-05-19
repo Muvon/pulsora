@@ -248,28 +248,82 @@ impl StorageEngine {
             }
         }
 
-        // Spawn background flush task only if interval > 0
-        let flush_engine = engine.clone();
+        // Spawn the background flush task — but with `Weak` references to
+        // the engine's internal Arcs, NOT a full `engine.clone()`.
+        //
+        // The previous design cloned the whole engine into the task. That
+        // captured-clone kept the underlying `Arc<DB>`, `Arc<RwLock<...>>`
+        // etc. alive forever, so the task could *never* exit on its own —
+        // its only termination was `Runtime::drop` aborting it. When that
+        // runtime drop happened concurrently with the timer driver
+        // shutting down, tokio's internal JoinHandle accounting raced and
+        // panicked with "JoinHandle polled after completion".
+        //
+        // With `Weak`, the task wakes on every tick, tries to upgrade —
+        // and exits cleanly the moment the user drops their last
+        // StorageEngine clone. The runtime no longer needs to abort
+        // anything during teardown.
         let flush_interval = config.storage.flush_interval_ms;
-
         if flush_interval > 0 {
+            // The task captures only `Weak` handles to the bits it needs —
+            // never a `StorageEngine` clone. The per-table schema lives on
+            // the buffer itself, so we don't even need the schemas map.
+            let buffers_weak = Arc::downgrade(&engine.buffers);
+            let db_weak = Arc::downgrade(&engine.db);
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_millis(flush_interval));
                 loop {
                     interval.tick().await;
 
-                    // Get list of tables to avoid holding lock during flush
+                    // If either Arc is gone the user has dropped the last
+                    // StorageEngine handle; exit the task cleanly so the
+                    // runtime can shut down without aborting us.
+                    let (Some(buffers), Some(db)) =
+                        (buffers_weak.upgrade(), db_weak.upgrade())
+                    else {
+                        break;
+                    };
+
+                    // Snapshot the table list under a read lock, then drop
+                    // the read lock before reacquiring as write per-table.
                     let tables: Vec<String> = {
-                        let buffers = flush_engine.buffers.read().await;
-                        buffers.keys().cloned().collect()
+                        let guard = buffers.read().await;
+                        guard.keys().cloned().collect()
                     };
 
                     for table in tables {
-                        if let Err(e) = flush_engine.flush_table(&table).await {
-                            tracing::error!("Failed to background flush table '{}': {}", table, e);
+                        let mut guard = buffers.write().await;
+                        let Some(buffer) = guard.get_mut(&table) else {
+                            continue;
+                        };
+                        if buffer.get_rows().is_empty() {
+                            continue;
+                        }
+                        let rows = buffer.get_rows();
+                        if let Err(e) =
+                            ingestion::write_batch_to_rocksdb(&db, &table, &buffer.schema, &rows)
+                        {
+                            tracing::error!(
+                                "background flush table '{}': write failed: {}",
+                                table,
+                                e
+                            );
+                            continue;
+                        }
+                        if let Err(e) = buffer.clear() {
+                            tracing::error!(
+                                "background flush table '{}': clear failed: {}",
+                                table,
+                                e
+                            );
                         }
                     }
+
+                    // Drop the upgraded Arcs before the next `interval.tick().await`
+                    // so they don't pin the engine alive across the await.
+                    drop(buffers);
+                    drop(db);
                 }
             });
         } else {
