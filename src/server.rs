@@ -28,12 +28,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{PulsoraError, Result};
 use crate::storage::StorageEngine;
+
+/// Map storage errors to HTTP statuses: a missing table is a client-side
+/// 404, everything else is a server error.
+fn storage_error_status(error: &PulsoraError) -> StatusCode {
+    match error {
+        PulsoraError::TableNotFound(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
 
 /// Application state shared across all request handlers
 #[derive(Clone)]
@@ -330,7 +339,7 @@ async fn query_data(
                     duration_ms = duration.as_millis(),
                     "💥 CSV Query error"
                 );
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(storage_error_status(&e));
             }
         }
     }
@@ -388,7 +397,7 @@ async fn query_data(
                     duration_ms = duration.as_millis(),
                     "💥 Arrow Query error"
                 );
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(storage_error_status(&e));
             }
         }
     }
@@ -529,7 +538,7 @@ async fn query_data(
                 duration_ms = duration.as_millis(),
                 "💥 Query error"
             );
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(storage_error_status(&e))
         }
     }
 }
@@ -559,7 +568,7 @@ async fn get_schema(
         Ok(schema) => Ok(Json(ApiResponse::success(schema))),
         Err(e) => {
             error!("Schema error: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(storage_error_status(&e))
         }
     }
 }
@@ -572,7 +581,7 @@ async fn get_row_by_id(
         Ok(row) => Ok(Json(ApiResponse::success(row))),
         Err(e) => {
             error!("Get row by ID error: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(storage_error_status(&e))
         }
     }
 }
@@ -619,19 +628,24 @@ async fn access_logging_middleware(
         version = ?version
     );
 
-    let _enter = span.enter();
+    span.in_scope(|| {
+        debug!(
+            correlation_id = %correlation_id,
+            method = %method,
+            uri = %uri,
+            content_length = content_length,
+            user_agent = user_agent,
+            "📥 Incoming request"
+        );
+    });
 
-    debug!(
-        correlation_id = %correlation_id,
-        method = %method,
-        uri = %uri,
-        content_length = content_length,
-        user_agent = user_agent,
-        "📥 Incoming request"
-    );
-
-    // Process the request
-    let response = next.run(request).await;
+    // Process the request, instrumented so the span is entered only while the
+    // future is actually being polled. NEVER hold a span.enter() guard across
+    // an .await: it corrupts the worker thread's span stack (concurrent
+    // requests stack into each other's log lines) until tracing-subscriber's
+    // registry hits its closed-span assertion — and with panic = "abort" that
+    // took the whole database down under concurrent load.
+    let response = next.run(request).instrument(span).await;
 
     let duration = start_time.elapsed();
     let status = response.status();

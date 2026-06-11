@@ -18,6 +18,13 @@ use pulsora::storage::{query, StorageEngine};
 // use std::collections::HashMap;
 use tempfile::TempDir;
 
+fn bench_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(0)
+        .build()
+        .unwrap()
+}
+
 fn create_test_storage_with_data(rows: usize) -> (StorageEngine, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let mut config = Config::default();
@@ -62,6 +69,7 @@ fn generate_csv_data(rows: usize) -> String {
 }
 
 fn bench_time_range_queries(c: &mut Criterion) {
+    let pool = bench_pool();
     let mut group = c.benchmark_group("time_range_queries");
 
     // Test with different dataset sizes
@@ -91,7 +99,7 @@ fn bench_time_range_queries(c: &mut Criterion) {
                             None,
                             Some(1000),
                             None,
-                            0,
+                            &pool,
                         )
                         .unwrap(),
                     )
@@ -113,7 +121,7 @@ fn bench_time_range_queries(c: &mut Criterion) {
                         Some("2024-01-01 10:01:40".to_string()), // ~10% of 1000 seconds
                         Some(1000),
                         None,
-                        0, // Auto-detect threads
+                        &pool,
                     ))
                 })
             },
@@ -134,7 +142,7 @@ fn bench_time_range_queries(c: &mut Criterion) {
                             None,
                             Some(1000),
                             None,
-                            0, // Auto-detect threads
+                            &pool,
                         )
                         .unwrap(),
                     )
@@ -146,6 +154,7 @@ fn bench_time_range_queries(c: &mut Criterion) {
 }
 
 fn bench_pagination(c: &mut Criterion) {
+    let pool = bench_pool();
     let mut group = c.benchmark_group("pagination");
     let (storage, _temp_dir) = create_test_storage_with_data(10000);
 
@@ -173,7 +182,7 @@ fn bench_pagination(c: &mut Criterion) {
                             None,
                             Some(*limit),
                             Some(0),
-                            0,
+                            &pool,
                         )
                         .unwrap(),
                     )
@@ -196,7 +205,7 @@ fn bench_pagination(c: &mut Criterion) {
                             None,
                             Some(*limit),
                             Some(5000), // Middle of 10k dataset
-                            0,          // Auto-detect threads
+                            &pool,
                         )
                         .unwrap(),
                     )
@@ -208,6 +217,7 @@ fn bench_pagination(c: &mut Criterion) {
 }
 
 fn bench_query_result_sizes(c: &mut Criterion) {
+    let pool = bench_pool();
     let mut group = c.benchmark_group("result_sizes");
     let (storage, _temp_dir) = create_test_storage_with_data(50000);
 
@@ -234,7 +244,7 @@ fn bench_query_result_sizes(c: &mut Criterion) {
                             None,
                             Some(*result_size),
                             None,
-                            0,
+                            &pool,
                         )
                         .unwrap(),
                     )
@@ -246,6 +256,7 @@ fn bench_query_result_sizes(c: &mut Criterion) {
 }
 
 fn bench_concurrent_queries(c: &mut Criterion) {
+    let pool = std::sync::Arc::new(bench_pool());
     let mut group = c.benchmark_group("concurrent_queries");
     let (storage, _temp_dir) = create_test_storage_with_data(10000);
 
@@ -275,6 +286,7 @@ fn bench_concurrent_queries(c: &mut Criterion) {
                             .map(|_| {
                                 let storage = storage.clone();
                                 let schema = schema.clone();
+                                let pool = pool.clone();
                                 std::thread::spawn(move || {
                                     query::execute_query(
                                         &storage.db,
@@ -284,7 +296,7 @@ fn bench_concurrent_queries(c: &mut Criterion) {
                                         None,
                                         Some(100),
                                         None,
-                                        0,
+                                        &pool,
                                     )
                                     .unwrap()
                                 })

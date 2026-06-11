@@ -27,6 +27,7 @@ use crate::error::{PulsoraError, Result};
 use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
 use crate::storage::id_manager::{IdManager, IdManagerRegistry, RowId};
+use crate::storage::refs;
 use crate::storage::schema::Schema;
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType as ArrowDataType;
@@ -191,7 +192,7 @@ pub fn process_csv_bulk(
     csv_data: &str,
     schema: &Schema,
     id_manager: &Arc<IdManager>,
-) -> Result<(ColumnBlock, Vec<u64>, i64, i64, Option<Vec<i64>>)> {
+) -> Result<(ColumnBlock, Vec<u64>, i64, i64)> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
     let headers = reader.headers()?.clone();
 
@@ -351,7 +352,6 @@ pub fn process_csv_bulk(
             Vec::new(),
             0,
             0,
-            None,
         ));
     }
 
@@ -389,12 +389,6 @@ pub fn process_csv_bulk(
         );
     }
 
-    let ts_values = if let Some(ts_name) = ts_col_name {
-        ts_cols.remove(ts_name)
-    } else {
-        None
-    };
-
     Ok((
         ColumnBlock {
             row_count,
@@ -404,91 +398,28 @@ pub fn process_csv_bulk(
         id_col_vals,
         min_ts,
         max_ts,
-        ts_values,
     ))
 }
 
 pub fn write_column_block_to_rocksdb(
     db: &Arc<DB>,
     table: &str,
+    schema: &Schema,
     column_block: &ColumnBlock,
     ids: &[u64],
     min_timestamp: i64,
     max_timestamp: i64,
-    timestamps: Option<&[i64]>,
 ) -> Result<u64> {
     let serialized_block = column_block.serialize()?;
-    let mut batch = WriteBatch::default();
-
-    // Generate a unique block ID for this chunk
-    let block_id = format!("_block_{}_{}", table, uuid::Uuid::new_v4());
-
-    // Store the compressed block ONCE with the block ID
-    batch.put(block_id.as_bytes(), &serialized_block);
-
-    // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
-    // Block index key: [table_hash:u32][B][min_timestamp:i64][block_id]
-    let mut block_index_key = Vec::with_capacity(13 + block_id.len());
-    let table_hash = calculate_table_hash(table);
-    block_index_key.extend_from_slice(&table_hash.to_be_bytes());
-    block_index_key.push(b'B'); // Block marker
-    block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
-    block_index_key.extend_from_slice(block_id.as_bytes());
-
-    // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
-    let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
-    block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-    block_index_value.extend_from_slice(block_id.as_bytes());
-    block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&(column_block.row_count as u32).to_le_bytes());
-
-    batch.put(&block_index_key, &block_index_value);
-
-    // For each row, store references using dual key strategy
-    // Note: We don't have the full row map here, so we can't easily generate time_key for every row
-    // UNLESS we extracted timestamps separately.
-    // For now, we will skip per-row time index if we don't have the timestamp column easily accessible.
-    // BUT, we need it for queries.
-    // Solution: We should have extracted timestamps alongside IDs.
-
-    // Let's assume we only index by ID for now in this fast path, OR we need to pass timestamps too.
-    // For correctness, we should pass timestamps.
-
-    for (row_idx, &id) in ids.iter().enumerate() {
-        // Create reference data: [marker][block_id_len][block_id][row_idx]
-        let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
-        ref_data.push(0xFF); // Reference marker
-        ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-        ref_data.extend_from_slice(block_id.as_bytes());
-        ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
-
-        // Primary key: [table_hash:u32][id:u64]
-        let id_key = generate_id_key(table, id);
-        batch.put(&id_key, &ref_data);
-
-        // Time index key: [table_hash:u32][timestamp:i64][id:u64]
-        // Only if we have timestamps
-        if let Some(ts_list) = timestamps {
-            if row_idx < ts_list.len() {
-                let ts = ts_list[row_idx];
-                let mut time_key = Vec::with_capacity(20);
-                let table_hash = calculate_table_hash(table);
-                time_key.extend_from_slice(&table_hash.to_be_bytes());
-                time_key.extend_from_slice(&ts.to_be_bytes());
-                time_key.extend_from_slice(&id.to_be_bytes());
-                batch.put(&time_key, &ref_data);
-            }
-        }
-    }
-
-    db.write(batch)?;
-    debug!(
-        "Wrote column block with {} rows (Fast Path)",
-        column_block.row_count
-    );
-
-    Ok(column_block.row_count as u64)
+    write_block_core(
+        db,
+        table,
+        schema,
+        &serialized_block,
+        ids,
+        min_timestamp,
+        max_timestamp,
+    )
 }
 
 pub fn write_batch_to_rocksdb(
@@ -501,23 +432,14 @@ pub fn write_batch_to_rocksdb(
         return Ok(0);
     }
 
-    // Create column block for this batch
     let column_block = ColumnBlock::from_rows(rows, schema)?;
     let serialized_block = column_block.serialize()?;
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
 
-    let mut batch = WriteBatch::default();
-
-    // Generate a unique block ID for this chunk
-    let timestamp = Utc::now().timestamp_millis();
-    let block_id = format!("_block_{}_{}", table, uuid::Uuid::new_v4());
-
-    // Store the compressed block ONCE with the block ID
-    batch.put(block_id.as_bytes(), &serialized_block);
-
-    // Get min and max timestamps from this block for range indexing
+    // Min and max timestamps for the block index; current time when the
+    // schema has no timestamp column.
     let mut min_timestamp = i64::MAX;
     let mut max_timestamp = i64::MIN;
-
     for (_, row) in rows.iter() {
         if let Some(ts_col) = schema.get_timestamp_column() {
             if let Some(ts_value) = row.get(ts_col) {
@@ -528,56 +450,257 @@ pub fn write_batch_to_rocksdb(
             }
         }
     }
-
-    // If no timestamp column, use current time
     if min_timestamp == i64::MAX {
-        min_timestamp = timestamp;
-        max_timestamp = timestamp;
+        let now = Utc::now().timestamp_millis();
+        min_timestamp = now;
+        max_timestamp = now;
     }
 
-    // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
-    // Block index key: [table_hash:u32][B][min_timestamp:i64][block_id]
-    // Appending block_id ensures uniqueness even if timestamps collide
-    let mut block_index_key = Vec::with_capacity(13 + block_id.len());
+    write_block_core(
+        db,
+        table,
+        schema,
+        &serialized_block,
+        &ids,
+        min_timestamp,
+        max_timestamp,
+    )
+}
+
+/// In-memory block metadata per (DB instance, table) — the engine's
+/// equivalent of an LSM "Version": REPLACE detection needs every block's id
+/// range on every write, and re-reading the block index from RocksDB is
+/// O(blocks) of iterator work per ingest (measured 24ms → 54ms per 10k-row
+/// batch as a table grew to ~120k blocks). The standard LSM answer (RocksDB,
+/// LevelDB, BadgerDB) is to keep file metadata in memory and never touch
+/// disk metadata on the write path — disk is read once, lazily, then the
+/// cache is appended on every successful block write. The engine is the
+/// single writer, so the cache cannot go stale; keying by DB instance
+/// address keeps test databases (and any reopen) isolated. A future block
+/// compactor must update this cache when it rewrites blocks.
+///
+/// `prefix_max_id[i]` = max over `metas[0..=i].max_id` (O(1) to maintain on
+/// append). Candidate selection walks the metas in REVERSE and stops at the
+/// first i where `prefix_max_id[i] < batch_min_id` — no earlier block can
+/// reach the batch's id range. For monotonic-id workloads (trades) that
+/// terminates after ~one entry, making REPLACE detection O(1) per write no
+/// matter how many blocks the table has.
+struct TableMetaCache {
+    metas: Vec<refs::BlockMeta>,
+    prefix_max_id: Vec<u64>,
+}
+
+impl TableMetaCache {
+    fn load(db: &DB, table_hash: u32) -> Self {
+        let metas = scan_table_blocks(db, table_hash);
+        let mut prefix_max_id = Vec::with_capacity(metas.len());
+        let mut running = 0u64;
+        for meta in &metas {
+            running = running.max(meta.max_id);
+            prefix_max_id.push(running);
+        }
+        Self {
+            metas,
+            prefix_max_id,
+        }
+    }
+
+    /// Blocks whose id range overlaps [batch_min_id, batch_max_id].
+    fn overlapping_blocks(&self, batch_min_id: u64, batch_max_id: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        for i in (0..self.metas.len()).rev() {
+            if self.prefix_max_id[i] < batch_min_id {
+                break;
+            }
+            let meta = &self.metas[i];
+            if meta.min_id <= batch_max_id && meta.max_id >= batch_min_id {
+                out.push(meta.block);
+            }
+        }
+        out
+    }
+
+    fn push(&mut self, meta: refs::BlockMeta) {
+        let running = self
+            .prefix_max_id
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .max(meta.max_id);
+        self.prefix_max_id.push(running);
+        self.metas.push(meta);
+    }
+}
+
+type TableMetas = Arc<std::sync::Mutex<TableMetaCache>>;
+static BLOCK_META_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<(usize, u32), TableMetas>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Get (lazily loading from the block index) the table's in-memory metadata.
+fn table_meta_cache(db: &Arc<DB>, table_hash: u32) -> TableMetas {
+    let key = (Arc::as_ptr(db) as usize, table_hash);
+    let mut map = BLOCK_META_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(TableMetaCache::load(db, table_hash))))
+        .clone()
+}
+
+/// Scan the table's block index and return metadata for every block.
+/// Cold-start path only — the write path uses `table_meta_cache`.
+fn scan_table_blocks(db: &DB, table_hash: u32) -> Vec<refs::BlockMeta> {
+    use rocksdb::{Direction, IteratorMode};
+    let mut start_key = Vec::with_capacity(5);
+    start_key.extend_from_slice(&table_hash.to_be_bytes());
+    start_key.push(b'B');
+
+    let iter = db.iterator(IteratorMode::From(&start_key, Direction::Forward));
+    let mut out = Vec::new();
+    for item in iter {
+        let Ok((key, value)) = item else { break };
+        if key.len() < 4 {
+            continue;
+        }
+        if u32::from_be_bytes([key[0], key[1], key[2], key[3]]) != table_hash {
+            break;
+        }
+        // Markers sort 'B' < 'D' < 'O' and the scan starts at the 'B' range:
+        // the first non-'B' key ends it. `continue` here would walk the whole
+        // 'D' range, materializing every serialized block along the way.
+        if key.len() < 5 || key[4] != b'B' {
+            break;
+        }
+        if let Ok(meta) = refs::parse_block_index_value(&value) {
+            out.push(meta);
+        }
+    }
+    out
+}
+
+/// Write one immutable block plus the bookkeeping that keeps REPLACE
+/// semantics without any per-row index entries:
+///
+/// 1. In-batch duplicate ids: only the LAST occurrence is live; earlier
+///    positions go into the new block's own override set.
+/// 2. Cross-block REPLACE: every existing block whose id range overlaps the
+///    batch is checked (one cheap id-column decode); positions holding
+///    re-ingested ids are merged into that block's override set.
+///
+/// Everything lands in ONE WriteBatch, so a crash can never leave a new copy
+/// live without its predecessors dead. Override updates use `merge` (set
+/// union), so concurrent batches replacing rows of the same old block cannot
+/// lose each other's updates; callers serialize ingests per table so the
+/// duplicate DETECTION itself is race-free.
+fn write_block_core(
+    db: &Arc<DB>,
+    table: &str,
+    schema: &Schema,
+    serialized_block: &[u8],
+    ids: &[u64],
+    min_timestamp: i64,
+    max_timestamp: i64,
+) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
     let table_hash = calculate_table_hash(table);
-    block_index_key.extend_from_slice(&table_hash.to_be_bytes());
-    block_index_key.push(b'B'); // Block marker to distinguish from row keys
-    block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
-    block_index_key.extend_from_slice(block_id.as_bytes());
 
-    // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
-    let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
-    block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-    block_index_value.extend_from_slice(block_id.as_bytes());
-    block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-
-    batch.put(&block_index_key, &block_index_value);
-
-    // For each row, store references using dual key strategy
-    for (row_idx, (id, row)) in rows.iter().enumerate() {
-        // Create reference data: [marker][block_id_len][block_id][row_idx]
-        let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
-        ref_data.push(0xFF); // Reference marker
-        ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-        ref_data.extend_from_slice(block_id.as_bytes());
-        ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
-
-        // Primary key: [table_hash:u32][id:u64] - for direct ID lookups
-        // For REPLACE semantics, we simply overwrite the existing key
-        let id_key = generate_id_key(table, *id);
-        batch.put(&id_key, &ref_data);
-
-        // Time index key: [table_hash:u32][timestamp:i64][id:u64] - for time-range queries
-        let time_key = generate_time_key(table, schema, row, *id)?;
-        batch.put(&time_key, &ref_data);
+    // In-batch duplicate ids: keep the last occurrence, override the rest.
+    let mut last_pos: HashMap<u64, u32> = HashMap::with_capacity(ids.len());
+    for (pos, &id) in ids.iter().enumerate() {
+        last_pos.insert(id, pos as u32);
+    }
+    let mut self_overrides: Vec<u32> = Vec::new();
+    if last_pos.len() != ids.len() {
+        for (pos, &id) in ids.iter().enumerate() {
+            if last_pos[&id] != pos as u32 {
+                self_overrides.push(pos as u32);
+            }
+        }
     }
 
-    db.write(batch)?;
-    debug!("Wrote column block with {} rows", rows.len());
+    let batch_min_id = *ids.iter().min().unwrap();
+    let batch_max_id = *ids.iter().max().unwrap();
 
-    Ok(rows.len() as u64)
+    // Cross-block REPLACE detection: only blocks whose id range overlaps the
+    // batch can hold previous copies. Append-style workloads (monotonic ids)
+    // overlap at most the newest block; REPLACE-heavy tables stay small.
+    // Candidates come from the in-memory metadata (O(blocks) memory pass,
+    // ~100x cheaper than the RocksDB index scan and flat in practice); the
+    // per-table lock is held through the write so the new block's metadata
+    // is appended atomically with respect to the next ingest.
+    let metas = table_meta_cache(db, table_hash);
+    let mut metas = metas
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let candidates = metas.overlapping_blocks(batch_min_id, batch_max_id);
+    let mut old_overrides: Vec<(u64, Vec<u32>)> = Vec::new();
+    for block in candidates {
+        let Some(old_block) = read_block(db, table_hash, block)? else {
+            continue;
+        };
+        let old_ids = old_block.get_id_values(schema)?;
+        let dead: Vec<u32> = old_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, oid)| last_pos.contains_key(oid))
+            .map(|(pos, _)| pos as u32)
+            .collect();
+        if !dead.is_empty() {
+            old_overrides.push((block, dead));
+        }
+    }
+
+    let block_id = refs::allocate_block_id(db)?;
+    let new_meta = refs::BlockMeta {
+        block: block_id,
+        min_ts: min_timestamp,
+        max_ts: max_timestamp,
+        rows: ids.len() as u32,
+        min_id: batch_min_id,
+        max_id: batch_max_id,
+    };
+    let mut batch = WriteBatch::default();
+    batch.put(refs::block_data_key(table_hash, block_id), serialized_block);
+    batch.put(
+        refs::block_index_key(table_hash, min_timestamp, block_id),
+        refs::encode_block_index_value(&new_meta),
+    );
+    if !self_overrides.is_empty() {
+        batch.merge(
+            refs::override_key(table_hash, block_id),
+            refs::encode_override_positions(&self_overrides),
+        );
+    }
+    for (old_block, dead) in &old_overrides {
+        batch.merge(
+            refs::override_key(table_hash, *old_block),
+            refs::encode_override_positions(dead),
+        );
+    }
+
+    // Synced write: callers truncate the application-level buffer WAL right
+    // after this returns, so the RocksDB WAL must be on disk first — an
+    // unsynced write would open a crash window where BOTH logs lose the
+    // batch. One fsync per block (not per row) is negligible against the
+    // block payload itself.
+    let mut write_opts = rocksdb::WriteOptions::default();
+    write_opts.set_sync(true);
+    db.write_opt(batch, &write_opts)?;
+    // Disk write succeeded — publish the new block to the in-memory metadata
+    // (still under the per-table lock taken before candidate selection).
+    metas.push(new_meta);
+    debug!("Wrote column block with {} rows", ids.len());
+    Ok(ids.len() as u64)
+}
+
+/// Fetch and deserialize one block by id (ingest-side helper).
+fn read_block(db: &DB, table_hash: u32, block_id: u64) -> Result<Option<ColumnBlock>> {
+    match db.get(refs::block_data_key(table_hash, block_id))? {
+        Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),
+        None => Ok(None),
+    }
 }
 
 #[allow(dead_code)]
@@ -629,79 +752,35 @@ pub fn insert_rows(
         processed_rows.push((actual_id, row));
     }
 
+    // Duplicate ids must not straddle chunk boundaries: chunks are written in
+    // parallel and cross-chunk copies of one id would race REPLACE detection.
+    // Keep the LAST occurrence (REPLACE semantics), preserving arrival order.
+    let mut keep_pos: HashMap<u64, usize> = HashMap::with_capacity(processed_rows.len());
+    for (pos, (id, _)) in processed_rows.iter().enumerate() {
+        keep_pos.insert(*id, pos);
+    }
+    if keep_pos.len() != processed_rows.len() {
+        let mut deduped = Vec::with_capacity(keep_pos.len());
+        for (pos, pair) in processed_rows.into_iter().enumerate() {
+            if keep_pos[&pair.0] == pos {
+                deduped.push(pair);
+            }
+        }
+        processed_rows = deduped;
+    }
+
     // Process rows in chunks for columnar storage
     let chunks: Vec<_> = processed_rows.chunks(batch_size).collect();
 
-    // PERFORMANCE OPTIMIZATION: Process chunks in parallel for massive speedup
-    // Each chunk creates its column block independently
-    use rayon::prelude::*;
-
-    // ADAPTIVE PARALLELISM: Only use parallel processing when beneficial
-    let use_parallel = chunks.len() >= 4 && rayon::current_num_threads() > 1;
-
-    let chunk_results: Result<Vec<_>> = if use_parallel {
-        chunks
-            .par_iter()
-            .map(|chunk| write_batch_to_rocksdb(db, table, schema, chunk))
-            .collect()
-    } else {
-        // Sequential processing for small workloads or single-threaded config
-        chunks
-            .iter()
-            .map(|chunk| write_batch_to_rocksdb(db, table, schema, chunk))
-            .collect()
-    };
-
-    // Process results and write batches
-    let chunk_results = chunk_results?;
-    let total_inserted = chunk_results.iter().sum();
+    // Chunks are written SEQUENTIALLY: block writes run REPLACE detection
+    // against the blocks already on disk, and parallel chunk writes would
+    // race that detection (a chunk cannot see a sibling's in-flight block).
+    let mut total_inserted = 0u64;
+    for chunk in chunks {
+        total_inserted += write_batch_to_rocksdb(db, table, schema, chunk)?;
+    }
 
     Ok(total_inserted)
-}
-
-/// Generate primary key for direct ID lookup: [table_hash:u32][id:u64]
-fn generate_id_key(table: &str, id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(12); // 4 + 8 bytes
-
-    // Table hash (4 bytes) - big-endian for correct ordering
-    let table_hash = calculate_table_hash(table);
-    key.extend_from_slice(&table_hash.to_be_bytes());
-
-    // ID (8 bytes) - big-endian for correct ordering
-    key.extend_from_slice(&id.to_be_bytes());
-
-    key
-}
-
-/// Generate time index key: [table_hash:u32][timestamp:i64][id:u64]
-fn generate_time_key(
-    table: &str,
-    schema: &Schema,
-    row: &HashMap<String, String>,
-    id: u64,
-) -> Result<Vec<u8>> {
-    let mut key = Vec::with_capacity(20); // 4 + 8 + 8 bytes
-
-    // Table hash (4 bytes) - big-endian for correct ordering
-    let table_hash = calculate_table_hash(table);
-    key.extend_from_slice(&table_hash.to_be_bytes());
-
-    // Timestamp (8 bytes) - big-endian for correct ordering
-    let timestamp = if let Some(ts_col) = schema.get_timestamp_column() {
-        if let Some(ts_value) = row.get(ts_col) {
-            parse_timestamp(ts_value)?
-        } else {
-            Utc::now().timestamp_millis()
-        }
-    } else {
-        Utc::now().timestamp_millis()
-    };
-    key.extend_from_slice(&timestamp.to_be_bytes());
-
-    // ID (8 bytes) - for uniqueness and ordering
-    key.extend_from_slice(&id.to_be_bytes());
-
-    Ok(key)
 }
 
 pub fn parse_timestamp(value: &str) -> Result<i64> {

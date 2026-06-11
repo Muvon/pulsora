@@ -167,14 +167,34 @@ impl WriteAheadLog {
             match reader.read_exact(&mut len_buf) {
                 Ok(_) => {
                     let len = u32::from_le_bytes(len_buf) as usize;
+                    // A torn tail record (crash mid-append) is normal WAL
+                    // wear, not corruption of the recovered prefix: records
+                    // are length-prefixed and appended sequentially, so every
+                    // complete record before it is intact. Recover those and
+                    // stop — aborting startup here would take the whole
+                    // engine down over an expected crash artifact.
                     let mut data_buf = vec![0u8; len];
-                    reader.read_exact(&mut data_buf)?;
-
-                    let entry: (u64, HashMap<String, String>) = serde_json::from_slice(&data_buf)
-                        .map_err(|e| {
-                        PulsoraError::Ingestion(format!("Failed to deserialize WAL entry: {}", e))
-                    })?;
-                    rows.push(entry);
+                    if let Err(e) = reader.read_exact(&mut data_buf) {
+                        tracing::warn!(
+                            "WAL {}: torn tail record ({}), recovering {} complete rows",
+                            self.path.display(),
+                            e,
+                            rows.len()
+                        );
+                        break;
+                    }
+                    match serde_json::from_slice::<(u64, HashMap<String, String>)>(&data_buf) {
+                        Ok(entry) => rows.push(entry),
+                        Err(e) => {
+                            tracing::warn!(
+                                "WAL {}: undecodable tail record ({}), recovering {} complete rows",
+                                self.path.display(),
+                                e,
+                                rows.len()
+                            );
+                            break;
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => {

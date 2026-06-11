@@ -40,6 +40,7 @@ pub mod encoding;
 pub mod id_manager;
 pub mod ingestion;
 pub mod query;
+pub mod refs;
 pub mod schema;
 pub mod wal;
 
@@ -64,7 +65,12 @@ pub struct StorageEngine {
     config: Config,
     #[allow(dead_code)] // Used during initialization to configure Rayon
     ingestion_threads: usize,
-    query_threads: usize,
+    /// Dedicated pool for query-side block decompression. Queries must NOT
+    /// run on the global rayon pool: ingestion's column compression lives
+    /// there, and a burst of scan-heavy queries (calc-metrics polling) would
+    /// queue multi-second decompress work ahead of every write — measured as
+    /// a fixed ~2.7s stall per ingest while reads flooded the shared pool.
+    query_pool: Arc<rayon::ThreadPool>,
 }
 
 impl StorageEngine {
@@ -95,7 +101,35 @@ impl StorageEngine {
             config.query.query_threads
         };
 
-        info!("Query parallelism: {} threads", query_thread_count);
+        // Isolated pool — see the field doc on `query_pool`. Threads run at
+        // lower OS priority: when scan-heavy queries saturate every core,
+        // reads may lag but writes keep their CPU share.
+        let query_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(query_thread_count)
+                .spawn_handler(|thread| {
+                    let mut builder = std::thread::Builder::new();
+                    if let Some(name) = thread.name() {
+                        builder = builder.name(name.to_string());
+                    }
+                    builder.spawn(move || {
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::nice(10);
+                        }
+                        thread.run()
+                    })?;
+                    Ok(())
+                })
+                .thread_name(|i| format!("pulsora-query-{i}"))
+                .build()
+                .map_err(|e| PulsoraError::Internal(format!("failed to build query pool: {e}")))?,
+        );
+
+        info!(
+            "Query parallelism: {} threads (dedicated pool)",
+            query_thread_count
+        );
 
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.storage.data_dir)?;
@@ -103,6 +137,11 @@ impl StorageEngine {
         // Configure RocksDB options optimized for time series workload
         let mut opts = Options::default();
         opts.create_if_missing(true);
+
+        // Override sets (dead row positions per block) are written with
+        // merge() so concurrent REPLACE batches union instead of clobbering.
+        // Only 'O' keys are ever merged; the operator never sees other data.
+        opts.set_merge_operator_associative("override-union", refs::override_merge);
 
         // Memory settings
         opts.set_write_buffer_size(config.storage.write_buffer_size_mb * 1024 * 1024);
@@ -191,7 +230,7 @@ impl StorageEngine {
             buffers: Arc::new(RwLock::new(HashMap::new())),
             config: config.clone(),
             ingestion_threads: ingestion_thread_count,
-            query_threads: query_thread_count,
+            query_pool,
         };
 
         // Recover WALs if enabled
@@ -499,7 +538,6 @@ impl StorageEngine {
 
                 // Handle IDs
                 let mut ids = Vec::with_capacity(row_count);
-                let mut timestamps = Vec::with_capacity(row_count);
                 let mut min_ts = i64::MAX;
                 let mut max_ts = i64::MIN;
 
@@ -576,7 +614,6 @@ impl StorageEngine {
                             } else {
                                 arr.value(i)
                             };
-                            timestamps.push(ts);
                             min_ts = min_ts.min(ts);
                             max_ts = max_ts.max(ts);
                         }
@@ -588,35 +625,37 @@ impl StorageEngine {
                                 ingestion::parse_timestamp(arr.value(i))
                                     .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
                             };
-                            timestamps.push(ts);
                             min_ts = min_ts.min(ts);
                             max_ts = max_ts.max(ts);
                         }
                     } else {
                         let now = chrono::Utc::now().timestamp_millis();
-                        timestamps.resize(row_count, now);
                         min_ts = now;
                         max_ts = now;
                     }
                 } else {
                     let now = chrono::Utc::now().timestamp_millis();
-                    timestamps.resize(row_count, now);
                     min_ts = now;
                     max_ts = now;
                 }
 
                 // Create ColumnBlock directly
                 let column_block = columnar::ColumnBlock::from_arrow(&batch, &schema, &ids)?;
-                // Write directly
-                ingestion::write_column_block_to_rocksdb(
-                    &self.db,
-                    table,
-                    &column_block,
-                    &ids,
-                    min_ts,
-                    max_ts,
-                    Some(&timestamps),
-                )?;
+                // Write under the buffers lock: block writes run REPLACE
+                // detection against existing blocks, so ingests must be
+                // serialized (same lock every buffer-flush path holds).
+                {
+                    let _guard = self.buffers.write().await;
+                    ingestion::write_column_block_to_rocksdb(
+                        &self.db,
+                        table,
+                        &schema,
+                        &column_block,
+                        &ids,
+                        min_ts,
+                        max_ts,
+                    )?;
+                }
             } else {
                 // SLOW PATH: Convert to rows and use buffer
                 // We need to convert this specific batch to rows
@@ -698,24 +737,26 @@ impl StorageEngine {
             let schema_clone = schema.clone();
             let id_manager_clone = id_manager.clone();
 
-            let (column_block, ids, min_ts, max_ts, timestamps) =
-                tokio::task::spawn_blocking(move || {
-                    ingestion::process_csv_bulk(&csv_data, &schema_clone, &id_manager_clone)
-                })
-                .await
-                .map_err(|e| PulsoraError::Internal(e.to_string()))??;
+            let (column_block, ids, min_ts, max_ts) = tokio::task::spawn_blocking(move || {
+                ingestion::process_csv_bulk(&csv_data, &schema_clone, &id_manager_clone)
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??;
 
             let row_count = column_block.row_count as u64;
             if row_count > 0 {
-                // Write directly to RocksDB
+                // Write under the buffers lock: block writes run REPLACE
+                // detection against existing blocks, so ingests must be
+                // serialized (same lock every buffer-flush path holds).
+                let _guard = self.buffers.write().await;
                 ingestion::write_column_block_to_rocksdb(
                     &self.db,
                     &table_owned,
+                    &schema,
                     &column_block,
                     &ids,
                     min_ts,
                     max_ts,
-                    timestamps.as_deref(),
                 )?;
             }
 
@@ -783,28 +824,53 @@ impl StorageEngine {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<serde_json::Value>> {
-        let schemas = self.schemas.read().await;
-        let schema = schemas
-            .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+        let schema = {
+            let schemas = self.schemas.read().await;
+            schemas
+                .get_schema(table)
+                .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?
+                .clone()
+        };
 
         // Calculate limit for DB query to ensure we get enough data for offset + limit
         // We don't pass offset to DB query because we need to merge with buffer first
         let db_limit = limit.map(|l| offset.unwrap_or(0) + l);
 
-        let db_results = query::execute_query(
-            &self.db,
-            table,
-            schema,
-            start.clone(),
-            end.clone(),
-            db_limit,
-            None, // Don't apply offset in DB query
-            self.query_threads,
-        )?;
+        // Copy buffered rows BEFORE the DB read: a background flush in the
+        // gap moves rows buffer→DB, and copy-then-query means such rows show
+        // up in both views (deduped by id below) instead of in neither.
+        let buffered_rows: Vec<(u64, HashMap<String, String>)> = {
+            let buffers = self.buffers.read().await;
+            buffers.get(table).map(|b| b.get_rows()).unwrap_or_default()
+        };
+
+        // Block decompression is CPU work — it must NOT run inline on the
+        // async runtime: scan-heavy queries would pin tokio workers and stall
+        // every concurrent request, ingest included (measured in production).
+        let db_results = {
+            let db = Arc::clone(&self.db);
+            let pool = Arc::clone(&self.query_pool);
+            let table_owned = table.to_string();
+            let schema_clone = schema.clone();
+            let (start_c, end_c) = (start.clone(), end.clone());
+            tokio::task::spawn_blocking(move || {
+                query::execute_query(
+                    &db,
+                    &table_owned,
+                    &schema_clone,
+                    start_c,
+                    end_c,
+                    db_limit,
+                    None, // Don't apply offset in DB query
+                    &pool,
+                )
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??
+        };
 
         // Merge with buffer data and deduplicate
-        let buffers = self.buffers.read().await;
+        let schema = &schema;
         let mut merged_map: HashMap<String, serde_json::Value> = HashMap::new();
         let id_col = &schema.id_column;
 
@@ -823,9 +889,8 @@ impl StorageEngine {
             }
         }
 
-        // 2. Add/Overwrite with buffer results
-        if let Some(buffer) = buffers.get(table) {
-            let buffered_rows = buffer.get_rows();
+        // 2. Add/Overwrite with buffer results (the pre-query copy)
+        {
             if !buffered_rows.is_empty() {
                 let start_ts = start
                     .as_deref()
@@ -874,23 +939,28 @@ impl StorageEngine {
         // Ideally we should re-sort by timestamp if it's a time-series query.
         let mut results: Vec<serde_json::Value> = merged_map.into_values().collect();
 
-        // Sort by timestamp if possible
+        // Sort in TOTAL order (ts, id): the merge map above iterates in
+        // arbitrary order, and a ts-only sort leaves same-second rows in
+        // nondeterministic relative order — offset pagination would then
+        // drop/duplicate tied rows across requests.
         if let Some(ts_col) = schema.get_timestamp_column() {
-            results.sort_by(|a, b| {
-                let get_ts = |v: &serde_json::Value| -> i64 {
-                    match v.get(ts_col) {
-                        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
-                        Some(serde_json::Value::String(s)) => {
-                            ingestion::parse_timestamp(s).unwrap_or(0)
-                        }
-                        _ => 0,
+            let get_id = |v: &serde_json::Value| -> u64 {
+                match v.get(id_col) {
+                    Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+                    Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+                    _ => 0,
+                }
+            };
+            let get_ts = |v: &serde_json::Value| -> i64 {
+                match v.get(ts_col) {
+                    Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+                    Some(serde_json::Value::String(s)) => {
+                        ingestion::parse_timestamp(s).unwrap_or(0)
                     }
-                };
-
-                let ts_a = get_ts(a);
-                let ts_b = get_ts(b);
-                ts_a.cmp(&ts_b)
-            });
+                    _ => 0,
+                }
+            };
+            results.sort_by_key(|a| (get_ts(a), get_id(a)));
         }
 
         // Re-apply limit/offset
@@ -921,22 +991,39 @@ impl StorageEngine {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<String> {
-        let schemas = self.schemas.read().await;
-        let schema = schemas
-            .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+        // The CSV/Arrow query paths read the block index only and do not merge
+        // with the buffer, so flush first to guarantee parity with `query()`.
+        self.flush_table(table).await?;
 
-        // Use optimized CSV query execution
-        let csv_chunks = query::execute_query_csv(
-            &self.db,
-            table,
-            schema,
-            start,
-            end,
-            limit,
-            offset,
-            self.query_threads,
-        )?;
+        let schema = {
+            let schemas = self.schemas.read().await;
+            schemas
+                .get_schema(table)
+                .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // Off the async runtime — see query() for rationale.
+        let csv_chunks = {
+            let db = Arc::clone(&self.db);
+            let pool = Arc::clone(&self.query_pool);
+            let table_owned = table.to_string();
+            let schema_clone = schema.clone();
+            tokio::task::spawn_blocking(move || {
+                query::execute_query_csv(
+                    &db,
+                    &table_owned,
+                    &schema_clone,
+                    start,
+                    end,
+                    limit,
+                    offset,
+                    &pool,
+                )
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??
+        };
 
         // Estimate total size
         let total_len: usize = csv_chunks.iter().map(|s| s.len()).sum();
@@ -965,22 +1052,38 @@ impl StorageEngine {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<u8>> {
-        let schemas = self.schemas.read().await;
-        let schema = schemas
-            .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+        // The CSV/Arrow query paths read the block index only and do not merge
+        // with the buffer, so flush first to guarantee parity with `query()`.
+        self.flush_table(table).await?;
 
-        // Use optimized Arrow query execution
-        let batches = query::execute_query_arrow(
-            &self.db,
-            table,
-            schema,
-            start,
-            end,
-            limit,
-            offset,
-            self.query_threads,
-        )?;
+        let schema = {
+            let schemas = self.schemas.read().await;
+            schemas
+                .get_schema(table)
+                .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?
+                .clone()
+        };
+
+        // Off the async runtime — see query() for rationale.
+        let batches = {
+            let db = Arc::clone(&self.db);
+            let pool = Arc::clone(&self.query_pool);
+            let table_owned = table.to_string();
+            tokio::task::spawn_blocking(move || {
+                query::execute_query_arrow(
+                    &db,
+                    &table_owned,
+                    &schema,
+                    start,
+                    end,
+                    limit,
+                    offset,
+                    &pool,
+                )
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??
+        };
 
         if batches.is_empty() {
             return Ok(Vec::new());
@@ -1012,46 +1115,55 @@ impl StorageEngine {
         // Check if table exists by checking schema
         let schemas = self.schemas.read().await;
         if schemas.get_schema(table).is_none() {
-            return Err(PulsoraError::Query(format!("Table '{}' not found", table)));
+            return Err(PulsoraError::TableNotFound(table.to_string()));
         }
         drop(schemas);
 
-        // Count rows by iterating through table keys
+        // Flush the buffer first so the count is a pure block-metadata scan:
+        // live rows = Σ block row_count − Σ overridden positions. Two BOUNDED
+        // scans ('B' index range, 'O' override range) under one snapshot —
+        // the iterator must never enter the 'D' range, whose values are whole
+        // serialized blocks.
+        self.flush_table(table).await?;
+
         let table_hash = calculate_table_hash(table);
-        let mut count = 0u64;
+        let snap = self.db.snapshot();
+        let mut total = 0u64;
+        let mut dead = 0u64;
 
-        // Create prefix for this table's keys
-        let prefix = table_hash.to_be_bytes();
-        let iter = self.db.prefix_iterator(prefix);
-
-        for item in iter {
-            match item {
-                Ok((key, value)) => {
-                    // Verify this is actually our table (not a hash collision)
-                    if key.len() >= 4 {
-                        let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
-                        if key_table_hash == table_hash {
-                            // Check if this is a row pointer (not a block or schema)
-                            if !value.is_empty() && value[0] == 0xFF {
-                                count += 1;
-                            }
-                        } else {
-                            // Hash collision or end of our table's data
-                            break;
-                        }
-                    }
+        for marker in [b'B', b'O'] {
+            let mut start_key = Vec::with_capacity(5);
+            start_key.extend_from_slice(&table_hash.to_be_bytes());
+            start_key.push(marker);
+            let iter = snap.iterator(rocksdb::IteratorMode::From(
+                &start_key,
+                rocksdb::Direction::Forward,
+            ));
+            for item in iter {
+                let Ok((key, value)) = item else { break };
+                if key.len() < 5
+                    || u32::from_be_bytes([key[0], key[1], key[2], key[3]]) != table_hash
+                    || key[4] != marker
+                {
+                    break;
                 }
-                Err(_) => break,
+                if marker == b'B' {
+                    if let Ok(meta) = refs::parse_block_index_value(&value) {
+                        total += meta.rows as u64;
+                    }
+                } else {
+                    dead += refs::decode_override_positions(&value).len() as u64;
+                }
             }
         }
 
-        Ok(count)
+        Ok(total.saturating_sub(dead))
     }
     pub async fn get_schema(&self, table: &str) -> Result<serde_json::Value> {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
-            .ok_or_else(|| PulsoraError::Schema(format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
 
         Ok(serde_json::to_value(schema)?)
     }
@@ -1064,7 +1176,20 @@ impl StorageEngine {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
+
+        // Latest-write-wins: a row in the in-memory buffer is newer than (or
+        // equal to) any DB-resident copy. Check the buffer first so freshly
+        // ingested rows are reachable by ID without requiring a flush.
+        {
+            let buffers = self.buffers.read().await;
+            if let Some(buffer) = buffers.get(table) {
+                if let Some(row) = buffer.rows.get(&id) {
+                    let json_row = query::convert_row_to_json(row, schema)?;
+                    return Ok(Some(json_row));
+                }
+            }
+        }
 
         if let Some(row) = query::get_row_by_id(&self.db, table, schema, id)? {
             let json_row = query::convert_row_to_json(&row, schema)?;

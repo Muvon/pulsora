@@ -198,17 +198,24 @@ Storage Pattern:
 4. Store lightweight RowPointer per row: [marker][block_id][row_index]
 ```
 
-**Key Encoding Strategy:**
+**Key Encoding Strategy (block-level only — no per-row entries):**
 ```
-Binary Key Format: [table_hash:u32][timestamp:i64][row_id:u64]
-Total: 20 bytes fixed-size for optimal performance
+Block index: [table_hash:u32]['B'][min_ts:i64][block_id:u64]
+             value: [block][min_ts][max_ts][rows][min_id][max_id]   one per block
+Block data:  [table_hash:u32]['D'][block_id:u64]                    compressed columnar block
+Overrides:   [table_hash:u32]['O'][block_id:u64]                    dead row positions (merge/union)
 ```
 
 This encoding ensures:
-- Time-ordered storage for efficient range queries
+- Time-range queries resolve via the per-block time index; row liveness via
+  the per-block override set (one point read per block, no per-row lookups)
+- REPLACE marks the superseded copy's position in the old block's override
+  set (RocksDB merge, set union) in the same WriteBatch as the new block
+- Point lookups by id scan the block index for id-range matches, newest
+  block first (block ids strictly increase with write time)
 - Table isolation via FNV-1a hash prefix
-- Fixed-size keys for better RocksDB performance
-- Unique row identification with collision detection
+- Storage cost scales with blocks, not rows — billions of rows add no
+  index entries beyond their blocks
 
 ### 6. Query Engine
 

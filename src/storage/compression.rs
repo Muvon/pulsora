@@ -335,9 +335,13 @@ pub fn compress_values(values: &[f64]) -> Result<(f64, Vec<u8>)> {
             } else {
                 writer.write_bits(1, 1);
 
-                // Use intrinsics for counting leading/trailing zeros when available
-                let leading_zeros = xor.leading_zeros() as u8;
-                let trailing_zeros = xor.trailing_zeros() as u8;
+                // Counts can be up to 63 but the on-wire window field is 5 bits
+                // (max 31). Clamping both ends is safe and lossless: any zero
+                // bits beyond the cap fall inside the significant_bits payload
+                // and decompress identically because the same clamped values
+                // are written on the wire and consumed by the decoder.
+                let leading_zeros = (xor.leading_zeros() as u8).min(31);
+                let trailing_zeros = (xor.trailing_zeros() as u8).min(31);
 
                 // Check if we can use the same bit window as before (common case)
                 if leading_zeros >= prev_leading && trailing_zeros >= prev_trailing {
@@ -463,7 +467,11 @@ pub fn compress_integers(values: &[i64]) -> Result<(i64, Vec<u8>)> {
 
     for chunk in values[1..].chunks(CHUNK_SIZE) {
         for &value in chunk {
-            let delta = value - prev_value;
+            // Wrapping subtraction: with full-range i64 inputs (e.g. mixed
+            // i64::MIN/MAX), the natural difference overflows. Zigzag varint
+            // round-trips losslessly under wrapping, so the decoder's matching
+            // wrapping_add reconstructs the original sequence exactly.
+            let delta = value.wrapping_sub(prev_value);
             encoding::encode_varint_signed(delta, &mut output);
             prev_value = value;
         }
@@ -492,25 +500,26 @@ pub fn decompress_integers(base: i64, data: &[u8], count: usize) -> Result<Vec<i
     let mut cursor = Cursor::new(data);
     let mut prev_value = base;
 
-    // Unroll loop for better performance
+    // Unroll loop for better performance.
+    // Wrapping_add mirrors compress_integers' wrapping_sub.
     let mut i = 1;
     while i < count {
         // Process 4 values at a time when possible
         if i + 3 < count {
             let delta1 = encoding::decode_varint_signed(&mut cursor)?;
-            let value1 = prev_value + delta1;
+            let value1 = prev_value.wrapping_add(delta1);
             values.push(value1);
 
             let delta2 = encoding::decode_varint_signed(&mut cursor)?;
-            let value2 = value1 + delta2;
+            let value2 = value1.wrapping_add(delta2);
             values.push(value2);
 
             let delta3 = encoding::decode_varint_signed(&mut cursor)?;
-            let value3 = value2 + delta3;
+            let value3 = value2.wrapping_add(delta3);
             values.push(value3);
 
             let delta4 = encoding::decode_varint_signed(&mut cursor)?;
-            let value4 = value3 + delta4;
+            let value4 = value3.wrapping_add(delta4);
             values.push(value4);
 
             prev_value = value4;
@@ -518,7 +527,7 @@ pub fn decompress_integers(base: i64, data: &[u8], count: usize) -> Result<Vec<i
         } else {
             // Handle remaining values
             let delta = encoding::decode_varint_signed(&mut cursor)?;
-            let value = prev_value + delta;
+            let value = prev_value.wrapping_add(delta);
             values.push(value);
             prev_value = value;
             i += 1;
