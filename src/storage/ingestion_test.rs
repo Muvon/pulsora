@@ -18,7 +18,12 @@ use tempfile::TempDir;
 
 fn create_test_db() -> (Arc<DB>, TempDir) {
     let temp_dir = TempDir::new().unwrap();
-    let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+    // Same merge operator StorageEngine registers — override sets are
+    // written with merge() on every REPLACE.
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    opts.set_merge_operator_associative("override-union", crate::storage::refs::override_merge);
+    let db = Arc::new(DB::open(&opts, temp_dir.path()).unwrap());
     (db, temp_dir)
 }
 

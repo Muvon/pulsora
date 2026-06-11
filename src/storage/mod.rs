@@ -48,7 +48,7 @@ use buffer::TableBuffer;
 use id_manager::IdManagerRegistry;
 use schema::Schema;
 use schema::SchemaManager;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngestionStats {
@@ -104,6 +104,11 @@ impl StorageEngine {
         // Configure RocksDB options optimized for time series workload
         let mut opts = Options::default();
         opts.create_if_missing(true);
+
+        // Override sets (dead row positions per block) are written with
+        // merge() so concurrent REPLACE batches union instead of clobbering.
+        // Only 'O' keys are ever merged; the operator never sees other data.
+        opts.set_merge_operator_associative("override-union", refs::override_merge);
 
         // Memory settings
         opts.set_write_buffer_size(config.storage.write_buffer_size_mb * 1024 * 1024);
@@ -603,15 +608,21 @@ impl StorageEngine {
 
                 // Create ColumnBlock directly
                 let column_block = columnar::ColumnBlock::from_arrow(&batch, &schema, &ids)?;
-                // Write directly
-                ingestion::write_column_block_to_rocksdb(
-                    &self.db,
-                    table,
-                    &column_block,
-                    &ids,
-                    min_ts,
-                    max_ts,
-                )?;
+                // Write under the buffers lock: block writes run REPLACE
+                // detection against existing blocks, so ingests must be
+                // serialized (same lock every buffer-flush path holds).
+                {
+                    let _guard = self.buffers.write().await;
+                    ingestion::write_column_block_to_rocksdb(
+                        &self.db,
+                        table,
+                        &schema,
+                        &column_block,
+                        &ids,
+                        min_ts,
+                        max_ts,
+                    )?;
+                }
             } else {
                 // SLOW PATH: Convert to rows and use buffer
                 // We need to convert this specific batch to rows
@@ -701,10 +712,14 @@ impl StorageEngine {
 
             let row_count = column_block.row_count as u64;
             if row_count > 0 {
-                // Write directly to RocksDB
+                // Write under the buffers lock: block writes run REPLACE
+                // detection against existing blocks, so ingests must be
+                // serialized (same lock every buffer-flush path holds).
+                let _guard = self.buffers.write().await;
                 ingestion::write_column_block_to_rocksdb(
                     &self.db,
                     &table_owned,
+                    &schema,
                     &column_block,
                     &ids,
                     min_ts,
@@ -1022,64 +1037,45 @@ impl StorageEngine {
         }
         drop(schemas);
 
-        // Count rows by iterating through table keys. Only id_keys (12 bytes:
-        // [hash:u32][id:u64] with 0xFF-prefixed ref value) count as rows — the
-        // same prefix also holds block index/data keys, and databases written
-        // before the per-row time index was removed may still carry 20-byte
-        // time keys; the length check skips all of them.
+        // Flush the buffer first so the count is a pure block-metadata scan:
+        // live rows = Σ block row_count − Σ overridden positions. Two BOUNDED
+        // scans ('B' index range, 'O' override range) under one snapshot —
+        // the iterator must never enter the 'D' range, whose values are whole
+        // serialized blocks.
+        self.flush_table(table).await?;
+
         let table_hash = calculate_table_hash(table);
-        let mut db_count = 0u64;
-        let mut buffered_ids: HashSet<u64> = HashSet::new();
+        let snap = self.db.snapshot();
+        let mut total = 0u64;
+        let mut dead = 0u64;
 
-        // Create prefix for this table's keys
-        let prefix = table_hash.to_be_bytes();
-        let iter = self.db.prefix_iterator(prefix);
-
-        for item in iter {
-            match item {
-                Ok((key, value)) => {
-                    // Verify this is actually our table (not a hash collision)
-                    if key.len() >= 4 {
-                        let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
-                        if key_table_hash == table_hash {
-                            // id_key length is exactly 12: 4-byte hash + 8-byte id.
-                            if key.len() == 12 && !value.is_empty() && value[0] == 0xFF {
-                                db_count += 1;
-                            }
-                        } else {
-                            // Hash collision or end of our table's data
-                            break;
-                        }
-                    }
+        for marker in [b'B', b'O'] {
+            let mut start_key = Vec::with_capacity(5);
+            start_key.extend_from_slice(&table_hash.to_be_bytes());
+            start_key.push(marker);
+            let iter = snap.iterator(rocksdb::IteratorMode::From(
+                &start_key,
+                rocksdb::Direction::Forward,
+            ));
+            for item in iter {
+                let Ok((key, value)) = item else { break };
+                if key.len() < 5
+                    || u32::from_be_bytes([key[0], key[1], key[2], key[3]]) != table_hash
+                    || key[4] != marker
+                {
+                    break;
                 }
-                Err(_) => break,
+                if marker == b'B' {
+                    if let Ok(meta) = refs::parse_block_index_value(&value) {
+                        total += meta.rows as u64;
+                    }
+                } else {
+                    dead += refs::decode_override_positions(&value).len() as u64;
+                }
             }
         }
 
-        // Include rows still in the in-memory buffer that haven't been flushed.
-        // Rows whose id_key already exists in DB are not double-counted because
-        // buffered IDs that match are detected by direct ID-key probe below.
-        let buffers = self.buffers.read().await;
-        if let Some(buffer) = buffers.get(table) {
-            for id in buffer.rows.keys() {
-                buffered_ids.insert(*id);
-            }
-        }
-        drop(buffers);
-
-        let mut buffer_only = 0u64;
-        for id in &buffered_ids {
-            let mut id_key = Vec::with_capacity(12);
-            id_key.extend_from_slice(&table_hash.to_be_bytes());
-            id_key.extend_from_slice(&id.to_be_bytes());
-            // If the buffered row already has an id_key entry in RocksDB, it was
-            // counted in db_count and the buffered copy is just an update — skip.
-            if self.db.get(&id_key)?.is_none() {
-                buffer_only += 1;
-            }
-        }
-
-        Ok(db_count + buffer_only)
+        Ok(total.saturating_sub(dead))
     }
     pub async fn get_schema(&self, table: &str) -> Result<serde_json::Value> {
         let schemas = self.schemas.read().await;
