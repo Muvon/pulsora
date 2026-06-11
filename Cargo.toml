@@ -30,6 +30,7 @@ bytes = "1.11"
 
 # Performance Optimizations
 rayon = "1.12"
+libc = "0.2"
 
 arrow = "58.3"
 prost = "0.14"
