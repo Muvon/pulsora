@@ -102,7 +102,7 @@ pub fn execute_query(
     end: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
-    query_threads: usize,
+    pool: &rayon::ThreadPool,
 ) -> Result<Vec<Value>> {
     let start_ts = start
         .as_deref()
@@ -155,8 +155,9 @@ pub fn execute_query(
     // not decompress the whole table. Only valid (non-stale) rows count toward
     // the exit, so REPLACE-stale rows cannot starve later blocks; overlapping
     // block time ranges are handled by bounding on collected row timestamps.
-    let chunk_size = if query_threads > 1 {
-        (query_threads * 2).max(4)
+    let pool_threads = pool.current_num_threads();
+    let chunk_size = if pool_threads > 1 {
+        (pool_threads * 2).max(4)
     } else {
         4
     };
@@ -202,23 +203,25 @@ pub fn execute_query(
             }
         }
 
-        let use_parallel = chunk.len() >= 4 && query_threads > 1;
+        let use_parallel = chunk.len() >= 4 && pool_threads > 1;
         let per_block: Result<Vec<Vec<Value>>> = if use_parallel {
-            chunk
-                .par_iter()
-                .map(|meta| {
-                    block_to_json(BlockQuery {
-                        snap: &snap,
-                        schema,
-                        table_hash,
-                        block_id: meta.block,
-                        block_min_ts: meta.min_ts,
-                        block_max_ts: meta.max_ts,
-                        start_ts,
-                        end_ts,
+            pool.install(|| {
+                chunk
+                    .par_iter()
+                    .map(|meta| {
+                        block_to_json(BlockQuery {
+                            snap: &snap,
+                            schema,
+                            table_hash,
+                            block_id: meta.block,
+                            block_min_ts: meta.min_ts,
+                            block_max_ts: meta.max_ts,
+                            start_ts,
+                            end_ts,
+                        })
                     })
-                })
-                .collect()
+                    .collect()
+            })
         } else {
             chunk
                 .iter()
@@ -625,7 +628,7 @@ pub fn execute_query_csv(
     end: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
-    query_threads: usize,
+    pool: &rayon::ThreadPool,
 ) -> Result<Vec<String>> {
     let start_ts = start
         .as_deref()
@@ -646,24 +649,26 @@ pub fn execute_query_csv(
     let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
-    let use_parallel = metadata.len() >= 4 && query_threads > 1;
+    let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
 
     let per_block: Result<Vec<String>> = if use_parallel {
-        metadata
-            .par_iter()
-            .map(|meta| {
-                block_to_csv(BlockQuery {
-                    snap: &snap,
-                    schema,
-                    table_hash,
-                    block_id: meta.block,
-                    block_min_ts: meta.min_ts,
-                    block_max_ts: meta.max_ts,
-                    start_ts,
-                    end_ts,
+        pool.install(|| {
+            metadata
+                .par_iter()
+                .map(|meta| {
+                    block_to_csv(BlockQuery {
+                        snap: &snap,
+                        schema,
+                        table_hash,
+                        block_id: meta.block,
+                        block_min_ts: meta.min_ts,
+                        block_max_ts: meta.max_ts,
+                        start_ts,
+                        end_ts,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
     } else {
         metadata
             .iter()
@@ -715,7 +720,7 @@ pub fn execute_query_arrow(
     end: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
-    query_threads: usize,
+    pool: &rayon::ThreadPool,
 ) -> Result<Vec<RecordBatch>> {
     let start_ts = start
         .as_deref()
@@ -736,24 +741,26 @@ pub fn execute_query_arrow(
     let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
-    let use_parallel = metadata.len() >= 4 && query_threads > 1;
+    let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
 
     let per_block: Result<Vec<Option<RecordBatch>>> = if use_parallel {
-        metadata
-            .par_iter()
-            .map(|meta| {
-                block_to_arrow(BlockQuery {
-                    snap: &snap,
-                    schema,
-                    table_hash,
-                    block_id: meta.block,
-                    block_min_ts: meta.min_ts,
-                    block_max_ts: meta.max_ts,
-                    start_ts,
-                    end_ts,
+        pool.install(|| {
+            metadata
+                .par_iter()
+                .map(|meta| {
+                    block_to_arrow(BlockQuery {
+                        snap: &snap,
+                        schema,
+                        table_hash,
+                        block_id: meta.block,
+                        block_min_ts: meta.min_ts,
+                        block_max_ts: meta.max_ts,
+                        start_ts,
+                        end_ts,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
     } else {
         metadata
             .iter()

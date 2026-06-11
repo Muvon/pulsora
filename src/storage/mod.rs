@@ -65,7 +65,12 @@ pub struct StorageEngine {
     config: Config,
     #[allow(dead_code)] // Used during initialization to configure Rayon
     ingestion_threads: usize,
-    query_threads: usize,
+    /// Dedicated pool for query-side block decompression. Queries must NOT
+    /// run on the global rayon pool: ingestion's column compression lives
+    /// there, and a burst of scan-heavy queries (calc-metrics polling) would
+    /// queue multi-second decompress work ahead of every write — measured as
+    /// a fixed ~2.7s stall per ingest while reads flooded the shared pool.
+    query_pool: Arc<rayon::ThreadPool>,
 }
 
 impl StorageEngine {
@@ -96,7 +101,34 @@ impl StorageEngine {
             config.query.query_threads
         };
 
-        info!("Query parallelism: {} threads", query_thread_count);
+        // Isolated pool — see the field doc on `query_pool`. Threads run at
+        // lower OS priority: when scan-heavy queries saturate every core,
+        // reads may lag but writes keep their CPU share.
+        let query_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(query_thread_count)
+                .spawn_handler(|thread| {
+                    let mut builder = std::thread::Builder::new();
+                    if let Some(name) = thread.name() {
+                        builder = builder.name(name.to_string());
+                    }
+                    builder.spawn(move || {
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::nice(10);
+                        }
+                        thread.run()
+                    })?;
+                    Ok(())
+                })
+                .thread_name(|i| format!("pulsora-query-{i}"))
+                .build()
+                .map_err(|e| {
+                    PulsoraError::Internal(format!("failed to build query pool: {e}"))
+                })?,
+        );
+
+        info!("Query parallelism: {} threads (dedicated pool)", query_thread_count);
 
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.storage.data_dir)?;
@@ -197,7 +229,7 @@ impl StorageEngine {
             buffers: Arc::new(RwLock::new(HashMap::new())),
             config: config.clone(),
             ingestion_threads: ingestion_thread_count,
-            query_threads: query_thread_count,
+            query_pool,
         };
 
         // Recover WALs if enabled
@@ -791,28 +823,56 @@ impl StorageEngine {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<serde_json::Value>> {
-        let schemas = self.schemas.read().await;
-        let schema = schemas
-            .get_schema(table)
-            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
+        let schema = {
+            let schemas = self.schemas.read().await;
+            schemas
+                .get_schema(table)
+                .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?
+                .clone()
+        };
 
         // Calculate limit for DB query to ensure we get enough data for offset + limit
         // We don't pass offset to DB query because we need to merge with buffer first
         let db_limit = limit.map(|l| offset.unwrap_or(0) + l);
 
-        let db_results = query::execute_query(
-            &self.db,
-            table,
-            schema,
-            start.clone(),
-            end.clone(),
-            db_limit,
-            None, // Don't apply offset in DB query
-            self.query_threads,
-        )?;
+        // Copy buffered rows BEFORE the DB read: a background flush in the
+        // gap moves rows buffer→DB, and copy-then-query means such rows show
+        // up in both views (deduped by id below) instead of in neither.
+        let buffered_rows: Vec<(u64, HashMap<String, String>)> = {
+            let buffers = self.buffers.read().await;
+            buffers
+                .get(table)
+                .map(|b| b.get_rows())
+                .unwrap_or_default()
+        };
+
+        // Block decompression is CPU work — it must NOT run inline on the
+        // async runtime: scan-heavy queries would pin tokio workers and stall
+        // every concurrent request, ingest included (measured in production).
+        let db_results = {
+            let db = Arc::clone(&self.db);
+            let pool = Arc::clone(&self.query_pool);
+            let table_owned = table.to_string();
+            let schema_clone = schema.clone();
+            let (start_c, end_c) = (start.clone(), end.clone());
+            tokio::task::spawn_blocking(move || {
+                query::execute_query(
+                    &db,
+                    &table_owned,
+                    &schema_clone,
+                    start_c,
+                    end_c,
+                    db_limit,
+                    None, // Don't apply offset in DB query
+                    &pool,
+                )
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??
+        };
 
         // Merge with buffer data and deduplicate
-        let buffers = self.buffers.read().await;
+        let schema = &schema;
         let mut merged_map: HashMap<String, serde_json::Value> = HashMap::new();
         let id_col = &schema.id_column;
 
@@ -831,9 +891,8 @@ impl StorageEngine {
             }
         }
 
-        // 2. Add/Overwrite with buffer results
-        if let Some(buffer) = buffers.get(table) {
-            let buffered_rows = buffer.get_rows();
+        // 2. Add/Overwrite with buffer results (the pre-query copy)
+        {
             if !buffered_rows.is_empty() {
                 let start_ts = start
                     .as_deref()
@@ -938,22 +997,35 @@ impl StorageEngine {
         // with the buffer, so flush first to guarantee parity with `query()`.
         self.flush_table(table).await?;
 
-        let schemas = self.schemas.read().await;
-        let schema = schemas
-            .get_schema(table)
-            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
+        let schema = {
+            let schemas = self.schemas.read().await;
+            schemas
+                .get_schema(table)
+                .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?
+                .clone()
+        };
 
-        // Use optimized CSV query execution
-        let csv_chunks = query::execute_query_csv(
-            &self.db,
-            table,
-            schema,
-            start,
-            end,
-            limit,
-            offset,
-            self.query_threads,
-        )?;
+        // Off the async runtime — see query() for rationale.
+        let csv_chunks = {
+            let db = Arc::clone(&self.db);
+            let pool = Arc::clone(&self.query_pool);
+            let table_owned = table.to_string();
+            let schema_clone = schema.clone();
+            tokio::task::spawn_blocking(move || {
+                query::execute_query_csv(
+                    &db,
+                    &table_owned,
+                    &schema_clone,
+                    start,
+                    end,
+                    limit,
+                    offset,
+                    &pool,
+                )
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??
+        };
 
         // Estimate total size
         let total_len: usize = csv_chunks.iter().map(|s| s.len()).sum();
@@ -986,22 +1058,34 @@ impl StorageEngine {
         // with the buffer, so flush first to guarantee parity with `query()`.
         self.flush_table(table).await?;
 
-        let schemas = self.schemas.read().await;
-        let schema = schemas
-            .get_schema(table)
-            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
+        let schema = {
+            let schemas = self.schemas.read().await;
+            schemas
+                .get_schema(table)
+                .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?
+                .clone()
+        };
 
-        // Use optimized Arrow query execution
-        let batches = query::execute_query_arrow(
-            &self.db,
-            table,
-            schema,
-            start,
-            end,
-            limit,
-            offset,
-            self.query_threads,
-        )?;
+        // Off the async runtime — see query() for rationale.
+        let batches = {
+            let db = Arc::clone(&self.db);
+            let pool = Arc::clone(&self.query_pool);
+            let table_owned = table.to_string();
+            tokio::task::spawn_blocking(move || {
+                query::execute_query_arrow(
+                    &db,
+                    &table_owned,
+                    &schema,
+                    start,
+                    end,
+                    limit,
+                    offset,
+                    &pool,
+                )
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??
+        };
 
         if batches.is_empty() {
             return Ok(Vec::new());
