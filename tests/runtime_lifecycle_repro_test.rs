@@ -136,7 +136,12 @@ fn one_iteration() {
     // then runs the iter closure with that tuple. We do the same below.
 
     // ITER — fan out THREADS sync queries.
-    let pool = std::sync::Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+    let pool = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap(),
+    );
     let handles: Vec<_> = (0..THREADS)
         .map(|_| {
             let storage = storage.clone();

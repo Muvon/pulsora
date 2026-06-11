@@ -19,7 +19,10 @@ use pulsora::storage::{query, StorageEngine};
 use tempfile::TempDir;
 
 fn bench_pool() -> rayon::ThreadPool {
-    rayon::ThreadPoolBuilder::new().num_threads(0).build().unwrap()
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(0)
+        .build()
+        .unwrap()
 }
 
 fn create_test_storage_with_data(rows: usize) -> (StorageEngine, TempDir) {
@@ -202,7 +205,7 @@ fn bench_pagination(c: &mut Criterion) {
                             None,
                             Some(*limit),
                             Some(5000), // Middle of 10k dataset
-                            0,          // Auto-detect threads
+                            &pool,
                         )
                         .unwrap(),
                     )
@@ -253,7 +256,7 @@ fn bench_query_result_sizes(c: &mut Criterion) {
 }
 
 fn bench_concurrent_queries(c: &mut Criterion) {
-    let pool = bench_pool();
+    let pool = std::sync::Arc::new(bench_pool());
     let mut group = c.benchmark_group("concurrent_queries");
     let (storage, _temp_dir) = create_test_storage_with_data(10000);
 
@@ -283,6 +286,7 @@ fn bench_concurrent_queries(c: &mut Criterion) {
                             .map(|_| {
                                 let storage = storage.clone();
                                 let schema = schema.clone();
+                                let pool = pool.clone();
                                 std::thread::spawn(move || {
                                     query::execute_query(
                                         &storage.db,

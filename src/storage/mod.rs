@@ -123,12 +123,13 @@ impl StorageEngine {
                 })
                 .thread_name(|i| format!("pulsora-query-{i}"))
                 .build()
-                .map_err(|e| {
-                    PulsoraError::Internal(format!("failed to build query pool: {e}"))
-                })?,
+                .map_err(|e| PulsoraError::Internal(format!("failed to build query pool: {e}")))?,
         );
 
-        info!("Query parallelism: {} threads (dedicated pool)", query_thread_count);
+        info!(
+            "Query parallelism: {} threads (dedicated pool)",
+            query_thread_count
+        );
 
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.storage.data_dir)?;
@@ -840,10 +841,7 @@ impl StorageEngine {
         // up in both views (deduped by id below) instead of in neither.
         let buffered_rows: Vec<(u64, HashMap<String, String>)> = {
             let buffers = self.buffers.read().await;
-            buffers
-                .get(table)
-                .map(|b| b.get_rows())
-                .unwrap_or_default()
+            buffers.get(table).map(|b| b.get_rows()).unwrap_or_default()
         };
 
         // Block decompression is CPU work — it must NOT run inline on the
