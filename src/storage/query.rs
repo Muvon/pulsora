@@ -27,6 +27,7 @@ use std::sync::Arc;
 use crate::error::{PulsoraError, Result};
 use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
+use crate::storage::refs;
 use crate::storage::schema::Schema;
 
 /// Execute ID-based query to retrieve a single row by ID
@@ -48,11 +49,13 @@ pub fn get_row_by_id(
     match db.get_opt(&id_key, &read_opts)? {
         Some(ref_data) => {
             // Parse the reference data to get block ID and row index
-            let (block_id, row_idx) = parse_reference_data(&ref_data)?;
+            let (block_id, row_idx) = refs::parse_ref(&ref_data)?;
+            let row_idx = row_idx as usize;
 
             // Load the block with optimized read
+            let table_hash = calculate_table_hash(table);
             let block_data = db
-                .get_opt(&block_id, &read_opts)?
+                .get_opt(refs::block_data_key(table_hash, block_id), &read_opts)?
                 .ok_or_else(|| PulsoraError::Query("Block not found".to_string()))?;
 
             // Deserialize the column block
@@ -85,49 +88,6 @@ fn generate_id_key(table: &str, id: u64) -> Vec<u8> {
     key
 }
 
-/// Parse reference data to extract block ID and row index
-fn parse_reference_data(ref_data: &[u8]) -> Result<(Vec<u8>, usize)> {
-    if ref_data.is_empty() || ref_data[0] != 0xFF {
-        return Err(PulsoraError::Query("Invalid reference data".to_string()));
-    }
-
-    let mut pos = 1;
-
-    // Read block ID length
-    if ref_data.len() < pos + 4 {
-        return Err(PulsoraError::Query(
-            "Invalid reference data length".to_string(),
-        ));
-    }
-    let block_id_len = u32::from_le_bytes([
-        ref_data[pos],
-        ref_data[pos + 1],
-        ref_data[pos + 2],
-        ref_data[pos + 3],
-    ]) as usize;
-    pos += 4;
-
-    // Read block ID
-    if ref_data.len() < pos + block_id_len {
-        return Err(PulsoraError::Query("Invalid block ID length".to_string()));
-    }
-    let block_id = ref_data[pos..pos + block_id_len].to_vec();
-    pos += block_id_len;
-
-    // Read row index
-    if ref_data.len() < pos + 4 {
-        return Err(PulsoraError::Query("Invalid row index data".to_string()));
-    }
-    let row_idx = u32::from_le_bytes([
-        ref_data[pos],
-        ref_data[pos + 1],
-        ref_data[pos + 2],
-        ref_data[pos + 3],
-    ]) as usize;
-
-    Ok((block_id, row_idx))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn execute_query(
     db: &Arc<DB>,
@@ -151,56 +111,150 @@ pub fn execute_query(
         .unwrap_or(i64::MAX);
     let limit = limit.unwrap_or(1000);
     let offset = offset.unwrap_or(0);
+    let needed = offset.saturating_add(limit);
 
     let table_hash = calculate_table_hash(table);
+    // Ascending by block min_ts from the index scan
     let metadata = scan_block_metadata(db, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
-    let use_parallel = metadata.len() >= 4 && query_threads > 1;
+    let ts_col = schema.get_timestamp_column().map(str::to_string);
+
+    // Row timestamp in milliseconds for the early-exit bound. Values render
+    // either as epoch numbers or formatted strings depending on column type.
+    let row_ts = |row: &Value| -> i64 {
+        let Some(ts_col) = ts_col.as_deref() else {
+            return 0;
+        };
+        let ts = match row.get(ts_col) {
+            Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+            Some(Value::String(s)) => crate::storage::ingestion::parse_timestamp(s).unwrap_or(0),
+            _ => 0,
+        };
+        // Normalize plain epoch seconds to milliseconds (block keys are ms)
+        if ts > 0 && ts < 100_000_000_000 {
+            ts * 1000
+        } else {
+            ts
+        }
+    };
 
     // Each in-range block is processed independently — fetch, validity-filter,
-    // serialize the live rows to JSON. Pagination is global, applied to the
-    // merged result, so REPLACE-stale rows in earlier blocks can no longer
-    // crowd out live rows in later blocks the way the pre-validity pagination
-    // pre-allocation used to.
-    let per_block: Result<Vec<Vec<Value>>> = if use_parallel {
-        metadata
-            .par_iter()
-            .map(|(block_id, min_ts, max_ts, _)| {
-                block_to_json(BlockQuery {
-                    db: db.as_ref(),
-                    schema,
-                    table_hash,
-                    block_id,
-                    block_min_ts: *min_ts,
-                    block_max_ts: *max_ts,
-                    start_ts,
-                    end_ts,
-                })
-            })
-            .collect()
+    // serialize the live rows to JSON. Blocks are consumed in chunks with an
+    // EARLY EXIT once enough valid rows are collected AND no unprocessed block
+    // can still contribute to the first `needed` ranks: a `limit=1` probe must
+    // not decompress the whole table. Only valid (non-stale) rows count toward
+    // the exit, so REPLACE-stale rows cannot starve later blocks; overlapping
+    // block time ranges are handled by bounding on collected row timestamps.
+    let chunk_size = if query_threads > 1 {
+        (query_threads * 2).max(4)
     } else {
-        metadata
-            .iter()
-            .map(|(block_id, min_ts, max_ts, _)| {
-                block_to_json(BlockQuery {
-                    db: db.as_ref(),
-                    schema,
-                    table_hash,
-                    block_id,
-                    block_min_ts: *min_ts,
-                    block_max_ts: *max_ts,
-                    start_ts,
-                    end_ts,
-                })
-            })
-            .collect()
+        4
     };
 
     let mut all: Vec<Value> = Vec::new();
-    for batch in per_block? {
-        all.extend(batch);
+    // Early-exit bound: the timestamp of the `needed`-th smallest collected
+    // row (a bounded max-heap over the best `needed` candidates). Bounding on
+    // the max of ALL collected rows would never fire on contiguous data —
+    // consecutive blocks share boundary seconds, so the running max always
+    // reaches into the next block. The k-th rank stays anchored instead.
+    let mut top_ts: std::collections::BinaryHeap<i64> = std::collections::BinaryHeap::new();
+
+    let mut idx = 0;
+    while idx < metadata.len() {
+        // Adaptive chunk: just enough blocks (by stored row counts — an upper
+        // bound on valid rows) to plausibly satisfy `needed`, capped at
+        // `chunk_size` for memory. A limit=1 probe then touches one block
+        // instead of a full parallel sweep.
+        let mut chunk_end = idx;
+        let mut rows_estimate = 0usize;
+        while chunk_end < metadata.len() && (chunk_end - idx) < chunk_size {
+            rows_estimate += metadata[chunk_end].3;
+            chunk_end += 1;
+            if rows_estimate >= needed.saturating_mul(2) {
+                break;
+            }
+        }
+        let chunk = &metadata[idx..chunk_end];
+        idx = chunk_end;
+
+        if top_ts.len() >= needed {
+            // Blocks are ordered by min_ts: a block starting strictly past the
+            // needed-th ranked row cannot change the first `needed` rows, and
+            // neither can any block after it.
+            let bound = top_ts.peek().copied().unwrap_or(i64::MAX);
+            let next_can_contribute = ts_col.is_some()
+                && chunk
+                    .first()
+                    .map(|(_, min_ts, _, _)| *min_ts <= bound)
+                    .unwrap_or(false);
+            if !next_can_contribute {
+                break;
+            }
+        }
+
+        let use_parallel = chunk.len() >= 4 && query_threads > 1;
+        let per_block: Result<Vec<Vec<Value>>> = if use_parallel {
+            chunk
+                .par_iter()
+                .map(|&(block_id, min_ts, max_ts, _)| {
+                    block_to_json(BlockQuery {
+                        db: db.as_ref(),
+                        schema,
+                        table_hash,
+                        block_id,
+                        block_min_ts: min_ts,
+                        block_max_ts: max_ts,
+                        start_ts,
+                        end_ts,
+                    })
+                })
+                .collect()
+        } else {
+            chunk
+                .iter()
+                .map(|&(block_id, min_ts, max_ts, _)| {
+                    block_to_json(BlockQuery {
+                        db: db.as_ref(),
+                        schema,
+                        table_hash,
+                        block_id,
+                        block_min_ts: min_ts,
+                        block_max_ts: max_ts,
+                        start_ts,
+                        end_ts,
+                    })
+                })
+                .collect()
+        };
+
+        for batch in per_block? {
+            for row in batch {
+                let ts = row_ts(&row);
+                if top_ts.len() < needed {
+                    top_ts.push(ts);
+                } else if let Some(mut worst) = top_ts.peek_mut() {
+                    if ts < *worst {
+                        *worst = ts;
+                    }
+                }
+                all.push(row);
+            }
+        }
     }
+
+    // Cut to the requested window in TOTAL order (ts, id). Sorting by ts alone
+    // leaves same-second rows in nondeterministic relative order, which makes
+    // offset pagination drop/duplicate tied rows across requests.
+    let id_col = schema.id_column.clone();
+    let row_id = move |row: &Value| -> u64 {
+        match row.get(&id_col) {
+            Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+            Some(Value::String(s)) => s.parse().unwrap_or(0),
+            _ => 0,
+        }
+    };
+    all.sort_by_cached_key(|row| (row_ts(row), row_id(row)));
 
     Ok(all.into_iter().skip(offset).take(limit).collect())
 }
@@ -329,7 +383,7 @@ fn scan_block_metadata(
     table_hash: u32,
     start_ts: i64,
     end_ts: i64,
-) -> Vec<(Vec<u8>, i64, i64, usize)> {
+) -> Vec<(u64, i64, i64, usize)> {
     let mut start_key = Vec::with_capacity(5);
     start_key.extend_from_slice(&table_hash.to_be_bytes());
     start_key.push(b'B');
@@ -340,19 +394,26 @@ fn scan_block_metadata(
     opts.set_readahead_size(4 * 1024 * 1024);
 
     let iter = db.iterator_opt(IteratorMode::From(&start_key, Direction::Forward), opts);
-    let mut result: Vec<(Vec<u8>, i64, i64, usize)> = Vec::new();
+    let mut result: Vec<(u64, i64, i64, usize)> = Vec::new();
 
     for item in iter {
         let (key, value) = match item {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if key.len() < 5 || key[4] != b'B' {
+        // Table-hash boundary FIRST: keys are hash-prefixed, so the first key
+        // of another table ends this table's index range. Checking the 'B'
+        // marker first would `continue` past foreign tables' row keys and walk
+        // the entire remaining keyspace on unbounded-end queries.
+        if key.len() < 4 {
             continue;
         }
         let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
         if key_table_hash != table_hash {
             break;
+        }
+        if key.len() < 5 || key[4] != b'B' {
+            continue;
         }
 
         // The key carries the block's min_ts; once that's past end_ts, every
@@ -366,47 +427,17 @@ fn scan_block_metadata(
             }
         }
 
-        if value.len() < 24 {
+        let Ok((block_id, block_min_ts, block_max_ts, row_count)) =
+            refs::parse_block_index_value(&value)
+        else {
             continue;
-        }
-        let block_id_len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
-        if value.len() < 4 + block_id_len + 16 + 4 {
-            continue;
-        }
-        let block_id = &value[4..4 + block_id_len];
-        let pos = 4 + block_id_len;
-        let block_min_ts = i64::from_le_bytes([
-            value[pos],
-            value[pos + 1],
-            value[pos + 2],
-            value[pos + 3],
-            value[pos + 4],
-            value[pos + 5],
-            value[pos + 6],
-            value[pos + 7],
-        ]);
-        let block_max_ts = i64::from_le_bytes([
-            value[pos + 8],
-            value[pos + 9],
-            value[pos + 10],
-            value[pos + 11],
-            value[pos + 12],
-            value[pos + 13],
-            value[pos + 14],
-            value[pos + 15],
-        ]);
-        let row_count = u32::from_le_bytes([
-            value[pos + 16],
-            value[pos + 17],
-            value[pos + 18],
-            value[pos + 19],
-        ]) as usize;
+        };
 
         if block_max_ts < start_ts || block_min_ts > end_ts {
             continue;
         }
 
-        result.push((block_id.to_vec(), block_min_ts, block_max_ts, row_count));
+        result.push((block_id, block_min_ts, block_max_ts, row_count as usize));
     }
 
     result
@@ -416,19 +447,19 @@ struct BlockQuery<'a> {
     db: &'a DB,
     schema: &'a Schema,
     table_hash: u32,
-    block_id: &'a [u8],
+    block_id: u64,
     block_min_ts: i64,
     block_max_ts: i64,
     start_ts: i64,
     end_ts: i64,
 }
 
-/// Fetch and deserialize a block by its storage key.
-fn fetch_block(db: &DB, block_id: &[u8]) -> Result<Option<ColumnBlock>> {
+/// Fetch and deserialize a block by its numeric id.
+fn fetch_block(db: &DB, table_hash: u32, block_id: u64) -> Result<Option<ColumnBlock>> {
     let mut opts = ReadOptions::default();
     opts.set_verify_checksums(false);
     opts.fill_cache(true);
-    match db.get_opt(block_id, &opts)? {
+    match db.get_opt(refs::block_data_key(table_hash, block_id), &opts)? {
         Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),
         None => Ok(None),
     }
@@ -454,7 +485,7 @@ fn block_validity_bitmap(
     table_hash: u32,
     block: &ColumnBlock,
     schema: &Schema,
-    block_id: &[u8],
+    block_id: u64,
 ) -> Result<Vec<bool>> {
     if block.row_count == 0 {
         return Ok(Vec::new());
@@ -470,8 +501,8 @@ fn block_validity_bitmap(
     let mut valid = vec![false; block.row_count];
     for (row_idx, result) in ref_results.into_iter().enumerate() {
         if let Ok(Some(ref_data)) = result {
-            if let Ok((latest_block_id, latest_row_idx)) = parse_reference_data(&ref_data) {
-                if latest_block_id == block_id && latest_row_idx == row_idx {
+            if let Ok((latest_block_id, latest_row_idx)) = refs::parse_ref(&ref_data) {
+                if latest_block_id == block_id && latest_row_idx as usize == row_idx {
                     valid[row_idx] = true;
                 }
             }
@@ -507,7 +538,7 @@ fn intersect_indices(
 ///   * **filtered path** — anything else; the surviving indices are
 ///     materialized once and passed to `to_json_filtered`.
 fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
-    let block = match fetch_block(query.db, query.block_id)? {
+    let block = match fetch_block(query.db, query.table_hash, query.block_id)? {
         Some(b) => b,
         None => return Ok(Vec::new()),
     };
@@ -551,7 +582,7 @@ fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
 ///      walks rows once with inline `validity[i] && ts in [start,end]`
 ///      checks, avoiding a separate `filter_by_timestamp` pre-scan.
 fn block_to_csv(query: BlockQuery<'_>) -> Result<String> {
-    let block = match fetch_block(query.db, query.block_id)? {
+    let block = match fetch_block(query.db, query.table_hash, query.block_id)? {
         Some(b) => b,
         None => return Ok(String::new()),
     };
@@ -583,7 +614,7 @@ fn block_to_csv(query: BlockQuery<'_>) -> Result<String> {
 /// Per-block Arrow serializer used by `execute_query_arrow`. Same
 /// three-path dispatch as `block_to_csv`.
 fn block_to_arrow(query: BlockQuery<'_>) -> Result<Option<RecordBatch>> {
-    let block = match fetch_block(query.db, query.block_id)? {
+    let block = match fetch_block(query.db, query.table_hash, query.block_id)? {
         Some(b) => b,
         None => return Ok(None),
     };
@@ -652,14 +683,14 @@ pub fn execute_query_csv(
     let per_block: Result<Vec<String>> = if use_parallel {
         metadata
             .par_iter()
-            .map(|(block_id, min_ts, max_ts, _)| {
+            .map(|&(block_id, min_ts, max_ts, _)| {
                 block_to_csv(BlockQuery {
                     db: db.as_ref(),
                     schema,
                     table_hash,
                     block_id,
-                    block_min_ts: *min_ts,
-                    block_max_ts: *max_ts,
+                    block_min_ts: min_ts,
+                    block_max_ts: max_ts,
                     start_ts,
                     end_ts,
                 })
@@ -668,14 +699,14 @@ pub fn execute_query_csv(
     } else {
         metadata
             .iter()
-            .map(|(block_id, min_ts, max_ts, _)| {
+            .map(|&(block_id, min_ts, max_ts, _)| {
                 block_to_csv(BlockQuery {
                     db: db.as_ref(),
                     schema,
                     table_hash,
                     block_id,
-                    block_min_ts: *min_ts,
-                    block_max_ts: *max_ts,
+                    block_min_ts: min_ts,
+                    block_max_ts: max_ts,
                     start_ts,
                     end_ts,
                 })
@@ -740,14 +771,14 @@ pub fn execute_query_arrow(
     let per_block: Result<Vec<Option<RecordBatch>>> = if use_parallel {
         metadata
             .par_iter()
-            .map(|(block_id, min_ts, max_ts, _)| {
+            .map(|&(block_id, min_ts, max_ts, _)| {
                 block_to_arrow(BlockQuery {
                     db: db.as_ref(),
                     schema,
                     table_hash,
                     block_id,
-                    block_min_ts: *min_ts,
-                    block_max_ts: *max_ts,
+                    block_min_ts: min_ts,
+                    block_max_ts: max_ts,
                     start_ts,
                     end_ts,
                 })
@@ -756,14 +787,14 @@ pub fn execute_query_arrow(
     } else {
         metadata
             .iter()
-            .map(|(block_id, min_ts, max_ts, _)| {
+            .map(|&(block_id, min_ts, max_ts, _)| {
                 block_to_arrow(BlockQuery {
                     db: db.as_ref(),
                     schema,
                     table_hash,
                     block_id,
-                    block_min_ts: *min_ts,
-                    block_max_ts: *max_ts,
+                    block_min_ts: min_ts,
+                    block_max_ts: max_ts,
                     start_ts,
                     end_ts,
                 })

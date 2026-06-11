@@ -269,7 +269,6 @@ impl SchemaManager {
         // Get all column names from first row
         let first_row = &sample_rows[0];
         let mut column_types: HashMap<String, DataType> = HashMap::new();
-        let mut timestamp_column = None;
         let mut has_id_column = false;
 
         // Initialize with column names - start with None to infer from first value
@@ -311,19 +310,44 @@ impl SchemaManager {
             }
         }
 
+        // Timestamp column: only TYPE-detected Timestamp columns qualify —
+        // a name hint alone must never promote a column (substring matches
+        // like "timeframe_id" would hijack the time index with a non-time
+        // integer column). Selection is deterministic: well-known names take
+        // priority, then alphabetical order — HashMap iteration order must
+        // never decide a table's time index.
+        let mut ts_candidates: Vec<&String> = column_types
+            .iter()
+            .filter(|(name, data_type)| name.as_str() != "id" && **data_type == DataType::Timestamp)
+            .map(|(name, _)| name)
+            .collect();
+        ts_candidates.sort();
+        const PREFERRED_TS_NAMES: [&str; 6] =
+            ["timestamp", "ts", "time", "datetime", "created_at", "date"];
+        let timestamp_column = PREFERRED_TS_NAMES
+            .iter()
+            .find_map(|preferred| {
+                ts_candidates
+                    .iter()
+                    .find(|candidate| candidate.as_str() == *preferred)
+            })
+            .or_else(|| ts_candidates.first())
+            .map(|name| (*name).clone())
+            // No Timestamp-typed column: an EXACT well-known name still marks
+            // the time index (e.g. epoch values that didn't type-infer as
+            // Timestamp). Substring matches must not.
+            .or_else(|| {
+                PREFERRED_TS_NAMES.iter().find_map(|preferred| {
+                    column_types
+                        .keys()
+                        .find(|name| name.as_str() == *preferred)
+                        .cloned()
+                })
+            });
+
         // Build columns with final types
         let mut columns = Vec::new();
         for (name, data_type) in &column_types {
-            // Check if this could be a timestamp column (but not ID)
-            if name != "id"
-                && (data_type == &DataType::Timestamp
-                    || name.to_lowercase().contains("time")
-                    || name.to_lowercase().contains("date"))
-                && timestamp_column.is_none()
-            {
-                timestamp_column = Some(name.clone());
-            }
-
             columns.push(Column {
                 name: name.clone(),
                 data_type: data_type.clone(),

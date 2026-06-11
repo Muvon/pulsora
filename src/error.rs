@@ -27,6 +27,9 @@ pub enum PulsoraError {
     #[error("Query error: {0}")]
     Query(String),
 
+    #[error("Table '{0}' not found")]
+    TableNotFound(String),
+
     #[error("Schema error: {0}")]
     Schema(String),
 

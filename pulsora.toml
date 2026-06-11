@@ -15,6 +15,16 @@ data_dir = "./data"
 write_buffer_size_mb = 64
 # Maximum number of open files - increase for better performance
 max_open_files = 1000
+# In-memory row buffer size before a columnar block is written
+buffer_size = 1000
+# How often the row buffer is flushed to storage (ms)
+flush_interval_ms = 1000
+# Write-Ahead Log: buffered rows survive a crash when enabled
+wal_enabled = true
+
+[query]
+# Query worker threads - 0 means auto-detect
+query_threads = 0
 
 [ingestion]
 # CSV ingestion performance tuning

@@ -32,8 +32,17 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{PulsoraError, Result};
 use crate::storage::StorageEngine;
+
+/// Map storage errors to HTTP statuses: a missing table is a client-side
+/// 404, everything else is a server error.
+fn storage_error_status(error: &PulsoraError) -> StatusCode {
+    match error {
+        PulsoraError::TableNotFound(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
 
 /// Application state shared across all request handlers
 #[derive(Clone)]
@@ -330,7 +339,7 @@ async fn query_data(
                     duration_ms = duration.as_millis(),
                     "💥 CSV Query error"
                 );
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(storage_error_status(&e));
             }
         }
     }
@@ -388,7 +397,7 @@ async fn query_data(
                     duration_ms = duration.as_millis(),
                     "💥 Arrow Query error"
                 );
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(storage_error_status(&e));
             }
         }
     }
@@ -529,7 +538,7 @@ async fn query_data(
                 duration_ms = duration.as_millis(),
                 "💥 Query error"
             );
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(storage_error_status(&e))
         }
     }
 }
@@ -559,7 +568,7 @@ async fn get_schema(
         Ok(schema) => Ok(Json(ApiResponse::success(schema))),
         Err(e) => {
             error!("Schema error: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(storage_error_status(&e))
         }
     }
 }
@@ -572,7 +581,7 @@ async fn get_row_by_id(
         Ok(row) => Ok(Json(ApiResponse::success(row))),
         Err(e) => {
             error!("Get row by ID error: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(storage_error_status(&e))
         }
     }
 }
