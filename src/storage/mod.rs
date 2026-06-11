@@ -960,7 +960,7 @@ impl StorageEngine {
                     _ => 0,
                 }
             };
-            results.sort_by(|a, b| (get_ts(a), get_id(a)).cmp(&(get_ts(b), get_id(b))));
+            results.sort_by_key(|a| (get_ts(a), get_id(a)));
         }
 
         // Re-apply limit/offset
