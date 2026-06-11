@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -628,19 +628,24 @@ async fn access_logging_middleware(
         version = ?version
     );
 
-    let _enter = span.enter();
+    span.in_scope(|| {
+        debug!(
+            correlation_id = %correlation_id,
+            method = %method,
+            uri = %uri,
+            content_length = content_length,
+            user_agent = user_agent,
+            "📥 Incoming request"
+        );
+    });
 
-    debug!(
-        correlation_id = %correlation_id,
-        method = %method,
-        uri = %uri,
-        content_length = content_length,
-        user_agent = user_agent,
-        "📥 Incoming request"
-    );
-
-    // Process the request
-    let response = next.run(request).await;
+    // Process the request, instrumented so the span is entered only while the
+    // future is actually being polled. NEVER hold a span.enter() guard across
+    // an .await: it corrupts the worker thread's span stack (concurrent
+    // requests stack into each other's log lines) until tracing-subscriber's
+    // registry hits its closed-span assertion — and with panic = "abort" that
+    // took the whole database down under concurrent load.
+    let response = next.run(request).instrument(span).await;
 
     let duration = start_time.elapsed();
     let status = response.status();
