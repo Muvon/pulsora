@@ -55,7 +55,7 @@ curl "http://localhost:8080/health"
 - **⚙️ Configurable**: TOML-based configuration with performance tuning options
 
 ## Architecture
-- **Storage Engine**: RocksDB with columnar blocks, per-row id refs (`table_hash:row_id`) and a per-block time index
+- **Storage Engine**: RocksDB with columnar blocks and block-level metadata only (time/id-range index + REPLACE override sets) — zero per-row index entries
 - **API Interface**: RESTful API supporting JSON, Arrow IPC, and Protobuf formats
 - **Compression**: Type-specific algorithms (Gorilla XOR, delta-of-delta, varint, dictionary)
 - **HTTP Server**: Axum/Tokio async server with CORS support and structured logging

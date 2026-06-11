@@ -12,42 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compact storage references and block keys.
+//! Compact block keys and per-block override sets.
 //!
-//! Per-row index entries dominate database size: every row stores its
-//! (block, row) location twice — once under its id-key and once under its
-//! time-key. The previous format embedded a ~54-byte string block id
-//! (`_block_{table}_{uuid}`) in every reference (~63 bytes per ref, ~158
-//! bytes of index per row — ~10x the compressed row data itself). This
-//! module replaces it with fixed-size binary encodings:
+//! There are NO per-row index entries: a row's identity and liveness are
+//! per-block facts. Each block carries its id range in the block index, and
+//! a (usually absent) override set lists the row positions superseded by
+//! later REPLACE ingests. Per-row entries would dominate database size —
+//! billions of rows but only hundreds of thousands of blocks — so all
+//! bookkeeping lives at block granularity:
 //!
 //! ```text
-//! ref value:       [0xFF][block: u64 BE][row: u32 BE]                  13 B
 //! block data key:  [hash: u32 BE]['D'][block: u64 BE]                  13 B
 //! block index key: [hash: u32 BE]['B'][min_ts: i64 BE][block: u64 BE]  21 B
-//! block index val: [block: u64 LE][min_ts: i64 LE][max_ts: i64 LE][rows: u32 LE]  28 B
+//! block index val: [block u64][min_ts i64][max_ts i64][rows u32][min_id u64][max_id u64] LE  44 B
+//! override key:    [hash: u32 BE]['O'][block: u64 BE]                  13 B
+//! override val:    concatenated [row: u32 LE] dead positions (merged, deduped on full merge)
 //! ```
+//!
+//! Override values are written with RocksDB `merge` (associative union), so
+//! concurrent REPLACE batches against the same old block cannot lose
+//! updates. Readers must treat the position list as a set — partial merges
+//! may leave duplicates.
 //!
 //! Keys stay byte-ordered (RocksDB applies prefix-delta compression inside
 //! SST blocks, so shared `[hash][ts]` prefixes cost almost nothing), and all
 //! parses are fixed-offset — no length prefixes, no string handling.
 //!
 //! Block ids come from a process-wide persisted sequence (key `_block_seq`),
-//! persisted BEFORE first use so a crash can never reuse an id.
+//! persisted BEFORE first use so a crash can never reuse an id. They are
+//! strictly increasing, so a larger block id always means a LATER write —
+//! point lookups scan candidate blocks newest-first and stop at the first
+//! live hit.
 
 use crate::error::{PulsoraError, Result};
 use rocksdb::DB;
 use std::sync::Mutex;
 
-/// Marker byte distinguishing row references from other values when scanning
-/// mixed keyspaces (e.g. get_table_count over id-keys).
-pub const REF_MARKER: u8 = 0xFF;
-
-/// Fixed reference length: marker + block u64 + row u32.
-pub const REF_LEN: usize = 13;
-
-/// Fixed block index value length: block + min_ts + max_ts + row_count.
-pub const BLOCK_INDEX_VALUE_LEN: usize = 28;
+/// Fixed block index value length:
+/// block + min_ts + max_ts + row_count + min_id + max_id.
+pub const BLOCK_INDEX_VALUE_LEN: usize = 44;
 
 const BLOCK_SEQ_KEY: &[u8] = b"_block_seq";
 
@@ -74,28 +77,6 @@ pub fn allocate_block_id(db: &DB) -> Result<u64> {
     Ok(next)
 }
 
-/// `[0xFF][block: u64 BE][row: u32 BE]`
-pub fn encode_ref(block: u64, row: u32) -> [u8; REF_LEN] {
-    let mut out = [0u8; REF_LEN];
-    out[0] = REF_MARKER;
-    out[1..9].copy_from_slice(&block.to_be_bytes());
-    out[9..13].copy_from_slice(&row.to_be_bytes());
-    out
-}
-
-/// Parse a row reference into (block, row).
-pub fn parse_ref(data: &[u8]) -> Result<(u64, u32)> {
-    if data.len() != REF_LEN || data[0] != REF_MARKER {
-        return Err(PulsoraError::Internal(format!(
-            "invalid row reference ({} bytes)",
-            data.len()
-        )));
-    }
-    let block = u64::from_be_bytes(data[1..9].try_into().unwrap());
-    let row = u32::from_be_bytes(data[9..13].try_into().unwrap());
-    Ok((block, row))
-}
-
 /// `[hash: u32 BE]['D'][block: u64 BE]` — where the serialized block lives.
 pub fn block_data_key(table_hash: u32, block: u64) -> [u8; 13] {
     let mut out = [0u8; 13];
@@ -115,35 +96,91 @@ pub fn block_index_key(table_hash: u32, min_ts: i64, block: u64) -> [u8; 21] {
     out
 }
 
-/// `[block: u64 LE][min_ts: i64 LE][max_ts: i64 LE][rows: u32 LE]`
-pub fn encode_block_index_value(
-    block: u64,
-    min_ts: i64,
-    max_ts: i64,
-    rows: u32,
-) -> [u8; BLOCK_INDEX_VALUE_LEN] {
+/// Block index metadata: time range, row count and id range of one block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMeta {
+    pub block: u64,
+    pub min_ts: i64,
+    pub max_ts: i64,
+    pub rows: u32,
+    pub min_id: u64,
+    pub max_id: u64,
+}
+
+/// `[block u64][min_ts i64][max_ts i64][rows u32][min_id u64][max_id u64]` LE
+pub fn encode_block_index_value(meta: &BlockMeta) -> [u8; BLOCK_INDEX_VALUE_LEN] {
     let mut out = [0u8; BLOCK_INDEX_VALUE_LEN];
-    out[0..8].copy_from_slice(&block.to_le_bytes());
-    out[8..16].copy_from_slice(&min_ts.to_le_bytes());
-    out[16..24].copy_from_slice(&max_ts.to_le_bytes());
-    out[24..28].copy_from_slice(&rows.to_le_bytes());
+    out[0..8].copy_from_slice(&meta.block.to_le_bytes());
+    out[8..16].copy_from_slice(&meta.min_ts.to_le_bytes());
+    out[16..24].copy_from_slice(&meta.max_ts.to_le_bytes());
+    out[24..28].copy_from_slice(&meta.rows.to_le_bytes());
+    out[28..36].copy_from_slice(&meta.min_id.to_le_bytes());
+    out[36..44].copy_from_slice(&meta.max_id.to_le_bytes());
     out
 }
 
-/// Parse a block index value into (block, min_ts, max_ts, row_count).
-pub fn parse_block_index_value(data: &[u8]) -> Result<(u64, i64, i64, u32)> {
+/// Parse a block index value.
+pub fn parse_block_index_value(data: &[u8]) -> Result<BlockMeta> {
     if data.len() != BLOCK_INDEX_VALUE_LEN {
         return Err(PulsoraError::Internal(format!(
             "invalid block index value ({} bytes)",
             data.len()
         )));
     }
-    Ok((
-        u64::from_le_bytes(data[0..8].try_into().unwrap()),
-        i64::from_le_bytes(data[8..16].try_into().unwrap()),
-        i64::from_le_bytes(data[16..24].try_into().unwrap()),
-        u32::from_le_bytes(data[24..28].try_into().unwrap()),
-    ))
+    Ok(BlockMeta {
+        block: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+        min_ts: i64::from_le_bytes(data[8..16].try_into().unwrap()),
+        max_ts: i64::from_le_bytes(data[16..24].try_into().unwrap()),
+        rows: u32::from_le_bytes(data[24..28].try_into().unwrap()),
+        min_id: u64::from_le_bytes(data[28..36].try_into().unwrap()),
+        max_id: u64::from_le_bytes(data[36..44].try_into().unwrap()),
+    })
+}
+
+/// `[hash: u32 BE]['O'][block: u64 BE]` — the block's override (dead-row) set.
+pub fn override_key(table_hash: u32, block: u64) -> [u8; 13] {
+    let mut out = [0u8; 13];
+    out[0..4].copy_from_slice(&table_hash.to_be_bytes());
+    out[4] = b'O';
+    out[5..13].copy_from_slice(&block.to_be_bytes());
+    out
+}
+
+/// Encode row positions as a mergeable override operand (`[row: u32 LE]`*).
+pub fn encode_override_positions(positions: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(positions.len() * 4);
+    for &pos in positions {
+        out.extend_from_slice(&pos.to_le_bytes());
+    }
+    out
+}
+
+/// Decode an override value into the set of dead row positions. Tolerates
+/// duplicates (concatenated merge operands) by virtue of returning a set.
+pub fn decode_override_positions(data: &[u8]) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::with_capacity(data.len() / 4);
+    for chunk in data.chunks_exact(4) {
+        out.insert(u32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    out
+}
+
+/// Associative merge for override values: union of dead positions.
+/// Registered as the database-wide merge operator — `merge()` is only ever
+/// issued against `'O'` keys, so the union semantics never touch other data.
+/// Deduplicates on every merge so values stay bounded by the block row count.
+pub fn override_merge(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &rocksdb::MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut set = existing.map(decode_override_positions).unwrap_or_default();
+    for op in operands {
+        set.extend(decode_override_positions(op));
+    }
+    let mut positions: Vec<u32> = set.into_iter().collect();
+    positions.sort_unstable();
+    Some(encode_override_positions(&positions))
 }
 
 #[cfg(test)]
@@ -151,24 +188,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ref_roundtrip() {
-        let encoded = encode_ref(987654321, 4242);
-        assert_eq!(encoded.len(), REF_LEN);
-        assert_eq!(parse_ref(&encoded).unwrap(), (987654321, 4242));
-    }
-
-    #[test]
-    fn ref_rejects_garbage() {
-        assert!(parse_ref(&[0u8; 13]).is_err());
-        assert!(parse_ref(&[0xFF, 1, 2]).is_err());
-    }
-
-    #[test]
     fn block_index_value_roundtrip() {
-        let encoded = encode_block_index_value(7, -5, 12345678901234, 999);
+        let meta = BlockMeta {
+            block: 7,
+            min_ts: -5,
+            max_ts: 12345678901234,
+            rows: 999,
+            min_id: 42,
+            max_id: u64::MAX - 1,
+        };
         assert_eq!(
-            parse_block_index_value(&encoded).unwrap(),
-            (7, -5, 12345678901234, 999)
+            parse_block_index_value(&encode_block_index_value(&meta)).unwrap(),
+            meta
         );
+    }
+
+    #[test]
+    fn block_index_value_rejects_old_format() {
+        assert!(parse_block_index_value(&[0u8; 28]).is_err());
+    }
+
+    #[test]
+    fn override_positions_roundtrip_dedup() {
+        let encoded = encode_override_positions(&[3, 1, 3, 7]);
+        let set = decode_override_positions(&encoded);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&1) && set.contains(&3) && set.contains(&7));
     }
 }

@@ -30,62 +30,67 @@ use crate::storage::columnar::ColumnBlock;
 use crate::storage::refs;
 use crate::storage::schema::Schema;
 
-/// Execute ID-based query to retrieve a single row by ID
+/// Retrieve a single row by id.
+///
+/// There are no per-row index entries: candidate blocks are those whose
+/// stored id range covers `id` (block index scan), checked NEWEST first —
+/// block ids are strictly increasing with write time, so the first
+/// non-overridden hit is the live copy.
 pub fn get_row_by_id(
     db: &Arc<DB>,
     table: &str,
     schema: &Schema,
     id: u64,
 ) -> Result<Option<HashMap<String, String>>> {
-    // Generate primary key for direct ID lookup
-    let id_key = generate_id_key(table, id);
+    let table_hash = calculate_table_hash(table);
+    // One snapshot covers the index scan AND the block/override reads: a
+    // concurrent REPLACE commits {new block + overrides} atomically, and a
+    // mixed view (old candidate set + new overrides) would serve nothing.
+    let snap = db.snapshot();
+    let mut candidates: Vec<refs::BlockMeta> =
+        scan_block_metadata(&snap, table_hash, i64::MIN, i64::MAX)
+            .into_iter()
+            .filter(|meta| meta.min_id <= id && id <= meta.max_id)
+            .collect();
+    candidates.sort_unstable_by(|a, b| b.block.cmp(&a.block));
 
-    // Use optimized read options for faster access
-    let mut read_opts = ReadOptions::default();
-    read_opts.set_verify_checksums(false); // Skip checksum verification for speed
-    read_opts.fill_cache(true); // Use block cache
-
-    // Try to find the row reference
-    match db.get_opt(&id_key, &read_opts)? {
-        Some(ref_data) => {
-            // Parse the reference data to get block ID and row index
-            let (block_id, row_idx) = refs::parse_ref(&ref_data)?;
-            let row_idx = row_idx as usize;
-
-            // Load the block with optimized read
-            let table_hash = calculate_table_hash(table);
-            let block_data = db
-                .get_opt(refs::block_data_key(table_hash, block_id), &read_opts)?
-                .ok_or_else(|| PulsoraError::Query("Block not found".to_string()))?;
-
-            // Deserialize the column block
-            let column_block = ColumnBlock::deserialize(&block_data)?;
-
-            // Convert to rows and return the specific row
-            let rows = column_block.to_rows(schema)?;
-
-            if row_idx < rows.len() {
-                Ok(Some(rows[row_idx].clone()))
-            } else {
-                Err(PulsoraError::Query("Row index out of bounds".to_string()))
-            }
+    for meta in candidates {
+        let Some(block) = fetch_block(&snap, table_hash, meta.block)? else {
+            continue;
+        };
+        let ids = block.get_id_values(schema)?;
+        // rposition: a block can hold the same id more than once (in-batch
+        // duplicates), with every position except the LAST self-overridden —
+        // only the last occurrence can be the live copy.
+        let Some(row_idx) = ids.iter().rposition(|&row_id| row_id == id) else {
+            continue;
+        };
+        let overrides = load_overrides(&snap, table_hash, meta.block)?;
+        if overrides.contains(&(row_idx as u32)) {
+            // Dead copy; any live copy sits in a NEWER block, which this
+            // newest-first scan has already visited — keep going only to
+            // honor older candidates of the same id (also dead) cleanly.
+            continue;
         }
-        None => Ok(None), // Row not found
+        let rows = block.to_rows(schema)?;
+        return Ok(rows.get(row_idx).cloned());
     }
+    Ok(None)
 }
 
-/// Generate primary key for ID-based lookup: [table_hash:u32][id:u64]
-fn generate_id_key(table: &str, id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(12); // 4 + 8 bytes
-
-    // Table hash (4 bytes) - big-endian for correct ordering
-    let table_hash = calculate_table_hash(table);
-    key.extend_from_slice(&table_hash.to_be_bytes());
-
-    // ID (8 bytes) - big-endian for correct ordering
-    key.extend_from_slice(&id.to_be_bytes());
-
-    key
+/// Load a block's override set (dead row positions). Absent key = all live.
+fn load_overrides(
+    snap: &rocksdb::Snapshot<'_>,
+    table_hash: u32,
+    block_id: u64,
+) -> Result<std::collections::HashSet<u32>> {
+    let mut opts = ReadOptions::default();
+    opts.set_verify_checksums(false);
+    opts.fill_cache(true);
+    match snap.get_opt(refs::override_key(table_hash, block_id), opts)? {
+        Some(data) => Ok(refs::decode_override_positions(&data)),
+        None => Ok(std::collections::HashSet::new()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,8 +119,12 @@ pub fn execute_query(
     let needed = offset.saturating_add(limit);
 
     let table_hash = calculate_table_hash(table);
+    // One snapshot for the whole query: the index scan and every block /
+    // override read must observe the same state, or a concurrent REPLACE
+    // (atomic {new block + overrides} batch) transiently hides the row.
+    let snap = db.snapshot();
     // Ascending by block min_ts from the index scan
-    let metadata = scan_block_metadata(db, table_hash, start_ts, end_ts);
+    let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
     let ts_col = schema.get_timestamp_column().map(str::to_string);
@@ -169,7 +178,7 @@ pub fn execute_query(
         let mut chunk_end = idx;
         let mut rows_estimate = 0usize;
         while chunk_end < metadata.len() && (chunk_end - idx) < chunk_size {
-            rows_estimate += metadata[chunk_end].3;
+            rows_estimate += metadata[chunk_end].rows as usize;
             chunk_end += 1;
             if rows_estimate >= needed.saturating_mul(2) {
                 break;
@@ -186,7 +195,7 @@ pub fn execute_query(
             let next_can_contribute = ts_col.is_some()
                 && chunk
                     .first()
-                    .map(|(_, min_ts, _, _)| *min_ts <= bound)
+                    .map(|meta| meta.min_ts <= bound)
                     .unwrap_or(false);
             if !next_can_contribute {
                 break;
@@ -197,14 +206,14 @@ pub fn execute_query(
         let per_block: Result<Vec<Vec<Value>>> = if use_parallel {
             chunk
                 .par_iter()
-                .map(|&(block_id, min_ts, max_ts, _)| {
+                .map(|meta| {
                     block_to_json(BlockQuery {
-                        db: db.as_ref(),
+                        snap: &snap,
                         schema,
                         table_hash,
-                        block_id,
-                        block_min_ts: min_ts,
-                        block_max_ts: max_ts,
+                        block_id: meta.block,
+                        block_min_ts: meta.min_ts,
+                        block_max_ts: meta.max_ts,
                         start_ts,
                         end_ts,
                     })
@@ -213,14 +222,14 @@ pub fn execute_query(
         } else {
             chunk
                 .iter()
-                .map(|&(block_id, min_ts, max_ts, _)| {
+                .map(|meta| {
                     block_to_json(BlockQuery {
-                        db: db.as_ref(),
+                        snap: &snap,
                         schema,
                         table_hash,
-                        block_id,
-                        block_min_ts: min_ts,
-                        block_max_ts: max_ts,
+                        block_id: meta.block,
+                        block_min_ts: meta.min_ts,
+                        block_max_ts: meta.max_ts,
                         start_ts,
                         end_ts,
                     })
@@ -362,15 +371,6 @@ pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Re
     Ok(Value::Object(json_obj))
 }
 
-/// Generate primary key from hash for ID-based lookup: [table_hash:u32][id:u64]
-/// Stack-allocated, no heap allocation in the hot validity-check loop.
-fn generate_id_key_from_hash(table_hash: u32, id: u64) -> [u8; 12] {
-    let mut key = [0u8; 12];
-    key[0..4].copy_from_slice(&table_hash.to_be_bytes());
-    key[4..12].copy_from_slice(&id.to_be_bytes());
-    key
-}
-
 /// Walk the block index for `table_hash` and collect metadata for every
 /// block whose stored \[min_ts, max_ts\] overlaps the requested range.
 ///
@@ -379,11 +379,11 @@ fn generate_id_key_from_hash(table_hash: u32, id: u64) -> [u8; 12] {
 /// in ascending `min_ts` order, and we can short-circuit as soon as a key's
 /// `min_ts` exceeds the requested `end_ts`.
 fn scan_block_metadata(
-    db: &DB,
+    snap: &rocksdb::Snapshot<'_>,
     table_hash: u32,
     start_ts: i64,
     end_ts: i64,
-) -> Vec<(u64, i64, i64, usize)> {
+) -> Vec<refs::BlockMeta> {
     let mut start_key = Vec::with_capacity(5);
     start_key.extend_from_slice(&table_hash.to_be_bytes());
     start_key.push(b'B');
@@ -393,8 +393,8 @@ fn scan_block_metadata(
     opts.fill_cache(true);
     opts.set_readahead_size(4 * 1024 * 1024);
 
-    let iter = db.iterator_opt(IteratorMode::From(&start_key, Direction::Forward), opts);
-    let mut result: Vec<(u64, i64, i64, usize)> = Vec::new();
+    let iter = snap.iterator_opt(IteratorMode::From(&start_key, Direction::Forward), opts);
+    let mut result: Vec<refs::BlockMeta> = Vec::new();
 
     for item in iter {
         let (key, value) = match item {
@@ -403,7 +403,7 @@ fn scan_block_metadata(
         };
         // Table-hash boundary FIRST: keys are hash-prefixed, so the first key
         // of another table ends this table's index range. Checking the 'B'
-        // marker first would `continue` past foreign tables' row keys and walk
+        // marker first would `continue` past foreign tables' keys and walk
         // the entire remaining keyspace on unbounded-end queries.
         if key.len() < 4 {
             continue;
@@ -412,8 +412,11 @@ fn scan_block_metadata(
         if key_table_hash != table_hash {
             break;
         }
+        // Markers sort 'B' < 'D' < 'O' and the scan starts at the 'B' range:
+        // the first non-'B' key ends it. `continue` here would walk the whole
+        // 'D' range, materializing every serialized block along the way.
         if key.len() < 5 || key[4] != b'B' {
-            continue;
+            break;
         }
 
         // The key carries the block's min_ts; once that's past end_ts, every
@@ -427,24 +430,22 @@ fn scan_block_metadata(
             }
         }
 
-        let Ok((block_id, block_min_ts, block_max_ts, row_count)) =
-            refs::parse_block_index_value(&value)
-        else {
+        let Ok(meta) = refs::parse_block_index_value(&value) else {
             continue;
         };
 
-        if block_max_ts < start_ts || block_min_ts > end_ts {
+        if meta.max_ts < start_ts || meta.min_ts > end_ts {
             continue;
         }
 
-        result.push((block_id, block_min_ts, block_max_ts, row_count as usize));
+        result.push(meta);
     }
 
     result
 }
 
 struct BlockQuery<'a> {
-    db: &'a DB,
+    snap: &'a rocksdb::Snapshot<'a>,
     schema: &'a Schema,
     table_hash: u32,
     block_id: u64,
@@ -455,11 +456,15 @@ struct BlockQuery<'a> {
 }
 
 /// Fetch and deserialize a block by its numeric id.
-fn fetch_block(db: &DB, table_hash: u32, block_id: u64) -> Result<Option<ColumnBlock>> {
+fn fetch_block(
+    snap: &rocksdb::Snapshot<'_>,
+    table_hash: u32,
+    block_id: u64,
+) -> Result<Option<ColumnBlock>> {
     let mut opts = ReadOptions::default();
     opts.set_verify_checksums(false);
     opts.fill_cache(true);
-    match db.get_opt(refs::block_data_key(table_hash, block_id), &opts)? {
+    match snap.get_opt(refs::block_data_key(table_hash, block_id), opts)? {
         Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),
         None => Ok(None),
     }
@@ -467,45 +472,24 @@ fn fetch_block(db: &DB, table_hash: u32, block_id: u64) -> Result<Option<ColumnB
 
 /// Compute the per-row validity bitmap for `block`.
 ///
-/// Every row has an `id_key` entry in RocksDB whose value points at the
-/// `(latest_block_id, latest_row_idx)` it currently lives at. On REPLACE,
-/// that pointer is overwritten to the newer block while the older block
-/// still physically holds the previous version of the row. A row in
-/// *this* block is the *live* one iff its `id_key` still points back at
-/// `(block_id, row_idx)` exactly.
-///
-/// This helper does **only** the validity check — no timestamp filter.
-/// The single ID-column decompression is cheap (one column, delta/varint),
-/// and the multi_get batches the id_key lookups into one RocksDB call.
-/// Returning a `Vec<bool>` keeps the bitmap usable both for index-style
-/// callers (`to_*_filtered`) and for inline-walk callers
-/// (`to_csv_query` / `to_arrow_query`) without re-running the multi_get.
+/// A row is live unless its position appears in the block's override set —
+/// the (usually absent) record of positions superseded by later REPLACE
+/// ingests. ONE point read per block, no per-row lookups: this is what makes
+/// large range scans cheap.
 fn block_validity_bitmap(
-    db: &DB,
+    snap: &rocksdb::Snapshot<'_>,
     table_hash: u32,
     block: &ColumnBlock,
-    schema: &Schema,
     block_id: u64,
 ) -> Result<Vec<bool>> {
     if block.row_count == 0 {
         return Ok(Vec::new());
     }
-
-    let ids = block.get_id_values(schema)?;
-    let mut keys: Vec<[u8; 12]> = Vec::with_capacity(block.row_count);
-    for &id in &ids {
-        keys.push(generate_id_key_from_hash(table_hash, id));
-    }
-    let ref_results = db.multi_get(&keys);
-
-    let mut valid = vec![false; block.row_count];
-    for (row_idx, result) in ref_results.into_iter().enumerate() {
-        if let Ok(Some(ref_data)) = result {
-            if let Ok((latest_block_id, latest_row_idx)) = refs::parse_ref(&ref_data) {
-                if latest_block_id == block_id && latest_row_idx as usize == row_idx {
-                    valid[row_idx] = true;
-                }
-            }
+    let overrides = load_overrides(snap, table_hash, block_id)?;
+    let mut valid = vec![true; block.row_count];
+    for pos in overrides {
+        if let Some(slot) = valid.get_mut(pos as usize) {
+            *slot = false;
         }
     }
     Ok(valid)
@@ -538,17 +522,11 @@ fn intersect_indices(
 ///   * **filtered path** — anything else; the surviving indices are
 ///     materialized once and passed to `to_json_filtered`.
 fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
-    let block = match fetch_block(query.db, query.table_hash, query.block_id)? {
+    let block = match fetch_block(query.snap, query.table_hash, query.block_id)? {
         Some(b) => b,
         None => return Ok(Vec::new()),
     };
-    let validity = block_validity_bitmap(
-        query.db,
-        query.table_hash,
-        &block,
-        query.schema,
-        query.block_id,
-    )?;
+    let validity = block_validity_bitmap(query.snap, query.table_hash, &block, query.block_id)?;
     let valid_count = validity.iter().filter(|&&v| v).count();
     if valid_count == 0 {
         return Ok(Vec::new());
@@ -582,17 +560,11 @@ fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
 ///      walks rows once with inline `validity[i] && ts in [start,end]`
 ///      checks, avoiding a separate `filter_by_timestamp` pre-scan.
 fn block_to_csv(query: BlockQuery<'_>) -> Result<String> {
-    let block = match fetch_block(query.db, query.table_hash, query.block_id)? {
+    let block = match fetch_block(query.snap, query.table_hash, query.block_id)? {
         Some(b) => b,
         None => return Ok(String::new()),
     };
-    let validity = block_validity_bitmap(
-        query.db,
-        query.table_hash,
-        &block,
-        query.schema,
-        query.block_id,
-    )?;
+    let validity = block_validity_bitmap(query.snap, query.table_hash, &block, query.block_id)?;
     let valid_count = validity.iter().filter(|&&v| v).count();
     if valid_count == 0 {
         return Ok(String::new());
@@ -614,17 +586,11 @@ fn block_to_csv(query: BlockQuery<'_>) -> Result<String> {
 /// Per-block Arrow serializer used by `execute_query_arrow`. Same
 /// three-path dispatch as `block_to_csv`.
 fn block_to_arrow(query: BlockQuery<'_>) -> Result<Option<RecordBatch>> {
-    let block = match fetch_block(query.db, query.table_hash, query.block_id)? {
+    let block = match fetch_block(query.snap, query.table_hash, query.block_id)? {
         Some(b) => b,
         None => return Ok(None),
     };
-    let validity = block_validity_bitmap(
-        query.db,
-        query.table_hash,
-        &block,
-        query.schema,
-        query.block_id,
-    )?;
+    let validity = block_validity_bitmap(query.snap, query.table_hash, &block, query.block_id)?;
     let valid_count = validity.iter().filter(|&&v| v).count();
     if valid_count == 0 {
         return Ok(None);
@@ -675,7 +641,9 @@ pub fn execute_query_csv(
     let offset = offset.unwrap_or(0);
 
     let table_hash = calculate_table_hash(table);
-    let metadata = scan_block_metadata(db, table_hash, start_ts, end_ts);
+    // One snapshot for the whole query — see execute_query for rationale.
+    let snap = db.snapshot();
+    let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
     let use_parallel = metadata.len() >= 4 && query_threads > 1;
@@ -683,14 +651,14 @@ pub fn execute_query_csv(
     let per_block: Result<Vec<String>> = if use_parallel {
         metadata
             .par_iter()
-            .map(|&(block_id, min_ts, max_ts, _)| {
+            .map(|meta| {
                 block_to_csv(BlockQuery {
-                    db: db.as_ref(),
+                    snap: &snap,
                     schema,
                     table_hash,
-                    block_id,
-                    block_min_ts: min_ts,
-                    block_max_ts: max_ts,
+                    block_id: meta.block,
+                    block_min_ts: meta.min_ts,
+                    block_max_ts: meta.max_ts,
                     start_ts,
                     end_ts,
                 })
@@ -699,14 +667,14 @@ pub fn execute_query_csv(
     } else {
         metadata
             .iter()
-            .map(|&(block_id, min_ts, max_ts, _)| {
+            .map(|meta| {
                 block_to_csv(BlockQuery {
-                    db: db.as_ref(),
+                    snap: &snap,
                     schema,
                     table_hash,
-                    block_id,
-                    block_min_ts: min_ts,
-                    block_max_ts: max_ts,
+                    block_id: meta.block,
+                    block_min_ts: meta.min_ts,
+                    block_max_ts: meta.max_ts,
                     start_ts,
                     end_ts,
                 })
@@ -763,7 +731,9 @@ pub fn execute_query_arrow(
     let offset = offset.unwrap_or(0);
 
     let table_hash = calculate_table_hash(table);
-    let metadata = scan_block_metadata(db, table_hash, start_ts, end_ts);
+    // One snapshot for the whole query — see execute_query for rationale.
+    let snap = db.snapshot();
+    let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
     let use_parallel = metadata.len() >= 4 && query_threads > 1;
@@ -771,14 +741,14 @@ pub fn execute_query_arrow(
     let per_block: Result<Vec<Option<RecordBatch>>> = if use_parallel {
         metadata
             .par_iter()
-            .map(|&(block_id, min_ts, max_ts, _)| {
+            .map(|meta| {
                 block_to_arrow(BlockQuery {
-                    db: db.as_ref(),
+                    snap: &snap,
                     schema,
                     table_hash,
-                    block_id,
-                    block_min_ts: min_ts,
-                    block_max_ts: max_ts,
+                    block_id: meta.block,
+                    block_min_ts: meta.min_ts,
+                    block_max_ts: meta.max_ts,
                     start_ts,
                     end_ts,
                 })
@@ -787,14 +757,14 @@ pub fn execute_query_arrow(
     } else {
         metadata
             .iter()
-            .map(|&(block_id, min_ts, max_ts, _)| {
+            .map(|meta| {
                 block_to_arrow(BlockQuery {
-                    db: db.as_ref(),
+                    snap: &snap,
                     schema,
                     table_hash,
-                    block_id,
-                    block_min_ts: min_ts,
-                    block_max_ts: max_ts,
+                    block_id: meta.block,
+                    block_min_ts: meta.min_ts,
+                    block_max_ts: meta.max_ts,
                     start_ts,
                     end_ts,
                 })

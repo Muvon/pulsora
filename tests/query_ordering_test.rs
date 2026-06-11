@@ -277,7 +277,7 @@ async fn test_limited_query_with_contiguous_block_boundaries() {
 }
 
 #[tokio::test]
-async fn test_row_references_are_compact() {
+async fn test_no_per_row_index_entries() {
     let (engine, _temp) = create_test_engine().await;
     let table = "compact_refs";
 
@@ -286,16 +286,20 @@ async fn test_row_references_are_compact() {
         .collect();
     ingest_block(&engine, table, &rows).await;
 
-    // Every per-row reference (under id-keys) must be the fixed 13-byte
-    // compact encoding — the previous string-block-id format cost ~63 bytes
-    // per reference and dominated database size.
-    let mut checked = 0;
+    // The whole point of the block-level design: NO per-row index entries.
+    // The only allowed entries are per-block ('B' index, 'D' data, 'O'
+    // overrides), schema/meta keys, and the block sequence counter.
+    let mut blocks = 0;
     for item in engine.db.iterator(rocksdb::IteratorMode::Start) {
-        let (key, value) = item.unwrap();
-        if key.len() == 12 && !value.is_empty() && value[0] == 0xFF {
-            assert_eq!(value.len(), 13, "row reference is not compact");
-            checked += 1;
+        let (key, _value) = item.unwrap();
+        // Per-block keys ('B'/'D'/'O') are 13 or 21 bytes and meta keys
+        // start with '_' — any other 12-byte key is a per-row entry.
+        if key.len() == 12 && key[0] != b'_' {
+            panic!("unexpected per-row index entry: {:?}", key);
+        }
+        if key.len() == 21 && key[4] == b'B' {
+            blocks += 1;
         }
     }
-    assert_eq!(checked, 50, "expected one compact id-key reference per row");
+    assert!(blocks >= 1, "expected at least one block index entry");
 }
