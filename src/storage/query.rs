@@ -52,7 +52,7 @@ pub fn get_row_by_id(
             .into_iter()
             .filter(|meta| meta.min_id <= id && id <= meta.max_id)
             .collect();
-    candidates.sort_unstable_by(|a, b| b.block.cmp(&a.block));
+    candidates.sort_unstable_by_key(|b| std::cmp::Reverse(b.block));
 
     for meta in candidates {
         let Some(block) = fetch_block(&snap, table_hash, meta.block)? else {
