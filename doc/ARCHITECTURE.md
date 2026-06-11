@@ -200,12 +200,13 @@ Storage Pattern:
 
 **Key Encoding Strategy:**
 ```
-Binary Key Format: [table_hash:u32][timestamp:i64][row_id:u64]
-Total: 20 bytes fixed-size for optimal performance
+Row reference: [table_hash:u32][row_id:u64]                     12 bytes → [0xFF][block_id][row_idx]
+Block index:   [table_hash:u32]['B'][min_ts:i64][block_id:u64]  one per block, drives range queries
+Block data:    [table_hash:u32]['D'][block_id:u64]              compressed columnar block
 ```
 
 This encoding ensures:
-- Time-ordered storage for efficient range queries
+- Time-range queries resolve via the per-block time index, not per-row keys
 - Table isolation via FNV-1a hash prefix
 - Fixed-size keys for better RocksDB performance
 - Unique row identification with collision detection

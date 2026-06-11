@@ -27,6 +27,7 @@ use crate::error::{PulsoraError, Result};
 use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
 use crate::storage::id_manager::{IdManager, IdManagerRegistry, RowId};
+use crate::storage::refs;
 use crate::storage::schema::Schema;
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType as ArrowDataType;
@@ -191,7 +192,7 @@ pub fn process_csv_bulk(
     csv_data: &str,
     schema: &Schema,
     id_manager: &Arc<IdManager>,
-) -> Result<(ColumnBlock, Vec<u64>, i64, i64, Option<Vec<i64>>)> {
+) -> Result<(ColumnBlock, Vec<u64>, i64, i64)> {
     let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
     let headers = reader.headers()?.clone();
 
@@ -351,7 +352,6 @@ pub fn process_csv_bulk(
             Vec::new(),
             0,
             0,
-            None,
         ));
     }
 
@@ -389,12 +389,6 @@ pub fn process_csv_bulk(
         );
     }
 
-    let ts_values = if let Some(ts_name) = ts_col_name {
-        ts_cols.remove(ts_name)
-    } else {
-        None
-    };
-
     Ok((
         ColumnBlock {
             row_count,
@@ -404,7 +398,6 @@ pub fn process_csv_bulk(
         id_col_vals,
         min_ts,
         max_ts,
-        ts_values,
     ))
 }
 
@@ -415,71 +408,38 @@ pub fn write_column_block_to_rocksdb(
     ids: &[u64],
     min_timestamp: i64,
     max_timestamp: i64,
-    timestamps: Option<&[i64]>,
 ) -> Result<u64> {
     let serialized_block = column_block.serialize()?;
     let mut batch = WriteBatch::default();
 
-    // Generate a unique block ID for this chunk
-    let block_id = format!("_block_{}_{}", table, uuid::Uuid::new_v4());
-
-    // Store the compressed block ONCE with the block ID
-    batch.put(block_id.as_bytes(), &serialized_block);
-
-    // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
-    // Block index key: [table_hash:u32][B][min_timestamp:i64][block_id]
-    let mut block_index_key = Vec::with_capacity(13 + block_id.len());
+    // Compact numeric block id — embedded in every row reference, so it must
+    // stay small (see storage::refs for the full format rationale)
     let table_hash = calculate_table_hash(table);
-    block_index_key.extend_from_slice(&table_hash.to_be_bytes());
-    block_index_key.push(b'B'); // Block marker
-    block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
-    block_index_key.extend_from_slice(block_id.as_bytes());
+    let block_id = refs::allocate_block_id(db)?;
 
-    // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
-    let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
-    block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-    block_index_value.extend_from_slice(block_id.as_bytes());
-    block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&(column_block.row_count as u32).to_le_bytes());
+    // Store the compressed block ONCE under its data key
+    batch.put(
+        refs::block_data_key(table_hash, block_id),
+        &serialized_block,
+    );
 
-    batch.put(&block_index_key, &block_index_value);
+    // Block-level index for fast range queries
+    batch.put(
+        refs::block_index_key(table_hash, min_timestamp, block_id),
+        refs::encode_block_index_value(
+            block_id,
+            min_timestamp,
+            max_timestamp,
+            column_block.row_count as u32,
+        ),
+    );
 
-    // For each row, store references using dual key strategy
-    // Note: We don't have the full row map here, so we can't easily generate time_key for every row
-    // UNLESS we extracted timestamps separately.
-    // For now, we will skip per-row time index if we don't have the timestamp column easily accessible.
-    // BUT, we need it for queries.
-    // Solution: We should have extracted timestamps alongside IDs.
-
-    // Let's assume we only index by ID for now in this fast path, OR we need to pass timestamps too.
-    // For correctness, we should pass timestamps.
-
+    // Per-row reference: id_key → (block, row). Time-range queries resolve
+    // through the block index above; no per-row time key exists.
     for (row_idx, &id) in ids.iter().enumerate() {
-        // Create reference data: [marker][block_id_len][block_id][row_idx]
-        let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
-        ref_data.push(0xFF); // Reference marker
-        ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-        ref_data.extend_from_slice(block_id.as_bytes());
-        ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
-
-        // Primary key: [table_hash:u32][id:u64]
+        let ref_data = refs::encode_ref(block_id, row_idx as u32);
         let id_key = generate_id_key(table, id);
-        batch.put(&id_key, &ref_data);
-
-        // Time index key: [table_hash:u32][timestamp:i64][id:u64]
-        // Only if we have timestamps
-        if let Some(ts_list) = timestamps {
-            if row_idx < ts_list.len() {
-                let ts = ts_list[row_idx];
-                let mut time_key = Vec::with_capacity(20);
-                let table_hash = calculate_table_hash(table);
-                time_key.extend_from_slice(&table_hash.to_be_bytes());
-                time_key.extend_from_slice(&ts.to_be_bytes());
-                time_key.extend_from_slice(&id.to_be_bytes());
-                batch.put(&time_key, &ref_data);
-            }
-        }
+        batch.put(&id_key, ref_data);
     }
 
     db.write(batch)?;
@@ -507,12 +467,18 @@ pub fn write_batch_to_rocksdb(
 
     let mut batch = WriteBatch::default();
 
-    // Generate a unique block ID for this chunk
     let timestamp = Utc::now().timestamp_millis();
-    let block_id = format!("_block_{}_{}", table, uuid::Uuid::new_v4());
 
-    // Store the compressed block ONCE with the block ID
-    batch.put(block_id.as_bytes(), &serialized_block);
+    // Compact numeric block id — embedded in every row reference, so it must
+    // stay small (see storage::refs for the full format rationale)
+    let table_hash = calculate_table_hash(table);
+    let block_id = refs::allocate_block_id(db)?;
+
+    // Store the compressed block ONCE under its data key
+    batch.put(
+        refs::block_data_key(table_hash, block_id),
+        &serialized_block,
+    );
 
     // Get min and max timestamps from this block for range indexing
     let mut min_timestamp = i64::MAX;
@@ -535,43 +501,18 @@ pub fn write_batch_to_rocksdb(
         max_timestamp = timestamp;
     }
 
-    // CRITICAL OPTIMIZATION: Store block-level index for fast range queries
-    // Block index key: [table_hash:u32][B][min_timestamp:i64][block_id]
-    // Appending block_id ensures uniqueness even if timestamps collide
-    let mut block_index_key = Vec::with_capacity(13 + block_id.len());
-    let table_hash = calculate_table_hash(table);
-    block_index_key.extend_from_slice(&table_hash.to_be_bytes());
-    block_index_key.push(b'B'); // Block marker to distinguish from row keys
-    block_index_key.extend_from_slice(&min_timestamp.to_be_bytes());
-    block_index_key.extend_from_slice(block_id.as_bytes());
+    // Block-level index for fast range queries
+    batch.put(
+        refs::block_index_key(table_hash, min_timestamp, block_id),
+        refs::encode_block_index_value(block_id, min_timestamp, max_timestamp, rows.len() as u32),
+    );
 
-    // Block index value: [block_id_len][block_id][min_ts][max_ts][row_count]
-    let mut block_index_value = Vec::with_capacity(4 + block_id.len() + 16 + 4);
-    block_index_value.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-    block_index_value.extend_from_slice(block_id.as_bytes());
-    block_index_value.extend_from_slice(&min_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&max_timestamp.to_le_bytes());
-    block_index_value.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-
-    batch.put(&block_index_key, &block_index_value);
-
-    // For each row, store references using dual key strategy
-    for (row_idx, (id, row)) in rows.iter().enumerate() {
-        // Create reference data: [marker][block_id_len][block_id][row_idx]
-        let mut ref_data = Vec::with_capacity(1 + 4 + block_id.len() + 4);
-        ref_data.push(0xFF); // Reference marker
-        ref_data.extend_from_slice(&(block_id.len() as u32).to_le_bytes());
-        ref_data.extend_from_slice(block_id.as_bytes());
-        ref_data.extend_from_slice(&(row_idx as u32).to_le_bytes());
-
-        // Primary key: [table_hash:u32][id:u64] - for direct ID lookups
-        // For REPLACE semantics, we simply overwrite the existing key
+    // Per-row reference: id_key → (block, row), overwritten on REPLACE.
+    // Time-range queries resolve through the block index above.
+    for (row_idx, (id, _)) in rows.iter().enumerate() {
+        let ref_data = refs::encode_ref(block_id, row_idx as u32);
         let id_key = generate_id_key(table, *id);
-        batch.put(&id_key, &ref_data);
-
-        // Time index key: [table_hash:u32][timestamp:i64][id:u64] - for time-range queries
-        let time_key = generate_time_key(table, schema, row, *id)?;
-        batch.put(&time_key, &ref_data);
+        batch.put(&id_key, ref_data);
     }
 
     db.write(batch)?;
@@ -671,37 +612,6 @@ fn generate_id_key(table: &str, id: u64) -> Vec<u8> {
     key.extend_from_slice(&id.to_be_bytes());
 
     key
-}
-
-/// Generate time index key: [table_hash:u32][timestamp:i64][id:u64]
-fn generate_time_key(
-    table: &str,
-    schema: &Schema,
-    row: &HashMap<String, String>,
-    id: u64,
-) -> Result<Vec<u8>> {
-    let mut key = Vec::with_capacity(20); // 4 + 8 + 8 bytes
-
-    // Table hash (4 bytes) - big-endian for correct ordering
-    let table_hash = calculate_table_hash(table);
-    key.extend_from_slice(&table_hash.to_be_bytes());
-
-    // Timestamp (8 bytes) - big-endian for correct ordering
-    let timestamp = if let Some(ts_col) = schema.get_timestamp_column() {
-        if let Some(ts_value) = row.get(ts_col) {
-            parse_timestamp(ts_value)?
-        } else {
-            Utc::now().timestamp_millis()
-        }
-    } else {
-        Utc::now().timestamp_millis()
-    };
-    key.extend_from_slice(&timestamp.to_be_bytes());
-
-    // ID (8 bytes) - for uniqueness and ordering
-    key.extend_from_slice(&id.to_be_bytes());
-
-    Ok(key)
 }
 
 pub fn parse_timestamp(value: &str) -> Result<i64> {

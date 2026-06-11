@@ -40,6 +40,7 @@ pub mod encoding;
 pub mod id_manager;
 pub mod ingestion;
 pub mod query;
+pub mod refs;
 pub mod schema;
 pub mod wal;
 
@@ -499,7 +500,6 @@ impl StorageEngine {
 
                 // Handle IDs
                 let mut ids = Vec::with_capacity(row_count);
-                let mut timestamps = Vec::with_capacity(row_count);
                 let mut min_ts = i64::MAX;
                 let mut max_ts = i64::MIN;
 
@@ -576,7 +576,6 @@ impl StorageEngine {
                             } else {
                                 arr.value(i)
                             };
-                            timestamps.push(ts);
                             min_ts = min_ts.min(ts);
                             max_ts = max_ts.max(ts);
                         }
@@ -588,19 +587,16 @@ impl StorageEngine {
                                 ingestion::parse_timestamp(arr.value(i))
                                     .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
                             };
-                            timestamps.push(ts);
                             min_ts = min_ts.min(ts);
                             max_ts = max_ts.max(ts);
                         }
                     } else {
                         let now = chrono::Utc::now().timestamp_millis();
-                        timestamps.resize(row_count, now);
                         min_ts = now;
                         max_ts = now;
                     }
                 } else {
                     let now = chrono::Utc::now().timestamp_millis();
-                    timestamps.resize(row_count, now);
                     min_ts = now;
                     max_ts = now;
                 }
@@ -615,7 +611,6 @@ impl StorageEngine {
                     &ids,
                     min_ts,
                     max_ts,
-                    Some(&timestamps),
                 )?;
             } else {
                 // SLOW PATH: Convert to rows and use buffer
@@ -698,12 +693,11 @@ impl StorageEngine {
             let schema_clone = schema.clone();
             let id_manager_clone = id_manager.clone();
 
-            let (column_block, ids, min_ts, max_ts, timestamps) =
-                tokio::task::spawn_blocking(move || {
-                    ingestion::process_csv_bulk(&csv_data, &schema_clone, &id_manager_clone)
-                })
-                .await
-                .map_err(|e| PulsoraError::Internal(e.to_string()))??;
+            let (column_block, ids, min_ts, max_ts) = tokio::task::spawn_blocking(move || {
+                ingestion::process_csv_bulk(&csv_data, &schema_clone, &id_manager_clone)
+            })
+            .await
+            .map_err(|e| PulsoraError::Internal(e.to_string()))??;
 
             let row_count = column_block.row_count as u64;
             if row_count > 0 {
@@ -715,7 +709,6 @@ impl StorageEngine {
                     &ids,
                     min_ts,
                     max_ts,
-                    timestamps.as_deref(),
                 )?;
             }
 
@@ -786,7 +779,7 @@ impl StorageEngine {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
 
         // Calculate limit for DB query to ensure we get enough data for offset + limit
         // We don't pass offset to DB query because we need to merge with buffer first
@@ -874,23 +867,28 @@ impl StorageEngine {
         // Ideally we should re-sort by timestamp if it's a time-series query.
         let mut results: Vec<serde_json::Value> = merged_map.into_values().collect();
 
-        // Sort by timestamp if possible
+        // Sort in TOTAL order (ts, id): the merge map above iterates in
+        // arbitrary order, and a ts-only sort leaves same-second rows in
+        // nondeterministic relative order — offset pagination would then
+        // drop/duplicate tied rows across requests.
         if let Some(ts_col) = schema.get_timestamp_column() {
-            results.sort_by(|a, b| {
-                let get_ts = |v: &serde_json::Value| -> i64 {
-                    match v.get(ts_col) {
-                        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
-                        Some(serde_json::Value::String(s)) => {
-                            ingestion::parse_timestamp(s).unwrap_or(0)
-                        }
-                        _ => 0,
+            let get_id = |v: &serde_json::Value| -> u64 {
+                match v.get(id_col) {
+                    Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+                    Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+                    _ => 0,
+                }
+            };
+            let get_ts = |v: &serde_json::Value| -> i64 {
+                match v.get(ts_col) {
+                    Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+                    Some(serde_json::Value::String(s)) => {
+                        ingestion::parse_timestamp(s).unwrap_or(0)
                     }
-                };
-
-                let ts_a = get_ts(a);
-                let ts_b = get_ts(b);
-                ts_a.cmp(&ts_b)
-            });
+                    _ => 0,
+                }
+            };
+            results.sort_by(|a, b| (get_ts(a), get_id(a)).cmp(&(get_ts(b), get_id(b))));
         }
 
         // Re-apply limit/offset
@@ -928,7 +926,7 @@ impl StorageEngine {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
 
         // Use optimized CSV query execution
         let csv_chunks = query::execute_query_csv(
@@ -976,7 +974,7 @@ impl StorageEngine {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
 
         // Use optimized Arrow query execution
         let batches = query::execute_query_arrow(
@@ -1020,15 +1018,15 @@ impl StorageEngine {
         // Check if table exists by checking schema
         let schemas = self.schemas.read().await;
         if schemas.get_schema(table).is_none() {
-            return Err(PulsoraError::Query(format!("Table '{}' not found", table)));
+            return Err(PulsoraError::TableNotFound(table.to_string()));
         }
         drop(schemas);
 
-        // Count rows by iterating through table keys.
-        // Each row writes both an id_key (12 bytes: [hash:u32][id:u64]) AND a
-        // time_key (20 bytes: [hash:u32][ts:i64][id:u64]) sharing the same
-        // 0xFF-prefixed reference value. Counting both would double-count, so
-        // restrict the count to id_keys.
+        // Count rows by iterating through table keys. Only id_keys (12 bytes:
+        // [hash:u32][id:u64] with 0xFF-prefixed ref value) count as rows — the
+        // same prefix also holds block index/data keys, and databases written
+        // before the per-row time index was removed may still carry 20-byte
+        // time keys; the length check skips all of them.
         let table_hash = calculate_table_hash(table);
         let mut db_count = 0u64;
         let mut buffered_ids: HashSet<u64> = HashSet::new();
@@ -1087,7 +1085,7 @@ impl StorageEngine {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
-            .ok_or_else(|| PulsoraError::Schema(format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
 
         Ok(serde_json::to_value(schema)?)
     }
@@ -1100,7 +1098,7 @@ impl StorageEngine {
         let schemas = self.schemas.read().await;
         let schema = schemas
             .get_schema(table)
-            .ok_or_else(|| PulsoraError::Query(format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
 
         // Latest-write-wins: a row in the in-memory buffer is newer than (or
         // equal to) any DB-resident copy. Check the buffer first so freshly
