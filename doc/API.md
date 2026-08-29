@@ -192,7 +192,7 @@ Returns the total number of rows in the specified table.
 
 ### Get Row by ID
 
-**GET** `/tables/{table_name}/rows/{id}`
+**GET** `/tables/{table_name}/row/{id}`
 
 Retrieves a specific row by its unique ID.
 
@@ -406,7 +406,7 @@ curl "http://localhost:8080/tables/stocks/schema"
 curl "http://localhost:8080/tables/stocks/count"
 
 # 6. Get specific row
-curl "http://localhost:8080/tables/stocks/rows/1"
+curl "http://localhost:8080/tables/stocks/row/1"
 
 # 7. List all tables
 curl "http://localhost:8080/tables"

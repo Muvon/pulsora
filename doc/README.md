@@ -86,7 +86,7 @@ All documentation follows these principles:
 - `GET /tables/{name}/query` - Time-range queries with pagination
 - `GET /tables/{name}/schema` - Schema information and column definitions
 - `GET /tables/{name}/count` - Total row count for table
-- `GET /tables/{name}/rows/{id}` - Retrieve specific row by ID
+- `GET /tables/{name}/row/{id}` - Retrieve specific row by ID
 
 ### Configuration Sections
 - `[server]` - HTTP server settings (host, port, body limits)

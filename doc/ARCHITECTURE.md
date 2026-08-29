@@ -84,7 +84,7 @@ Pulsora is a high-performance time series database built with Rust, designed for
 - `GET /tables/{name}/query` - Time-range queries (supports JSON, Arrow, Protobuf, CSV output)
 - `GET /tables/{name}/schema` - Schema information
 - `GET /tables/{name}/count` - Row count
-- `GET /tables/{name}/rows/{id}` - Get row by ID
+- `GET /tables/{name}/row/{id}` - Get row by ID
 
 ### 2. Storage Engine
 
