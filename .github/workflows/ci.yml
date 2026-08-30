@@ -17,7 +17,19 @@ jobs:
       # ONNX runtime issues — test without default features
       test-script: 'cargo test --verbose --no-default-features'
       doc: false
-      tarpaulin-args: '--verbose --no-default-features --workspace --timeout 120 --out xml'
+      # Shared tarpaulin job uploads to Codecov without a token, so nothing
+      # ever lands. Replaced by the llvm-cov `coverage` job below.
+      coverage: false
+
+  coverage:
+    name: Coverage Report
+    permissions:
+      contents: write # push the badge JSON to the `badges` branch
+    uses: muvon/ci-workflow/.github/workflows/rust-coverage.yml@master
+    with:
+      feature-flags: '--no-default-features'
+      setup-protoc: true
+      tools: 'ripgrep,ast-grep'
 
   brief:
     uses: muvon/ci-workflow/.github/workflows/brief.yml@master

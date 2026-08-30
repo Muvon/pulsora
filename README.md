@@ -3,6 +3,7 @@
 > High-performance time-series database with columnar storage and type-specific compression
 
 [![CI](https://github.com/Muvon/pulsora/actions/workflows/ci.yml/badge.svg)](https://github.com/Muvon/pulsora/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmuvon%2Fpulsora%2Fbadges%2Fcoverage.json&style=flat-square)](https://github.com/Muvon/pulsora/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 Pulsora ingests market data and time-ordered datasets over a plain REST API —
