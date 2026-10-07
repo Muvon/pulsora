@@ -2,6 +2,7 @@
 name = "pulsora"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.99.0"
 description = "High-performance time series database optimized for market data"
 authors = ["Muvon Un Limited <contact@muvon.io>"]
 
