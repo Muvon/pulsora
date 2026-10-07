@@ -546,13 +546,9 @@ async fn query_data(
 async fn get_table_count(
     Path(table): Path<String>,
     State(state): State<AppState>,
-) -> Json<ApiResponse<HashMap<String, u64>>> {
-    match state.storage.get_table_count(&table).await {
-        Ok(count) => {
-            let mut result = HashMap::new();
-            result.insert("count".to_string(), count);
-            Json(ApiResponse::success(result))
-        }
+) -> Json<ApiResponse<crate::storage::TableStats>> {
+    match state.storage.get_table_stats(&table).await {
+        Ok(stats) => Json(ApiResponse::success(stats)),
         Err(e) => {
             error!("Failed to get table count: {}", e);
             Json(ApiResponse::error(e.to_string()))

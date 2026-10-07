@@ -136,3 +136,45 @@ async fn test_list_tables() {
     let tables = body.get("data").unwrap().as_array().unwrap();
     assert!(tables.iter().any(|t| t.as_str().unwrap() == table));
 }
+
+#[tokio::test]
+async fn test_count_includes_buffer_and_additive_timestamp_bounds() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    let app = create_app(config).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/count_test/ingest")
+                .header("Content-Type", "text/csv")
+                .body(Body::from(
+                    "id,timestamp,value\n1,1704067200000,10\n2,1704067201000,20\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/count_test/count")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["count"], 2);
+    assert_eq!(json["data"]["min_ts"], 1704067200000i64);
+    assert_eq!(json["data"]["max_ts"], 1704067201000i64);
+}

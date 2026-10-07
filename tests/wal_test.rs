@@ -14,6 +14,11 @@
 
 use pulsora::config::Config;
 use pulsora::storage::StorageEngine;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 use tempfile::TempDir;
 
 async fn create_test_engine(wal_enabled: bool) -> (StorageEngine, TempDir) {
@@ -42,8 +47,6 @@ async fn test_wal_durability_on_crash() {
     assert_eq!(results.len(), 1);
 
     // 3. Simulate "Crash" by dropping engine and creating new one on same dir
-    // Wait for async WAL write to complete
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     drop(engine);
 
     // 4. Restart engine
@@ -185,8 +188,6 @@ async fn test_long_flush_interval_rows_survive_restart() {
         .unwrap();
     assert_eq!(row["value"].as_i64().unwrap(), 11);
 
-    // The WAL writer is a background thread; give it time to fsync.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     drop(engine);
 
     let engine = StorageEngine::new(&long_interval_config(temp_dir.path()))
@@ -222,4 +223,120 @@ async fn test_long_flush_interval_rows_survive_restart() {
         .await
         .unwrap();
     assert_eq!(a.len(), 2);
+}
+
+/// A real `pulsora` process; dropping it SIGKILLs it, as a container stop does.
+struct Server(Child);
+
+impl Server {
+    fn start(config_path: &Path, port: u16) -> Self {
+        let server = Server(
+            Command::new(env!("CARGO_BIN_EXE_pulsora"))
+                .arg("-c")
+                .arg(config_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        for _ in 0..200 {
+            if http(port, "GET", "/health", "").is_ok() {
+                return server;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("pulsora did not start listening on {}", port);
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.0.kill().unwrap();
+        self.0.wait().unwrap();
+    }
+}
+
+/// One HTTP/1.1 round trip; the crate has no HTTP client and this test must
+/// talk to a real server process.
+fn http(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> std::io::Result<(u16, serde_json::Value)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/csv\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    Ok((status, serde_json::from_str(body).unwrap()))
+}
+
+/// Containers stop Pulsora with SIGKILL (it does not handle SIGTERM), so a
+/// row is only safe if it is on disk when its ingest is acknowledged — not
+/// after the next flush or the WAL writer catching up. Concurrent clients
+/// outpace the per-table WAL writer, so the kill lands while it has a backlog.
+#[test]
+fn test_acknowledged_rows_survive_sigkill() {
+    const CLIENTS: i64 = 8;
+    const BATCHES: i64 = 10;
+    const ROWS_PER_BATCH: i64 = 50;
+    let tables = ["kill_a", "kill_b"];
+
+    let temp_dir = TempDir::new().unwrap();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut config = long_interval_config(&temp_dir.path().join("data"));
+    config.server.host = "127.0.0.1".to_string();
+    config.server.port = port;
+    let config_path = temp_dir.path().join("pulsora.toml");
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+
+    let server = Server::start(&config_path, port);
+    std::thread::scope(|scope| {
+        for client in 0..CLIENTS {
+            scope.spawn(move || {
+                for batch in 0..BATCHES {
+                    for table in tables {
+                        let first = (client * BATCHES + batch) * ROWS_PER_BATCH;
+                        let mut csv = String::from("id,timestamp,value\n");
+                        for id in first + 1..=first + ROWS_PER_BATCH {
+                            csv.push_str(&format!("{},{},{}\n", id, 1704067200000i64 + id, id));
+                        }
+                        let (status, _) =
+                            http(port, "POST", &format!("/tables/{}/ingest", table), &csv).unwrap();
+                        assert_eq!(status, 200);
+                    }
+                }
+            });
+        }
+    });
+    drop(server);
+
+    let server = Server::start(&config_path, port);
+    for table in tables {
+        let (status, body) = http(
+            port,
+            "GET",
+            &format!("/tables/{}/query?limit=10000", table),
+            "",
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["data"].as_array().unwrap().len() as i64,
+            CLIENTS * BATCHES * ROWS_PER_BATCH,
+            "{}: every acknowledged row recovered",
+            table
+        );
+    }
+    drop(server);
 }

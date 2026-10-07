@@ -177,14 +177,16 @@ curl "http://localhost:8080/tables/market_data/query?limit=100&offset=0"
 
 **GET** `/tables/{table_name}/count`
 
-Returns the total number of rows in the specified table.
+Returns the exact live row count, including buffered rows, without flushing. `min_ts` and `max_ts` are conservative timestamp bounds in milliseconds since the UNIX epoch (both `null` when empty or no timestamp is available). Bounds include overlapping blocks and may include overridden rows until compaction; they are not exact live-row extrema.
 
 **Response:**
 ```json
 {
   "success": true,
   "data": {
-    "count": 1500000
+    "count": 1500000,
+    "min_ts": 1704067200000,
+    "max_ts": 1704153600000
   },
   "error": null
 }

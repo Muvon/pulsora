@@ -124,3 +124,223 @@ async fn test_reads_after_reopen_see_all_blocks() {
     assert_eq!(value_of(&engine, table, 30).await, Some(1));
     assert_eq!(value_of(&engine, table, 60).await, Some(3));
 }
+
+#[tokio::test]
+async fn test_count_without_flush_is_exact_for_sparse_ids_and_replacements() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    let engine = StorageEngine::new(&config).await.unwrap();
+    engine
+        .ingest_csv(
+            "sparse",
+            format!(
+                "id,timestamp,value\n1,{BASE_TS},10\n100,{},20\n",
+                BASE_TS + 10000
+            ),
+        )
+        .await
+        .unwrap();
+    engine.flush_table("sparse").await.unwrap();
+    // The second block starts later but ends earlier than the first.
+    engine
+        .ingest_csv(
+            "sparse",
+            format!("id,timestamp,value\n101,{},30\n", BASE_TS + 1000),
+        )
+        .await
+        .unwrap();
+    engine.flush_table("sparse").await.unwrap();
+    let disk_stats = engine.get_table_stats("sparse").await.unwrap();
+    assert_eq!(disk_stats.max_ts, Some(BASE_TS + 10000));
+    // Protobuf uses the buffering path even when the schema already exists;
+    // CSV's established-schema path intentionally writes directly to disk.
+    use prost::Message;
+    use pulsora::storage::ingestion::{parse_csv, ProtoBatch, ProtoRow};
+    let rows = parse_csv(&format!(
+        "id,timestamp,value\n1,{},40\n50,{},50\n50,{},60\n",
+        BASE_TS - 1000,
+        BASE_TS + 20000,
+        BASE_TS + 20000,
+    ))
+    .unwrap()
+    .into_iter()
+    .map(|values| ProtoRow { values })
+    .collect();
+    engine
+        .ingest_protobuf("sparse", ProtoBatch { rows }.encode_to_vec())
+        .await
+        .unwrap();
+    assert_eq!(engine.buffers.read().await["sparse"].rows.len(), 2);
+    assert_eq!(block_count(&engine, "sparse"), 2);
+    let stats = engine.get_table_stats("sparse").await.unwrap();
+    assert_eq!(stats.count, 4);
+    assert_eq!(stats.min_ts, Some(BASE_TS - 1000));
+    assert_eq!(stats.max_ts, Some(BASE_TS + 20000));
+    assert_eq!(engine.get_table_count("sparse").await.unwrap(), 4);
+    assert_eq!(engine.buffers.read().await["sparse"].rows.len(), 2);
+    assert_eq!(block_count(&engine, "sparse"), 2);
+    assert_eq!(value_of(&engine, "sparse", 50).await, Some(60));
+    engine.flush_table("sparse").await.unwrap();
+    assert_eq!(engine.get_table_count("sparse").await.unwrap(), 4);
+    assert!(engine.get_table_stats("missing").await.is_err());
+}
+
+fn block_count(engine: &StorageEngine, table: &str) -> usize {
+    let mut prefix = pulsora::storage::calculate_table_hash(table)
+        .to_be_bytes()
+        .to_vec();
+    prefix.push(b'B');
+    engine
+        .db
+        .prefix_iterator(&prefix)
+        .take_while(|entry| entry.as_ref().unwrap().0.starts_with(&prefix))
+        .count()
+}
+
+#[tokio::test]
+async fn test_compaction_preserves_old_data_replacements_snapshots_and_reopen() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    let engine = StorageEngine::new(&config).await.unwrap();
+    write_block(&engine, "compact", 1, 3, 10).await;
+    write_block(&engine, "compact", 1, 1, 20).await;
+    write_block(&engine, "compact", 4, 2, 30).await;
+    write_block(&engine, "compact", 4, 2, 40).await;
+    let before = ids_and_values(&engine, "compact", 1, 5).await;
+    assert_eq!(block_count(&engine, "compact"), 4);
+    let hash = pulsora::storage::calculate_table_hash("compact");
+    let old_key = engine
+        .db
+        .prefix_iterator([hash.to_be_bytes().as_slice(), b"B"].concat())
+        .next()
+        .unwrap()
+        .unwrap()
+        .0;
+    let snapshot = engine.db.snapshot();
+    assert_eq!(engine.compact_table("compact").await.unwrap(), 4);
+    assert_eq!(block_count(&engine, "compact"), 1);
+    assert!(engine.db.get(&old_key).unwrap().is_none());
+    assert!(snapshot.get(&old_key).unwrap().is_some());
+    drop(snapshot);
+    assert_eq!(ids_and_values(&engine, "compact", 1, 5).await, before);
+    assert_eq!(engine.get_table_count("compact").await.unwrap(), 5);
+    assert_eq!(engine.compact_table("compact").await.unwrap(), 0);
+    assert_eq!(value_of(&engine, "compact", 1).await, Some(20));
+    // New ingestion must find the rewritten block and override its old copy.
+    write_block(&engine, "compact", 2, 1, 99).await;
+    assert_eq!(engine.get_table_count("compact").await.unwrap(), 5);
+    assert_eq!(value_of(&engine, "compact", 2).await, Some(99));
+    drop(engine);
+    let reopened = StorageEngine::new(&config).await.unwrap();
+    assert_eq!(reopened.get_table_count("compact").await.unwrap(), 5);
+    assert_eq!(value_of(&reopened, "compact", 2).await, Some(99));
+}
+
+#[tokio::test]
+async fn test_compaction_deletes_fully_dead_blocks_and_empty_bounds() {
+    use pulsora::storage::refs;
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir).await;
+    write_block(&engine, "dead", 1, 2, 10).await;
+    let hash = pulsora::storage::calculate_table_hash("dead");
+    let prefix = [hash.to_be_bytes().as_slice(), b"B"].concat();
+    let (_, value) = engine.db.prefix_iterator(prefix).next().unwrap().unwrap();
+    let meta = refs::parse_block_index_value(&value).unwrap();
+    engine
+        .db
+        .merge(
+            refs::override_key(hash, meta.block),
+            refs::encode_override_positions(&[0, 1]),
+        )
+        .unwrap();
+    let stats = engine.get_table_stats("dead").await.unwrap();
+    assert_eq!(stats.count, 0);
+    assert_eq!((stats.min_ts, stats.max_ts), (None, None));
+    assert_eq!(engine.compact_table("dead").await.unwrap(), 1);
+    assert_eq!(block_count(&engine, "dead"), 0);
+    assert!(engine
+        .db
+        .get(refs::override_key(hash, meta.block))
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_background_compaction_enabled_and_bounded() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    config.storage.compaction_interval_ms = 10;
+    config.ingestion.batch_size = 3;
+    let engine = StorageEngine::new(&config).await.unwrap();
+    for id in 1..=3 {
+        write_block(&engine, "scheduled", id, 1, 10).await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while block_count(&engine, "scheduled") > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(engine.get_table_count("scheduled").await.unwrap(), 3);
+    assert_eq!(ids_and_values(&engine, "scheduled", 1, 3).await.len(), 3);
+    assert_eq!(engine.compact_table("scheduled").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_compaction_recomputes_live_timestamp_bounds_in_milliseconds() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    let engine = StorageEngine::new(&config).await.unwrap();
+    engine
+        .ingest_csv(
+            "bounds",
+            "id,timestamp,value\n1,1704067200,10\n2,1704153600,20\n".into(),
+        )
+        .await
+        .unwrap();
+    engine.flush_table("bounds").await.unwrap();
+    engine
+        .ingest_csv("bounds", "id,timestamp,value\n2,1704067201,30\n".into())
+        .await
+        .unwrap();
+    engine.flush_table("bounds").await.unwrap();
+    assert_eq!(
+        engine.get_table_stats("bounds").await.unwrap().max_ts,
+        Some(1704153600000)
+    );
+    engine.compact_table("bounds").await.unwrap();
+    let stats = engine.get_table_stats("bounds").await.unwrap();
+    assert_eq!(stats.count, 2);
+    assert_eq!(stats.min_ts, Some(BASE_TS));
+    assert_eq!(stats.max_ts, Some(BASE_TS + 1000));
+}
+
+#[tokio::test]
+async fn test_count_and_compaction_without_timestamp_column() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    let engine = StorageEngine::new(&config).await.unwrap();
+    for id in 1..=2 {
+        engine
+            .ingest_csv("untimed", format!("id,value\n{id},10\n"))
+            .await
+            .unwrap();
+        let stats = engine.get_table_stats("untimed").await.unwrap();
+        assert_eq!(stats.count, id);
+        assert_eq!((stats.min_ts, stats.max_ts), (None, None));
+        engine.flush_table("untimed").await.unwrap();
+    }
+    assert_eq!(engine.compact_table("untimed").await.unwrap(), 2);
+    assert_eq!(engine.get_table_count("untimed").await.unwrap(), 2);
+}

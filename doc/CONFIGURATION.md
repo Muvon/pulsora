@@ -89,6 +89,7 @@ Controls the underlying RocksDB storage engine behavior.
 | `max_open_files` | Integer | `1000` | Maximum number of open file handles |
 | `buffer_size` | Integer | `1000` | Number of rows to buffer in memory before flushing |
 | `flush_interval_ms` | Integer | `1000` | Max time (ms) to hold data in buffer (0 = disable time flush) |
+| `compaction_interval_ms` | Integer | `0` | Background column-block compaction interval (ms); 0 disables it |
 | `wal_enabled` | Boolean | `true` | Enable Write-Ahead Log for durability |
 
 **Tuning Guidelines:**
@@ -97,6 +98,11 @@ Controls the underlying RocksDB storage engine behavior.
 - **Low Latency:** `buffer_size=100`, `flush_interval_ms=100`
 - **High Compression:** `buffer_size=10000`, `flush_interval_ms=0` (Batch Only Mode)
 - **Balanced:** `buffer_size=1000`, `flush_interval_ms=1000`
+
+**compaction_interval_ms:**
+- Opt-in: set a positive interval (for example `60000`) to merge adjacent small blocks and reclaim overridden rows.
+- Each table rewrites at most one run per interval, up to `ingestion.batch_size` live rows and 32 source blocks; fully overridden blocks are deleted atomically.
+- Existing block format and ingest semantics are unchanged; no migration or data wipe is needed. Startup and table creation reject table-name hash collisions and advise renaming a table.
 
 **wal_enabled:**
 - **True (Default):** Ensures data safety. Rows are written to disk immediately.

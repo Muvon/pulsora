@@ -18,11 +18,32 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::{mpsc, Mutex};
+use tokio::sync::oneshot;
 
 #[derive(Debug)]
 enum WalOp {
-    Write(Vec<u8>),
+    Write(Vec<u8>, oneshot::Sender<std::io::Result<()>>),
     Truncate,
+}
+
+/// Completion of one `append_batch`: resolves once the batch is fsynced.
+/// The process is routinely SIGKILLed (container stop), so an ingest may only
+/// be acknowledged after this — a batch still queued for the writer thread
+/// dies with the process.
+#[must_use = "an ingest must wait for its WAL write before acknowledging"]
+#[derive(Debug, Default)]
+pub struct WalDurable(Option<oneshot::Receiver<std::io::Result<()>>>);
+
+impl WalDurable {
+    pub async fn wait(self) -> Result<()> {
+        let Some(durable) = self.0 else {
+            return Ok(());
+        };
+        durable
+            .await
+            .map_err(|_| PulsoraError::Ingestion("WAL writer thread is dead".to_string()))?
+            .map_err(|e| PulsoraError::Ingestion(format!("WAL write failed: {}", e)))
+    }
 }
 
 /// Write-Ahead Log writer.
@@ -94,15 +115,16 @@ impl WriteAheadLog {
                 // of scope (engine teardown), this loop exits naturally.
                 while let Ok(op) = receiver.recv() {
                     match op {
-                        WalOp::Write(data) => {
-                            if let Err(e) = file.write_all(&data) {
-                                tracing::error!("Failed to write to WAL: {}", e);
-                            }
+                        WalOp::Write(data, done) => {
                             // sync_data fsyncs file contents (not metadata)
                             // — durability guarantee for crash recovery.
-                            if let Err(e) = file.sync_data() {
-                                tracing::error!("Failed to sync WAL: {}", e);
+                            let result = file.write_all(&data).and_then(|()| file.sync_data());
+                            if let Err(e) = &result {
+                                tracing::error!("Failed to write WAL: {}", e);
                             }
+                            // A closed receiver means the ingest was cancelled;
+                            // there is no one left to acknowledge.
+                            let _ = done.send(result);
                         }
                         WalOp::Truncate => {
                             if let Err(e) = file.set_len(0) {
@@ -138,9 +160,9 @@ impl WriteAheadLog {
             .map_err(|_| PulsoraError::Ingestion("WAL writer thread is dead".to_string()))
     }
 
-    pub fn append_batch(&self, rows: &[(u64, HashMap<String, String>)]) -> Result<()> {
+    pub fn append_batch(&self, rows: &[(u64, HashMap<String, String>)]) -> Result<WalDurable> {
         if rows.is_empty() {
-            return Ok(());
+            return Ok(WalDurable::default());
         }
 
         let mut buffer = Vec::new();
@@ -153,7 +175,9 @@ impl WriteAheadLog {
             buffer.extend_from_slice(&json);
         }
 
-        self.send(WalOp::Write(buffer))
+        let (done, durable) = oneshot::channel();
+        self.send(WalOp::Write(buffer, done))?;
+        Ok(WalDurable(Some(durable)))
     }
 
     pub fn replay(&self) -> Result<Vec<(u64, HashMap<String, String>)>> {
@@ -261,10 +285,7 @@ mod tests {
 
         let rows = vec![(1, row1.clone()), (2, row2.clone())];
 
-        wal.append_batch(&rows).unwrap();
-
-        // Wait for async write
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wal.append_batch(&rows).unwrap().wait().await.unwrap();
 
         // Replay
         let replayed = wal.replay().unwrap();
@@ -285,9 +306,7 @@ mod tests {
 
         let mut row = HashMap::new();
         row.insert("col".to_string(), "val".to_string());
-        wal.append_batch(&[(1, row)]).unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wal.append_batch(&[(1, row)]).unwrap().wait().await.unwrap();
 
         let replayed = wal.replay().unwrap();
         assert_eq!(replayed.len(), 1);

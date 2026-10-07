@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::storage::schema::Schema;
-use crate::storage::wal::WriteAheadLog;
+use crate::storage::wal::{WalDurable, WriteAheadLog};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -38,14 +38,15 @@ impl TableBuffer {
     pub fn push_batch(
         &mut self,
         rows: Vec<(u64, HashMap<String, String>)>,
-    ) -> crate::error::Result<()> {
-        if let Some(wal) = &self.wal {
-            wal.append_batch(&rows)?;
-        }
+    ) -> crate::error::Result<WalDurable> {
+        let durable = match &self.wal {
+            Some(wal) => wal.append_batch(&rows)?,
+            None => WalDurable::default(),
+        };
         for (id, row) in rows {
             self.rows.insert(id, row);
         }
-        Ok(())
+        Ok(durable)
     }
 
     pub fn should_flush(&self, buffer_size: usize, flush_interval_ms: u64) -> bool {

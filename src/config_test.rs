@@ -113,3 +113,18 @@ enable_performance_logs = false
     assert_eq!(config.logging.level, "debug");
     assert!(!config.logging.enable_access_logs);
 }
+
+#[test]
+fn test_compaction_config_defaults_and_roundtrip() {
+    let mut config = Config::default();
+    assert_eq!(config.storage.compaction_interval_ms, 0);
+    let old_toml = toml::to_string(&config)
+        .unwrap()
+        .replace("compaction_interval_ms = 0\n", "");
+    let old_config: Config = toml::from_str(&old_toml).unwrap();
+    assert_eq!(old_config.storage.compaction_interval_ms, 0);
+    config.storage.compaction_interval_ms = 60000;
+    let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.storage.compaction_interval_ms, 60000);
+    assert!(restored.validate().is_ok());
+}

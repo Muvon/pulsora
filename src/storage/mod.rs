@@ -56,6 +56,14 @@ pub struct IngestionStats {
     pub processing_time_ms: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TableStats {
+    pub count: u64,
+    /// Conservative bounds in milliseconds; None for an empty table.
+    pub min_ts: Option<i64>,
+    pub max_ts: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct StorageEngine {
     pub db: Arc<DB>,
@@ -368,6 +376,46 @@ impl StorageEngine {
             info!("Background flush disabled (flush_interval_ms = 0)");
         }
 
+        let compaction_interval = config.storage.compaction_interval_ms;
+        if compaction_interval > 0 {
+            let db_weak = Arc::downgrade(&engine.db);
+            let schemas_weak = Arc::downgrade(&engine.schemas);
+            let target_rows = config.ingestion.batch_size;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_millis(compaction_interval));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await; // First rewrite follows a full interval.
+                loop {
+                    interval.tick().await;
+                    let (Some(db), Some(schemas)) = (db_weak.upgrade(), schemas_weak.upgrade())
+                    else {
+                        break;
+                    };
+                    let tables: Vec<Schema> = {
+                        let guard = schemas.read().await;
+                        guard
+                            .list_tables()
+                            .iter()
+                            .filter_map(|table| guard.get_schema(table).cloned())
+                            .collect()
+                    };
+                    drop(schemas);
+                    let result = tokio::task::spawn_blocking(move || {
+                        for schema in tables {
+                            if let Err(error) = ingestion::compact_table_blocks(&db, &schema.table_name, &schema, target_rows) {
+                                tracing::error!(table = %schema.table_name, %error, "background block compaction failed");
+                            }
+                        }
+                    }).await;
+                    if let Err(error) = result {
+                        tracing::error!(%error, "background compaction task failed");
+                        break;
+                    }
+                }
+            });
+        }
+
         Ok(engine)
     }
 
@@ -397,7 +445,7 @@ impl StorageEngine {
         let rows_inserted = processed_rows.len() as u64;
 
         // Push to buffer (Batch)
-        {
+        let durable = {
             let mut buffers = self.buffers.write().await;
 
             // Get or create buffer for this table
@@ -416,7 +464,7 @@ impl StorageEngine {
             let buffer = buffers.get_mut(table).unwrap();
 
             // Batch push - ONE WAL write, ONE lock acquisition
-            buffer.push_batch(processed_rows)?;
+            let durable = buffer.push_batch(processed_rows)?;
 
             // Check if we need to flush
             if buffer.should_flush(
@@ -427,7 +475,12 @@ impl StorageEngine {
                 ingestion::write_batch_to_rocksdb(&self.db, table, &schema, &rows_to_write)?;
                 buffer.clear()?;
             }
-        } // Release buffers lock
+            durable
+        }; // Release buffers lock
+
+        // Acknowledge only once the batch is fsynced; waiting outside the
+        // buffers lock keeps other ingests from queueing behind the fsync.
+        durable.wait().await?;
 
         let processing_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -1112,52 +1165,52 @@ impl StorageEngine {
     }
 
     pub async fn get_table_count(&self, table: &str) -> Result<u64> {
-        // Check if table exists by checking schema
-        let schemas = self.schemas.read().await;
-        if schemas.get_schema(table).is_none() {
-            return Err(PulsoraError::TableNotFound(table.to_string()));
-        }
-        drop(schemas);
+        Ok(self.get_table_stats(table).await?.count)
+    }
 
-        // Flush the buffer first so the count is a pure block-metadata scan:
-        // live rows = Σ block row_count − Σ overridden positions. Two BOUNDED
-        // scans ('B' index range, 'O' override range) under one snapshot —
-        // the iterator must never enter the 'D' range, whose values are whole
-        // serialized blocks.
-        self.flush_table(table).await?;
+    pub async fn get_table_stats(&self, table: &str) -> Result<TableStats> {
+        let schema = self
+            .schemas
+            .read()
+            .await
+            .get_schema(table)
+            .cloned()
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
+        // Keep buffering/flush serialized with the disk snapshot. Compaction
+        // serializes its snapshot and publication via the metadata lock.
+        let buffers = self.buffers.read().await;
+        let rows = buffers
+            .get(table)
+            .map(|buffer| buffer.rows.clone())
+            .unwrap_or_default();
+        let db = Arc::clone(&self.db);
+        let table = table.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            ingestion::table_stats(&db, &table, &schema, &rows)
+        })
+        .await
+        .map_err(|e| PulsoraError::Internal(format!("count task failed: {e}")))?;
+        drop(buffers);
+        result
+    }
 
-        let table_hash = calculate_table_hash(table);
-        let snap = self.db.snapshot();
-        let mut total = 0u64;
-        let mut dead = 0u64;
-
-        for marker in *b"BO" {
-            let mut start_key = Vec::with_capacity(5);
-            start_key.extend_from_slice(&table_hash.to_be_bytes());
-            start_key.push(marker);
-            let iter = snap.iterator(rocksdb::IteratorMode::From(
-                &start_key,
-                rocksdb::Direction::Forward,
-            ));
-            for item in iter {
-                let Ok((key, value)) = item else { break };
-                if key.len() < 5
-                    || u32::from_be_bytes([key[0], key[1], key[2], key[3]]) != table_hash
-                    || key[4] != marker
-                {
-                    break;
-                }
-                if marker == b'B' {
-                    if let Ok(meta) = refs::parse_block_index_value(&value) {
-                        total += meta.rows as u64;
-                    }
-                } else {
-                    dead += refs::decode_override_positions(&value).len() as u64;
-                }
-            }
-        }
-
-        Ok(total.saturating_sub(dead))
+    /// Compact one bounded run of adjacent blocks; return the number retired.
+    pub async fn compact_table(&self, table: &str) -> Result<u64> {
+        let schema = self
+            .schemas
+            .read()
+            .await
+            .get_schema(table)
+            .cloned()
+            .ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
+        let db = Arc::clone(&self.db);
+        let table = table.to_string();
+        let target_rows = self.config.ingestion.batch_size;
+        tokio::task::spawn_blocking(move || {
+            ingestion::compact_table_blocks(&db, &table, &schema, target_rows)
+        })
+        .await
+        .map_err(|e| PulsoraError::Internal(format!("compaction task failed: {e}")))?
     }
     pub async fn get_schema(&self, table: &str) -> Result<serde_json::Value> {
         let schemas = self.schemas.read().await;

@@ -109,6 +109,83 @@ impl ColumnBlock {
         })
     }
 
+    /// Rebuild live rows directly from typed columns, preserving nulls and float bits.
+    pub(crate) fn compact(blocks: &[(Self, Vec<usize>)], schema: &Schema) -> Result<Self> {
+        let row_count: usize = blocks.iter().map(|(_, positions)| positions.len()).sum();
+        let mut columns = HashMap::with_capacity(schema.columns.len());
+        let mut null_bitmaps = HashMap::with_capacity(schema.columns.len());
+        for column in &schema.columns {
+            let mut values = Vec::with_capacity(row_count);
+            let mut bitmap = vec![0u8; row_count.div_ceil(8)];
+            for (block, positions) in blocks {
+                let data = block.columns.get(&column.name).ok_or_else(|| {
+                    PulsoraError::InvalidData(format!("Missing column: {}", column.name))
+                })?;
+                let decoded = decompress_column(data, &column.data_type, block.row_count)?;
+                let old_bitmap = block.null_bitmaps.get(&column.name);
+                let mut positions = positions.iter().copied().peekable();
+                for (old_pos, value) in decoded.into_iter().enumerate() {
+                    if positions.peek() != Some(&old_pos) {
+                        continue;
+                    }
+                    positions.next();
+                    let new_pos = values.len();
+                    if old_bitmap.is_some_and(|bits| {
+                        bits.get(old_pos / 8)
+                            .is_some_and(|byte| byte & (1 << (old_pos % 8)) != 0)
+                    }) {
+                        bitmap[new_pos / 8] |= 1 << (new_pos % 8);
+                    }
+                    values.push(value);
+                }
+            }
+            columns.insert(
+                column.name.clone(),
+                compress_column(&values, &column.data_type)?,
+            );
+            null_bitmaps.insert(column.name.clone(), bitmap);
+        }
+        Ok(Self {
+            row_count,
+            columns,
+            null_bitmaps,
+        })
+    }
+
+    /// Timestamp bounds for a rewrite, using the same units as the block index.
+    pub(crate) fn timestamp_bounds(&self, schema: &Schema) -> Result<Option<(i64, i64)>> {
+        let Some(name) = schema.get_timestamp_column() else {
+            return Ok(None);
+        };
+        let column = schema
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .ok_or_else(|| PulsoraError::InvalidData(format!("Missing column: {name}")))?;
+        let data = self
+            .columns
+            .get(name)
+            .ok_or_else(|| PulsoraError::InvalidData(format!("Missing column: {name}")))?;
+        let values = decompress_column(data, &column.data_type, self.row_count)?;
+        let mut bounds: Option<(i64, i64)> = None;
+        for (pos, value) in values.into_iter().enumerate() {
+            if self.null_bitmaps.get(name).is_some_and(|bits| {
+                bits.get(pos / 8)
+                    .is_some_and(|byte| byte & (1 << (pos % 8)) != 0)
+            }) {
+                continue;
+            }
+            let timestamp = match value {
+                EncodedValue::Timestamp(ts) => Some(ts),
+                value => crate::storage::ingestion::parse_timestamp(&value_to_string(&value)).ok(),
+            };
+            if let Some(ts) = timestamp {
+                bounds = Some(bounds.map_or((ts, ts), |(min, max)| (min.min(ts), max.max(ts))));
+            }
+        }
+        Ok(bounds)
+    }
+
     /// Create a new column block directly from an Arrow RecordBatch (Fast Path)
     pub fn from_arrow(
         batch: &RecordBatch,

@@ -766,7 +766,198 @@ fn write_block_core(
     Ok(ids.len() as u64)
 }
 
-/// Fetch and deserialize one block by id (ingest-side helper).
+/// Metadata-only disk count, decoding ids only for possible buffered replacements.
+pub(crate) fn table_stats(
+    db: &Arc<DB>,
+    table: &str,
+    schema: &Schema,
+    rows: &HashMap<u64, HashMap<String, String>>,
+) -> Result<super::TableStats> {
+    let hash = calculate_table_hash(table);
+    let (snap, metas) = snapshot_blocks_in_range(db, hash, i64::MIN, i64::MAX);
+    let mut total: u64 = metas.iter().map(|meta| meta.rows as u64).sum();
+    let mut prefix = hash.to_be_bytes().to_vec();
+    prefix.push(b'O');
+    for entry in snap.iterator(rocksdb::IteratorMode::From(
+        &prefix,
+        rocksdb::Direction::Forward,
+    )) {
+        let (key, value) = entry?;
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        total = total
+            .checked_sub(refs::decode_override_positions(&value).len() as u64)
+            .ok_or_else(|| {
+                PulsoraError::InvalidData("Override count exceeds block rows".to_string())
+            })?;
+    }
+    let mut new_ids: std::collections::HashSet<u64> = rows.keys().copied().collect();
+    for meta in &metas {
+        if !new_ids
+            .iter()
+            .any(|id| meta.min_id <= *id && *id <= meta.max_id)
+        {
+            continue;
+        }
+        // A range is only a candidate: sparse ids and dead copies must not
+        // suppress genuinely new buffered rows.
+        let data = snap
+            .get(refs::block_data_key(hash, meta.block))?
+            .ok_or_else(|| PulsoraError::InvalidData(format!("Missing block {}", meta.block)))?;
+        let block = ColumnBlock::deserialize(&data)?;
+        let dead = snap
+            .get(refs::override_key(hash, meta.block))?
+            .map(|data| refs::decode_override_positions(&data))
+            .unwrap_or_default();
+        for (pos, id) in block.get_id_values(schema)?.into_iter().enumerate() {
+            if !dead.contains(&(pos as u32)) {
+                new_ids.remove(&id);
+            }
+        }
+    }
+    total += new_ids.len() as u64;
+    let mut min_ts = metas.iter().map(|meta| meta.min_ts).min();
+    let mut max_ts = metas.iter().map(|meta| meta.max_ts).max();
+    if let Some(column) = schema.get_timestamp_column() {
+        for row in rows.values() {
+            if let Some(value) = row.get(column) {
+                // Match block-index ingestion: integer timestamp columns can
+                // contain values outside the timestamp parser's supported range.
+                if let Ok(ts) = parse_timestamp(value) {
+                    min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
+                    max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
+                }
+            }
+        }
+    }
+    if total == 0 || schema.get_timestamp_column().is_none() {
+        min_ts = None;
+        max_ts = None;
+    }
+    Ok(super::TableStats {
+        count: total,
+        min_ts,
+        max_ts,
+    })
+}
+
+/// Rewrite at most one run per tick, bounding live output to target_rows and
+/// sources to 32 blocks (decoding cost still scales with their physical rows).
+/// The same lock as ingestion protects overrides and publication.
+pub(crate) fn compact_table_blocks(
+    db: &Arc<DB>,
+    table: &str,
+    schema: &Schema,
+    target_rows: usize,
+) -> Result<u64> {
+    const MAX_SOURCE_BLOCKS: usize = 32;
+    let hash = calculate_table_hash(table);
+    let cache = table_meta_cache(db, hash);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let ordered = cache.in_time_range(i64::MIN, i64::MAX);
+    let mut selected = Vec::new();
+    let mut live_rows = 0usize;
+    let mut has_dead = false;
+    for meta in ordered {
+        let dead = db
+            .get(refs::override_key(hash, meta.block))?
+            .map(|data| refs::decode_override_positions(&data))
+            .unwrap_or_default();
+        let live = (meta.rows as usize)
+            .checked_sub(dead.len())
+            .ok_or_else(|| {
+                PulsoraError::InvalidData("Override count exceeds block rows".to_string())
+            })?;
+        if live >= target_rows
+            || live_rows + live > target_rows
+            || selected.len() == MAX_SOURCE_BLOCKS
+        {
+            if selected.len() > 1 || has_dead {
+                break;
+            }
+            selected.clear();
+            live_rows = 0;
+            has_dead = false;
+            if live >= target_rows {
+                continue;
+            }
+        }
+        live_rows += live;
+        has_dead |= !dead.is_empty();
+        selected.push((meta, dead));
+    }
+    if selected.is_empty() || (selected.len() == 1 && !has_dead) {
+        return Ok(0);
+    }
+
+    let mut blocks = Vec::new();
+    for (meta, dead) in &selected {
+        if dead.len() == meta.rows as usize {
+            continue;
+        }
+        let block = read_block(db, hash, meta.block)?
+            .ok_or_else(|| PulsoraError::InvalidData(format!("Missing block {}", meta.block)))?;
+        let positions = (0..block.row_count)
+            .filter(|pos| !dead.contains(&(*pos as u32)))
+            .collect();
+        blocks.push((block, positions));
+    }
+    let mut batch = WriteBatch::default();
+    let mut replacement = None;
+    if live_rows > 0 {
+        let block = ColumnBlock::compact(&blocks, schema)?;
+        let ids = block.get_id_values(schema)?;
+        let (min_ts, max_ts) = block.timestamp_bounds(schema)?.unwrap_or_else(|| {
+            (
+                selected.iter().map(|(meta, _)| meta.min_ts).min().unwrap(),
+                selected.iter().map(|(meta, _)| meta.max_ts).max().unwrap(),
+            )
+        });
+        let meta = refs::BlockMeta {
+            block: refs::allocate_block_id(db)?,
+            min_ts,
+            max_ts,
+            rows: block.row_count as u32,
+            min_id: *ids.iter().min().unwrap(),
+            max_id: *ids.iter().max().unwrap(),
+        };
+        batch.put(refs::block_data_key(hash, meta.block), block.serialize()?);
+        batch.put(
+            refs::block_index_key(hash, min_ts, meta.block),
+            refs::encode_block_index_value(&meta),
+        );
+        replacement = Some(meta);
+    }
+    let retired: std::collections::HashSet<u64> =
+        selected.iter().map(|(meta, _)| meta.block).collect();
+    for (meta, _) in &selected {
+        batch.delete(refs::block_data_key(hash, meta.block));
+        batch.delete(refs::block_index_key(hash, meta.min_ts, meta.block));
+        batch.delete(refs::override_key(hash, meta.block));
+    }
+    let mut options = rocksdb::WriteOptions::default();
+    options.set_sync(true);
+    db.write_opt(batch, &options)?;
+    cache.metas.retain(|meta| !retired.contains(&meta.block));
+    let mut running = 0;
+    cache.prefix_max_id = cache
+        .metas
+        .iter()
+        .map(|meta| {
+            running = running.max(meta.max_id);
+            running
+        })
+        .collect();
+    if let Some(meta) = replacement {
+        cache.push(meta);
+    }
+    Ok(retired.len() as u64)
+}
+
+/// Read one stored column block.
 fn read_block(db: &DB, table_hash: u32, block_id: u64) -> Result<Option<ColumnBlock>> {
     match db.get(refs::block_data_key(table_hash, block_id))? {
         Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),

@@ -247,3 +247,127 @@ fn test_non_sequential_id_compression() {
         assert_eq!(original["value"], recovered["value"]);
     }
 }
+
+#[test]
+fn test_typed_compaction_preserves_nulls_and_float_bits() {
+    use crate::storage::schema::Column;
+    let columns = vec![
+        Column {
+            name: "id".into(),
+            data_type: DataType::Id,
+            nullable: false,
+        },
+        Column {
+            name: "price".into(),
+            data_type: DataType::Float,
+            nullable: true,
+        },
+        Column {
+            name: "label".into(),
+            data_type: DataType::String,
+            nullable: true,
+        },
+    ];
+    let schema = Schema {
+        table_name: "typed".into(),
+        column_order: columns.iter().map(|col| col.name.clone()).collect(),
+        columns,
+        timestamp_column: None,
+        id_column: "id".into(),
+        created_at: chrono::Utc::now(),
+    };
+    let prices = [
+        EncodedValue::Float(-0.0),
+        EncodedValue::Float(f64::from_bits(0x7ff8000000000042)),
+        EncodedValue::Float(1.2345678901234567),
+    ];
+    let mut columns = HashMap::new();
+    columns.insert(
+        "id".into(),
+        compress_column(
+            &[
+                EncodedValue::Id(1),
+                EncodedValue::Id(2),
+                EncodedValue::Id(3),
+            ],
+            &DataType::Id,
+        )
+        .unwrap(),
+    );
+    columns.insert(
+        "price".into(),
+        compress_column(&prices, &DataType::Float).unwrap(),
+    );
+    columns.insert(
+        "label".into(),
+        compress_column(
+            &[
+                EncodedValue::String("discard".into()),
+                EncodedValue::String("".into()),
+                EncodedValue::String("keep".into()),
+            ],
+            &DataType::String,
+        )
+        .unwrap(),
+    );
+    let block = ColumnBlock {
+        row_count: 3,
+        columns,
+        null_bitmaps: HashMap::from([("label".into(), vec![2])]),
+    };
+    let compacted = ColumnBlock::compact(&[(block, vec![1, 2])], &schema).unwrap();
+    let restored = ColumnBlock::deserialize(&compacted.serialize().unwrap()).unwrap();
+    assert_eq!(restored.get_id_values(&schema).unwrap(), vec![2, 3]);
+    assert_eq!(restored.null_bitmaps["label"], vec![1]);
+    let values = decompress_column(&restored.columns["price"], &DataType::Float, 2).unwrap();
+    match &values[0] {
+        EncodedValue::Float(value) => assert_eq!(value.to_bits(), 0x7ff8000000000042),
+        _ => panic!("expected float"),
+    }
+    match &values[1] {
+        EncodedValue::Float(value) => assert_eq!(value.to_bits(), 1.2345678901234567f64.to_bits()),
+        _ => panic!("expected float"),
+    }
+}
+
+#[test]
+fn test_compacted_timestamp_bounds_ignore_live_nulls() {
+    use crate::storage::schema::Column;
+    let columns = vec![
+        Column {
+            name: "id".into(),
+            data_type: DataType::Id,
+            nullable: false,
+        },
+        Column {
+            name: "timestamp".into(),
+            data_type: DataType::Timestamp,
+            nullable: true,
+        },
+    ];
+    let schema = Schema {
+        table_name: "null_ts".into(),
+        column_order: columns.iter().map(|col| col.name.clone()).collect(),
+        columns,
+        timestamp_column: Some("timestamp".into()),
+        id_column: "id".into(),
+        created_at: chrono::Utc::now(),
+    };
+    let rows = vec![
+        (1, HashMap::from([("id".into(), "1".into())])),
+        (
+            2,
+            HashMap::from([
+                ("id".into(), "2".into()),
+                ("timestamp".into(), "1704067200000".into()),
+            ]),
+        ),
+    ];
+    let block = ColumnBlock::from_rows(&rows, &schema).unwrap();
+    let compacted = ColumnBlock::compact(&[(block, vec![0, 1])], &schema).unwrap();
+    assert_eq!(
+        compacted.timestamp_bounds(&schema).unwrap(),
+        Some((1704067200000, 1704067200000))
+    );
+    assert_eq!(compacted.null_bitmaps["timestamp"], vec![1]);
+}

@@ -97,6 +97,12 @@ impl SchemaManager {
 
         for item in iter {
             let (key, value) = item.map_err(PulsoraError::RocksDb)?;
+            // No prefix extractor is configured, so the iterator does not stop
+            // at the prefix: past the last schema key it walks the whole table
+            // data keyspace (~30 s of startup on a 70 GB store).
+            if !key.starts_with(schema_prefix) {
+                break;
+            }
 
             // Extract table name from key: "_schema_{table_name}"
             if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -104,6 +110,7 @@ impl SchemaManager {
                     // Deserialize schema
                     match serde_json::from_slice::<Schema>(&value) {
                         Ok(schema) => {
+                            self.check_table_hash(table_name)?;
                             tracing::info!("Loaded schema for table: {}", table_name);
                             self.schemas.insert(table_name.to_string(), schema);
                         }
@@ -120,6 +127,21 @@ impl SchemaManager {
         }
 
         tracing::info!("Loaded {} schemas from database", self.schemas.len());
+        Ok(())
+    }
+
+    /// Reject collisions before either persisted or buffered data can share keys.
+    fn check_table_hash(&self, table: &str) -> Result<()> {
+        let hash = super::calculate_table_hash(table);
+        if let Some(other) = self
+            .schemas
+            .keys()
+            .find(|other| other.as_str() != table && super::calculate_table_hash(other) == hash)
+        {
+            return Err(PulsoraError::Schema(format!(
+                "Table-name hash collision between '{table}' and '{other}' ({hash:#010x}); rename one table"
+            )));
+        }
         Ok(())
     }
 
@@ -154,6 +176,7 @@ impl SchemaManager {
             return Ok(schema.clone());
         }
 
+        self.check_table_hash(table)?;
         // Infer schema from ALL sample rows for better accuracy
         let schema = self.infer_schema_from_rows(table, sample_rows)?;
 
@@ -165,6 +188,7 @@ impl SchemaManager {
     }
 
     pub fn register_schema(&mut self, table: &str, schema: Schema) -> Result<Schema> {
+        self.check_table_hash(table)?;
         self.save_schema_to_db(table, &schema)?;
         self.schemas.insert(table.to_string(), schema.clone());
         Ok(schema)

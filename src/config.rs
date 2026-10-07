@@ -40,6 +40,9 @@ pub struct StorageConfig {
     pub max_open_files: i32,
     pub buffer_size: usize,
     pub flush_interval_ms: u64,
+    /// Background block compaction interval; 0 disables it.
+    #[serde(default)]
+    pub compaction_interval_ms: u64,
     /// Enable Write-Ahead Log (WAL) for durability.
     /// If true, buffered rows are written to disk immediately.
     /// If false, buffered rows are lost on crash.
@@ -94,6 +97,7 @@ impl Default for Config {
                 max_open_files: 1000,
                 buffer_size: 1000,
                 flush_interval_ms: 1000,
+                compaction_interval_ms: 0,
                 wal_enabled: true,
             },
             ingestion: IngestionConfig {
