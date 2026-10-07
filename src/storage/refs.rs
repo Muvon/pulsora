@@ -159,8 +159,8 @@ pub fn encode_override_positions(positions: &[u32]) -> Vec<u8> {
 /// duplicates (concatenated merge operands) by virtue of returning a set.
 pub fn decode_override_positions(data: &[u8]) -> std::collections::HashSet<u32> {
     let mut out = std::collections::HashSet::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
-        out.insert(u32::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in data.as_chunks::<4>().0 {
+        out.insert(u32::from_le_bytes(*chunk));
     }
     out
 }

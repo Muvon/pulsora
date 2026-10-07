@@ -1131,7 +1131,7 @@ impl StorageEngine {
         let mut total = 0u64;
         let mut dead = 0u64;
 
-        for marker in [b'B', b'O'] {
+        for marker in *b"BO" {
             let mut start_key = Vec::with_capacity(5);
             start_key.extend_from_slice(&table_hash.to_be_bytes());
             start_key.push(marker);

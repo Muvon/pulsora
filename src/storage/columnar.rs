@@ -1034,11 +1034,10 @@ impl ColumnBlock {
         let _end_vec = i64x4::splat(end_ts);
 
         let mut idx = 0;
-        let chunks = timestamps.chunks_exact(4);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = timestamps.as_chunks::<4>();
 
         for chunk in chunks {
-            let val_vec = i64x4::from(unsafe { *(chunk.as_ptr() as *const [i64; 4]) });
+            let val_vec = i64x4::from(*chunk);
 
             // Compare: val >= start && val <= end
             // wide doesn't have direct ge/le for all types, so we use:
