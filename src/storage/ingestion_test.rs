@@ -331,3 +331,73 @@ fn test_parse_arrow() {
     assert_eq!(rows[1].get("id"), Some(&"2".to_string()));
     assert_eq!(rows[1].get("name"), Some(&"Bob".to_string()));
 }
+
+fn meta(block: u64, min_ts: i64, max_ts: i64, min_id: u64, max_id: u64) -> refs::BlockMeta {
+    refs::BlockMeta {
+        block,
+        min_ts,
+        max_ts,
+        rows: 1,
+        min_id,
+        max_id,
+    }
+}
+
+fn cache_of(metas: &[refs::BlockMeta]) -> TableMetaCache {
+    let mut cache = TableMetaCache {
+        metas: Vec::new(),
+        prefix_max_id: Vec::new(),
+    };
+    for m in metas {
+        cache.push(*m);
+    }
+    cache
+}
+
+#[test]
+fn test_meta_cache_time_range_overlap_and_index_order() {
+    // Written out of time order: the cache is in write order, the result must
+    // follow the on-disk index order (min_ts, block).
+    let cache = cache_of(&[
+        meta(1, 100, 200, 1, 10),
+        meta(2, 50, 60, 11, 20),
+        meta(3, 300, 400, 21, 30),
+        meta(4, 150, 160, 31, 40),
+        meta(5, 150, 500, 41, 50),
+    ]);
+    let blocks: Vec<u64> = cache
+        .in_time_range(140, 310)
+        .iter()
+        .map(|m| m.block)
+        .collect();
+    assert_eq!(blocks, vec![1, 4, 5, 3]);
+
+    // Boundaries are inclusive on both ends.
+    let blocks: Vec<u64> = cache
+        .in_time_range(200, 300)
+        .iter()
+        .map(|m| m.block)
+        .collect();
+    assert_eq!(blocks, vec![1, 5, 3]);
+
+    assert!(cache.in_time_range(601, 700).is_empty());
+    assert_eq!(cache.in_time_range(i64::MIN, i64::MAX).len(), 5);
+}
+
+#[test]
+fn test_meta_cache_containing_id_newest_first() {
+    // Block 3 re-ingests ids 50..60 (REPLACE); block 5 is a later append.
+    let cache = cache_of(&[
+        meta(1, 0, 10, 1, 100),
+        meta(2, 11, 20, 101, 200),
+        meta(3, 21, 30, 50, 60),
+        meta(4, 31, 40, 201, 300),
+        meta(5, 41, 50, 301, 400),
+    ]);
+    let blocks = |id| -> Vec<u64> { cache.containing_id(id).iter().map(|m| m.block).collect() };
+    assert_eq!(blocks(55), vec![3, 1]);
+    assert_eq!(blocks(150), vec![2]);
+    assert_eq!(blocks(400), vec![5]);
+    assert!(blocks(401).is_empty());
+    assert!(blocks(0).is_empty());
+}

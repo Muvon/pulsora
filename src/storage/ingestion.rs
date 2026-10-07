@@ -467,7 +467,7 @@ pub fn write_batch_to_rocksdb(
     )
 }
 
-/// In-memory block metadata per (DB instance, table) — the engine's
+/// In-memory block metadata per (DB path, table) — the engine's
 /// equivalent of an LSM "Version": REPLACE detection needs every block's id
 /// range on every write, and re-reading the block index from RocksDB is
 /// O(blocks) of iterator work per ingest (measured 24ms → 54ms per 10k-row
@@ -475,9 +475,12 @@ pub fn write_batch_to_rocksdb(
 /// LevelDB, BadgerDB) is to keep file metadata in memory and never touch
 /// disk metadata on the write path — disk is read once, lazily, then the
 /// cache is appended on every successful block write. The engine is the
-/// single writer, so the cache cannot go stale; keying by DB instance
-/// address keeps test databases (and any reopen) isolated. A future block
-/// compactor must update this cache when it rewrites blocks.
+/// single writer, so the cache cannot go stale. It is keyed by the DB PATH,
+/// not the `Arc<DB>` address: a database reopened in the same process can land
+/// on a dropped instance's address and would inherit its block list, while the
+/// same path always holds the same blocks. Reads use it too (see
+/// `snapshot_blocks_in_range`), so a query never walks the on-disk index. A
+/// future block compactor must update this cache when it rewrites blocks.
 ///
 /// `prefix_max_id[i]` = max over `metas[0..=i].max_id` (O(1) to maintain on
 /// append). Candidate selection walks the metas in REVERSE and stops at the
@@ -520,6 +523,36 @@ impl TableMetaCache {
         out
     }
 
+    /// Blocks whose [min_ts, max_ts] overlaps [start_ts, end_ts], in block-index
+    /// key order (min_ts, block) — the order the on-disk index scan returned.
+    fn in_time_range(&self, start_ts: i64, end_ts: i64) -> Vec<refs::BlockMeta> {
+        let mut out: Vec<refs::BlockMeta> = self
+            .metas
+            .iter()
+            .filter(|meta| meta.max_ts >= start_ts && meta.min_ts <= end_ts)
+            .copied()
+            .collect();
+        out.sort_unstable_by_key(|meta| (meta.min_ts, meta.block));
+        out
+    }
+
+    /// Blocks whose id range covers `id`, newest first. Same early stop as
+    /// `overlapping_blocks`: for monotonic ids it touches ~one entry.
+    fn containing_id(&self, id: u64) -> Vec<refs::BlockMeta> {
+        let mut out = Vec::new();
+        for i in (0..self.metas.len()).rev() {
+            if self.prefix_max_id[i] < id {
+                break;
+            }
+            let meta = &self.metas[i];
+            if meta.min_id <= id && id <= meta.max_id {
+                out.push(*meta);
+            }
+        }
+        out.sort_unstable_by_key(|meta| std::cmp::Reverse(meta.block));
+        out
+    }
+
     fn push(&mut self, meta: refs::BlockMeta) {
         let running = self
             .prefix_max_id
@@ -533,18 +566,56 @@ impl TableMetaCache {
 }
 
 type TableMetas = Arc<std::sync::Mutex<TableMetaCache>>;
-static BLOCK_META_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<(usize, u32), TableMetas>>> =
+type MetaCacheKey = (std::path::PathBuf, u32);
+static BLOCK_META_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<MetaCacheKey, TableMetas>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Get (lazily loading from the block index) the table's in-memory metadata.
 fn table_meta_cache(db: &Arc<DB>, table_hash: u32) -> TableMetas {
-    let key = (Arc::as_ptr(db) as usize, table_hash);
+    let key = (db.path().to_path_buf(), table_hash);
     let mut map = BLOCK_META_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.entry(key)
         .or_insert_with(|| Arc::new(std::sync::Mutex::new(TableMetaCache::load(db, table_hash))))
         .clone()
+}
+
+/// A read snapshot plus the blocks overlapping [start_ts, end_ts] (block-index
+/// order). Replaces walking the on-disk block index, which every query did
+/// from the table's FIRST block: a recent-window read cost O(all blocks ever
+/// written) and grew with every flush.
+///
+/// The snapshot is taken under the per-table lock `write_block_core` holds
+/// from commit until it publishes the block, so every block visible in the
+/// snapshot is in the list; a block published later is simply absent from the
+/// snapshot and reads as missing, exactly as before.
+pub(crate) fn snapshot_blocks_in_range(
+    db: &Arc<DB>,
+    table_hash: u32,
+    start_ts: i64,
+    end_ts: i64,
+) -> (rocksdb::Snapshot<'_>, Vec<refs::BlockMeta>) {
+    let metas = table_meta_cache(db, table_hash);
+    let metas = metas
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (db.snapshot(), metas.in_time_range(start_ts, end_ts))
+}
+
+/// A read snapshot plus the blocks whose id range covers `id`, newest first —
+/// the point-lookup counterpart of `snapshot_blocks_in_range`, with the same
+/// snapshot/lock guarantee.
+pub(crate) fn snapshot_blocks_with_id(
+    db: &Arc<DB>,
+    table_hash: u32,
+    id: u64,
+) -> (rocksdb::Snapshot<'_>, Vec<refs::BlockMeta>) {
+    let metas = table_meta_cache(db, table_hash);
+    let metas = metas
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (db.snapshot(), metas.containing_id(id))
 }
 
 /// Scan the table's block index and return metadata for every block.

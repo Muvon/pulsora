@@ -19,7 +19,7 @@
 
 use arrow::record_batch::RecordBatch;
 use chrono::DateTime;
-use rocksdb::{Direction, IteratorMode, ReadOptions, DB};
+use rocksdb::{ReadOptions, DB};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,15 +27,17 @@ use std::sync::Arc;
 use crate::error::{PulsoraError, Result};
 use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
+use crate::storage::ingestion;
 use crate::storage::refs;
 use crate::storage::schema::Schema;
 
 /// Retrieve a single row by id.
 ///
 /// There are no per-row index entries: candidate blocks are those whose
-/// stored id range covers `id` (block index scan), checked NEWEST first —
-/// block ids are strictly increasing with write time, so the first
-/// non-overridden hit is the live copy.
+/// stored id range covers `id`, taken from the in-memory block metadata and
+/// checked NEWEST first — block ids are strictly increasing with write time,
+/// so the first non-overridden hit is the live copy. (This used to walk the
+/// table's whole on-disk block index on every call.)
 pub fn get_row_by_id(
     db: &Arc<DB>,
     table: &str,
@@ -43,17 +45,10 @@ pub fn get_row_by_id(
     id: u64,
 ) -> Result<Option<HashMap<String, String>>> {
     let table_hash = calculate_table_hash(table);
-    // One snapshot covers the index scan AND the block/override reads: a
+    // One snapshot covers the candidate list AND the block/override reads: a
     // concurrent REPLACE commits {new block + overrides} atomically, and a
     // mixed view (old candidate set + new overrides) would serve nothing.
-    let snap = db.snapshot();
-    let mut candidates: Vec<refs::BlockMeta> =
-        scan_block_metadata(&snap, table_hash, i64::MIN, i64::MAX)
-            .into_iter()
-            .filter(|meta| meta.min_id <= id && id <= meta.max_id)
-            .collect();
-    candidates.sort_unstable_by_key(|b| std::cmp::Reverse(b.block));
-
+    let (snap, candidates) = ingestion::snapshot_blocks_with_id(db, table_hash, id);
     for meta in candidates {
         let Some(block) = fetch_block(&snap, table_hash, meta.block)? else {
             continue;
@@ -119,12 +114,11 @@ pub fn execute_query(
     let needed = offset.saturating_add(limit);
 
     let table_hash = calculate_table_hash(table);
-    // One snapshot for the whole query: the index scan and every block /
+    // One snapshot for the whole query: the block list and every block /
     // override read must observe the same state, or a concurrent REPLACE
     // (atomic {new block + overrides} batch) transiently hides the row.
-    let snap = db.snapshot();
-    // Ascending by block min_ts from the index scan
-    let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
+    // Blocks ascend by min_ts.
+    let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
     let ts_col = schema.get_timestamp_column().map(str::to_string);
@@ -374,79 +368,6 @@ pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Re
     Ok(Value::Object(json_obj))
 }
 
-/// Walk the block index for `table_hash` and collect metadata for every
-/// block whose stored \[min_ts, max_ts\] overlaps the requested range.
-///
-/// Block-index keys are laid out as `[table_hash:u32][b'B'][min_ts:i64][block_id]`
-/// in big-endian; iteration in `Forward` direction therefore yields blocks
-/// in ascending `min_ts` order, and we can short-circuit as soon as a key's
-/// `min_ts` exceeds the requested `end_ts`.
-fn scan_block_metadata(
-    snap: &rocksdb::Snapshot<'_>,
-    table_hash: u32,
-    start_ts: i64,
-    end_ts: i64,
-) -> Vec<refs::BlockMeta> {
-    let mut start_key = Vec::with_capacity(5);
-    start_key.extend_from_slice(&table_hash.to_be_bytes());
-    start_key.push(b'B');
-
-    let mut opts = ReadOptions::default();
-    opts.set_verify_checksums(false);
-    opts.fill_cache(true);
-    opts.set_readahead_size(4 * 1024 * 1024);
-
-    let iter = snap.iterator_opt(IteratorMode::From(&start_key, Direction::Forward), opts);
-    let mut result: Vec<refs::BlockMeta> = Vec::new();
-
-    for item in iter {
-        let (key, value) = match item {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // Table-hash boundary FIRST: keys are hash-prefixed, so the first key
-        // of another table ends this table's index range. Checking the 'B'
-        // marker first would `continue` past foreign tables' keys and walk
-        // the entire remaining keyspace on unbounded-end queries.
-        if key.len() < 4 {
-            continue;
-        }
-        let key_table_hash = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
-        if key_table_hash != table_hash {
-            break;
-        }
-        // Markers sort 'B' < 'D' < 'O' and the scan starts at the 'B' range:
-        // the first non-'B' key ends it. `continue` here would walk the whole
-        // 'D' range, materializing every serialized block along the way.
-        if key.len() < 5 || key[4] != b'B' {
-            break;
-        }
-
-        // The key carries the block's min_ts; once that's past end_ts, every
-        // subsequent block in the iterator is also out of range.
-        if key.len() >= 13 {
-            let key_min_ts = i64::from_be_bytes([
-                key[5], key[6], key[7], key[8], key[9], key[10], key[11], key[12],
-            ]);
-            if key_min_ts > end_ts {
-                break;
-            }
-        }
-
-        let Ok(meta) = refs::parse_block_index_value(&value) else {
-            continue;
-        };
-
-        if meta.max_ts < start_ts || meta.min_ts > end_ts {
-            continue;
-        }
-
-        result.push(meta);
-    }
-
-    result
-}
-
 struct BlockQuery<'a> {
     snap: &'a rocksdb::Snapshot<'a>,
     schema: &'a Schema,
@@ -645,8 +566,7 @@ pub fn execute_query_csv(
 
     let table_hash = calculate_table_hash(table);
     // One snapshot for the whole query — see execute_query for rationale.
-    let snap = db.snapshot();
-    let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
+    let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
     let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
@@ -737,8 +657,7 @@ pub fn execute_query_arrow(
 
     let table_hash = calculate_table_hash(table);
     // One snapshot for the whole query — see execute_query for rationale.
-    let snap = db.snapshot();
-    let metadata = scan_block_metadata(&snap, table_hash, start_ts, end_ts);
+    let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
 
     use rayon::prelude::*;
     let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
