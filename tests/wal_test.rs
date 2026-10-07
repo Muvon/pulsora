@@ -130,3 +130,96 @@ async fn test_wal_disabled_data_loss() {
         assert_eq!(rows.len(), 0, "Should have lost data with WAL disabled");
     }
 }
+
+fn long_interval_config(data_dir: &std::path::Path) -> Config {
+    let mut config = Config::default();
+    config.storage.data_dir = data_dir.to_string_lossy().to_string();
+    config.storage.wal_enabled = true;
+    config.storage.buffer_size = 10_000;
+    config.storage.flush_interval_ms = 60_000;
+    config
+}
+
+/// A long flush interval keeps acknowledged rows in the WAL-backed buffer:
+/// they must be readable before any flush and survive a restart that never
+/// flushed, with a re-ingested id resolving to its latest value.
+#[tokio::test]
+async fn test_long_flush_interval_rows_survive_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let engine = StorageEngine::new(&long_interval_config(temp_dir.path()))
+        .await
+        .unwrap();
+
+    engine
+        .ingest_csv(
+            "wal_long_a",
+            "id,timestamp,value\n1,1704067200000,10\n2,1704067201000,20".to_string(),
+        )
+        .await
+        .unwrap();
+    engine
+        .ingest_csv(
+            "wal_long_a",
+            "id,timestamp,value\n1,1704067200000,11".to_string(),
+        )
+        .await
+        .unwrap();
+    engine
+        .ingest_csv(
+            "wal_long_b",
+            "id,timestamp,value\n7,1704067205000,70".to_string(),
+        )
+        .await
+        .unwrap();
+
+    // Readable straight from the buffer, latest copy only.
+    let rows = engine
+        .query("wal_long_a", None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let row = engine
+        .get_row_by_id_json("wal_long_a", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row["value"].as_i64().unwrap(), 11);
+
+    // The WAL writer is a background thread; give it time to fsync.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(engine);
+
+    let engine = StorageEngine::new(&long_interval_config(temp_dir.path()))
+        .await
+        .unwrap();
+    let a = engine
+        .query("wal_long_a", None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(a.len(), 2, "both rows of table a recovered");
+    let row = engine
+        .get_row_by_id_json("wal_long_a", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row["value"].as_i64().unwrap(), 11, "latest copy recovered");
+    let b = engine
+        .query("wal_long_b", None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(b.len(), 1, "table b recovered");
+
+    // Recovered rows flush into blocks and stay readable.
+    engine.flush_table("wal_long_a").await.unwrap();
+    let row = engine
+        .get_row_by_id_json("wal_long_a", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row["value"].as_i64().unwrap(), 11);
+    let a = engine
+        .query("wal_long_a", None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(a.len(), 2);
+}
