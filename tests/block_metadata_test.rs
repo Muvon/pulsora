@@ -16,6 +16,8 @@
 //! the on-disk block index: time-range queries and id lookups must see every
 //! block, the latest REPLACE copy, and the same data after a reopen.
 
+use arrow::array::{Int64Array, UInt64Array};
+use arrow::ipc::reader::StreamReader;
 use pulsora::config::Config;
 use pulsora::storage::StorageEngine;
 use tempfile::TempDir;
@@ -123,6 +125,80 @@ async fn test_reads_after_reopen_see_all_blocks() {
     assert_eq!(value_of(&engine, table, 6).await, Some(4));
     assert_eq!(value_of(&engine, table, 30).await, Some(1));
     assert_eq!(value_of(&engine, table, 60).await, Some(3));
+}
+
+/// Metric frames are rewritten every minute until they close, leaving runs of
+/// fully-overridden single-row blocks. Every read format must skip them and
+/// return each frame's last copy, while a partially overridden block still
+/// yields its live rows.
+#[tokio::test]
+async fn test_fully_overridden_blocks_read_as_latest_copy_in_every_format() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir).await;
+    let table = "block_meta_frames";
+
+    for frame in 1..=3u64 {
+        for rewrite in 1..=20 {
+            write_block(&engine, table, frame, 1, rewrite).await;
+        }
+    }
+    write_block(&engine, table, 10, 3, 5).await;
+    write_block(&engine, table, 11, 1, 6).await;
+
+    let expected = vec![(1, 20), (2, 20), (3, 20), (10, 5), (11, 6), (12, 5)];
+    assert_eq!(ids_and_values(&engine, table, 0, 100).await, expected);
+
+    let csv = engine
+        .query_csv(table, None, None, Some(100), None)
+        .await
+        .unwrap();
+    let mut lines = csv.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let id_at = header.iter().position(|c| *c == "id").unwrap();
+    let value_at = header.iter().position(|c| *c == "value").unwrap();
+    let mut from_csv: Vec<(u64, i64)> = lines
+        .map(|line| {
+            let fields: Vec<&str> = line.split(',').collect();
+            (
+                fields[id_at].parse().unwrap(),
+                fields[value_at].parse().unwrap(),
+            )
+        })
+        .collect();
+    from_csv.sort_unstable();
+    assert_eq!(from_csv, expected);
+
+    let arrow_bytes = engine
+        .query_arrow(table, None, None, Some(100), None)
+        .await
+        .unwrap();
+    let reader = StreamReader::try_new(std::io::Cursor::new(&arrow_bytes), None).unwrap();
+    let mut from_arrow: Vec<(u64, i64)> = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        from_arrow.extend(
+            ids.values()
+                .iter()
+                .copied()
+                .zip(values.values().iter().copied()),
+        );
+    }
+    from_arrow.sort_unstable();
+    assert_eq!(from_arrow, expected);
+
+    assert_eq!(value_of(&engine, table, 2).await, Some(20));
 }
 
 #[tokio::test]

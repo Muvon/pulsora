@@ -208,6 +208,7 @@ pub fn execute_query(
                             schema,
                             table_hash,
                             block_id: meta.block,
+                            block_rows: meta.rows,
                             block_min_ts: meta.min_ts,
                             block_max_ts: meta.max_ts,
                             start_ts,
@@ -225,6 +226,7 @@ pub fn execute_query(
                         schema,
                         table_hash,
                         block_id: meta.block,
+                        block_rows: meta.rows,
                         block_min_ts: meta.min_ts,
                         block_max_ts: meta.max_ts,
                         start_ts,
@@ -373,6 +375,7 @@ struct BlockQuery<'a> {
     schema: &'a Schema,
     table_hash: u32,
     block_id: u64,
+    block_rows: u32,
     block_min_ts: i64,
     block_max_ts: i64,
     start_ts: i64,
@@ -394,29 +397,30 @@ fn fetch_block(
     }
 }
 
-/// Compute the per-row validity bitmap for `block`.
+/// Fetch a block and its per-row validity, or `None` when the block is gone or
+/// every row is overridden.
 ///
 /// A row is live unless its position appears in the block's override set —
 /// the (usually absent) record of positions superseded by later REPLACE
-/// ingests. ONE point read per block, no per-row lookups: this is what makes
-/// large range scans cheap.
-fn block_validity_bitmap(
-    snap: &rocksdb::Snapshot<'_>,
-    table_hash: u32,
-    block: &ColumnBlock,
-    block_id: u64,
-) -> Result<Vec<bool>> {
-    if block.row_count == 0 {
-        return Ok(Vec::new());
+/// ingests. The override set is read BEFORE the block: a table whose rows are
+/// rewritten in place (metric frames, re-ingested every minute until the frame
+/// closes) is mostly fully-dead single-row blocks, and each one would
+/// otherwise cost a random block read plus a full decode to yield nothing.
+fn fetch_live_block(query: &BlockQuery<'_>) -> Result<Option<(ColumnBlock, Vec<bool>)>> {
+    let overrides = load_overrides(query.snap, query.table_hash, query.block_id)?;
+    if overrides.len() >= query.block_rows as usize {
+        return Ok(None);
     }
-    let overrides = load_overrides(snap, table_hash, block_id)?;
+    let Some(block) = fetch_block(query.snap, query.table_hash, query.block_id)? else {
+        return Ok(None);
+    };
     let mut valid = vec![true; block.row_count];
     for pos in overrides {
         if let Some(slot) = valid.get_mut(pos as usize) {
             *slot = false;
         }
     }
-    Ok(valid)
+    Ok(Some((block, valid)))
 }
 
 /// Materialize the indices selected by both the timestamp range and the
@@ -446,11 +450,9 @@ fn intersect_indices(
 ///   * **filtered path** — anything else; the surviving indices are
 ///     materialized once and passed to `to_json_filtered`.
 fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
-    let block = match fetch_block(query.snap, query.table_hash, query.block_id)? {
-        Some(b) => b,
-        None => return Ok(Vec::new()),
+    let Some((block, validity)) = fetch_live_block(&query)? else {
+        return Ok(Vec::new());
     };
-    let validity = block_validity_bitmap(query.snap, query.table_hash, &block, query.block_id)?;
     let valid_count = validity.iter().filter(|&&v| v).count();
     if valid_count == 0 {
         return Ok(Vec::new());
@@ -484,11 +486,9 @@ fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
 ///      walks rows once with inline `validity[i] && ts in [start,end]`
 ///      checks, avoiding a separate `filter_by_timestamp` pre-scan.
 fn block_to_csv(query: BlockQuery<'_>) -> Result<String> {
-    let block = match fetch_block(query.snap, query.table_hash, query.block_id)? {
-        Some(b) => b,
-        None => return Ok(String::new()),
+    let Some((block, validity)) = fetch_live_block(&query)? else {
+        return Ok(String::new());
     };
-    let validity = block_validity_bitmap(query.snap, query.table_hash, &block, query.block_id)?;
     let valid_count = validity.iter().filter(|&&v| v).count();
     if valid_count == 0 {
         return Ok(String::new());
@@ -510,11 +510,9 @@ fn block_to_csv(query: BlockQuery<'_>) -> Result<String> {
 /// Per-block Arrow serializer used by `execute_query_arrow`. Same
 /// three-path dispatch as `block_to_csv`.
 fn block_to_arrow(query: BlockQuery<'_>) -> Result<Option<RecordBatch>> {
-    let block = match fetch_block(query.snap, query.table_hash, query.block_id)? {
-        Some(b) => b,
-        None => return Ok(None),
+    let Some((block, validity)) = fetch_live_block(&query)? else {
+        return Ok(None);
     };
-    let validity = block_validity_bitmap(query.snap, query.table_hash, &block, query.block_id)?;
     let valid_count = validity.iter().filter(|&&v| v).count();
     if valid_count == 0 {
         return Ok(None);
@@ -581,6 +579,7 @@ pub fn execute_query_csv(
                         schema,
                         table_hash,
                         block_id: meta.block,
+                        block_rows: meta.rows,
                         block_min_ts: meta.min_ts,
                         block_max_ts: meta.max_ts,
                         start_ts,
@@ -598,6 +597,7 @@ pub fn execute_query_csv(
                     schema,
                     table_hash,
                     block_id: meta.block,
+                    block_rows: meta.rows,
                     block_min_ts: meta.min_ts,
                     block_max_ts: meta.max_ts,
                     start_ts,
@@ -672,6 +672,7 @@ pub fn execute_query_arrow(
                         schema,
                         table_hash,
                         block_id: meta.block,
+                        block_rows: meta.rows,
                         block_min_ts: meta.min_ts,
                         block_max_ts: meta.max_ts,
                         start_ts,
@@ -689,6 +690,7 @@ pub fn execute_query_arrow(
                     schema,
                     table_hash,
                     block_id: meta.block,
+                    block_rows: meta.rows,
                     block_min_ts: meta.min_ts,
                     block_max_ts: meta.max_ts,
                     start_ts,
