@@ -23,13 +23,7 @@ use tikv_jemallocator::Jemalloc;
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
-mod config;
-mod error;
-mod server;
-mod storage;
-
-use config::Config;
-use error::Result;
+use pulsora::{config::Config, error::Result, server};
 
 #[derive(Parser)]
 #[command(name = "pulsora")]
