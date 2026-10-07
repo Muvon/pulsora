@@ -369,6 +369,55 @@ async fn test_background_compaction_enabled_and_bounded() {
     assert_eq!(engine.compact_table("scheduled").await.unwrap(), 0);
 }
 
+/// Each pass resumes where the previous one stopped instead of re-walking the
+/// table from its oldest block, and wraps around once it reaches the end.
+#[tokio::test]
+async fn test_compaction_passes_resume_after_previous_run_and_wrap() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    config.ingestion.batch_size = 3;
+    let engine = StorageEngine::new(&config).await.unwrap();
+    for id in 1..=9 {
+        write_block(&engine, "resume", id, 1, 10).await;
+    }
+    let before = ids_and_values(&engine, "resume", 1, 9).await;
+
+    let mut retired = Vec::new();
+    for _ in 0..5 {
+        retired.push(engine.compact_table("resume").await.unwrap());
+    }
+    assert_eq!(retired, vec![3, 3, 3, 0, 0]);
+    assert_eq!(block_count(&engine, "resume"), 3);
+    assert_eq!(ids_and_values(&engine, "resume", 1, 9).await, before);
+    assert_eq!(engine.get_table_count("resume").await.unwrap(), 9);
+}
+
+/// Metric frames leave ~60 fully overridden single-row blocks per live row.
+/// Those are deleted without being read, so they must not count toward the
+/// per-pass source limit — one pass clears a whole run of them.
+#[tokio::test]
+async fn test_compaction_retires_fully_dead_blocks_beyond_source_limit() {
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = dir.path().to_string_lossy().to_string();
+    config.storage.flush_interval_ms = 0;
+    let engine = StorageEngine::new(&config).await.unwrap();
+    for rewrite in 1..=40 {
+        write_block(&engine, "rewrites", 1, 1, rewrite).await;
+    }
+    assert_eq!(block_count(&engine, "rewrites"), 40);
+
+    assert_eq!(engine.compact_table("rewrites").await.unwrap(), 40);
+    assert_eq!(block_count(&engine, "rewrites"), 1);
+    assert_eq!(value_of(&engine, "rewrites", 1).await, Some(40));
+    assert_eq!(
+        ids_and_values(&engine, "rewrites", 0, 10).await,
+        vec![(1, 40)]
+    );
+}
+
 #[tokio::test]
 async fn test_compaction_recomputes_live_timestamp_bounds_in_milliseconds() {
     let dir = TempDir::new().unwrap();

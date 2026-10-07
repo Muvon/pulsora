@@ -45,7 +45,8 @@
 //! live hit.
 
 use crate::error::{PulsoraError, Result};
-use rocksdb::DB;
+use rocksdb::{Direction, IteratorMode, ReadOptions, DB};
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Fixed block index value length:
@@ -181,6 +182,71 @@ pub fn override_merge(
     let mut positions: Vec<u32> = set.into_iter().collect();
     positions.sort_unstable();
     Some(encode_override_positions(&positions))
+}
+
+/// Dead-row state of a set of blocks: fully overridden blocks (never worth
+/// reading) and the dead positions of partially overridden ones. Blocks absent
+/// from both are entirely live.
+#[derive(Debug, Default)]
+pub struct OverrideStates {
+    pub fully_dead: HashSet<u64>,
+    pub partial: HashMap<u64, HashSet<u32>>,
+}
+
+/// Block ids closer than this share one override scan: reading through the
+/// table's other override keys in a small gap is cheaper than another seek.
+const OVERRIDE_SCAN_GAP: u64 = 4096;
+
+/// Override states of `metas`, read with one bounded iterator per cluster of
+/// nearby block ids instead of a point read per block.
+///
+/// Override values are merge operands, so a point read resolves operands
+/// across LSM levels — 2-3 ms each on a 70 GB store. REPLACE-heavy tables pay
+/// that for every dead copy: metric frames are re-ingested every minute until
+/// they close, leaving ~60 dead single-row blocks per live row, which made one
+/// symbol's 83-day frame read take minutes.
+pub fn load_override_states(
+    snap: &rocksdb::Snapshot<'_>,
+    table_hash: u32,
+    metas: &[BlockMeta],
+) -> Result<OverrideStates> {
+    let rows: HashMap<u64, u32> = metas.iter().map(|meta| (meta.block, meta.rows)).collect();
+    let mut blocks: Vec<u64> = rows.keys().copied().collect();
+    blocks.sort_unstable();
+    let mut out = OverrideStates::default();
+    let mut next = 0;
+    while next < blocks.len() {
+        let first = blocks[next];
+        let mut last = first;
+        next += 1;
+        while next < blocks.len() && blocks[next] - last <= OVERRIDE_SCAN_GAP {
+            last = blocks[next];
+            next += 1;
+        }
+        let mut opts = ReadOptions::default();
+        opts.set_verify_checksums(false);
+        opts.set_iterate_upper_bound(override_key(table_hash, last + 1));
+        let start = override_key(table_hash, first);
+        for item in snap.iterator_opt(IteratorMode::From(&start, Direction::Forward), opts) {
+            let (key, value) = item?;
+            let block = key
+                .get(5..13)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or_else(|| PulsoraError::InvalidData("Malformed override key".to_string()))?;
+            let Some(&block_rows) = rows.get(&block) else {
+                continue;
+            };
+            let mut positions = decode_override_positions(&value);
+            positions.retain(|&pos| pos < block_rows);
+            if positions.len() == block_rows as usize {
+                out.fully_dead.insert(block);
+            } else {
+                out.partial.insert(block, positions);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

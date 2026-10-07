@@ -491,6 +491,8 @@ pub fn write_batch_to_rocksdb(
 struct TableMetaCache {
     metas: Vec<refs::BlockMeta>,
     prefix_max_id: Vec<u64>,
+    /// Block-index key `(min_ts, block)` the next compaction pass starts at.
+    compact_cursor: (i64, u64),
 }
 
 impl TableMetaCache {
@@ -505,7 +507,33 @@ impl TableMetaCache {
         Self {
             metas,
             prefix_max_id,
+            compact_cursor: (i64::MIN, 0),
         }
+    }
+
+    /// The first `limit` blocks at or after `from` in block-index order
+    /// `(min_ts, block)`, selected in one pass without sorting the table.
+    fn window_from(&self, from: (i64, u64), limit: usize) -> Vec<refs::BlockMeta> {
+        let mut nearest = std::collections::BinaryHeap::with_capacity(limit + 1);
+        for (index, meta) in self.metas.iter().enumerate() {
+            let key = (meta.min_ts, meta.block);
+            // Metas are mostly in index order, so once the window is full nearly
+            // every later key loses to its largest entry on this one comparison.
+            if key < from
+                || (nearest.len() == limit && nearest.peek().is_some_and(|&(top, _)| key >= top))
+            {
+                continue;
+            }
+            nearest.push((key, index));
+            if nearest.len() > limit {
+                nearest.pop();
+            }
+        }
+        nearest
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(_, index)| self.metas[index])
+            .collect()
     }
 
     /// Blocks whose id range overlaps [batch_min_id, batch_max_id].
@@ -842,9 +870,16 @@ pub(crate) fn table_stats(
     })
 }
 
-/// Rewrite at most one run per tick, bounding live output to target_rows and
-/// sources to 32 blocks (decoding cost still scales with their physical rows).
-/// The same lock as ingestion protects overrides and publication.
+/// Rewrite at most one run per call, bounding live output to `target_rows` and
+/// decoded sources to 32 blocks (decoding cost still scales with their
+/// physical rows). The same lock as ingestion protects overrides and
+/// publication, so a call must stay short: it resumes where the previous call
+/// stopped (`compact_cursor`, wrapping at the end) and inspects at most
+/// `COMPACT_WINDOW` blocks, whose override states come from one sequential
+/// scan. Re-walking the table from its oldest block with a point read per block
+/// held the ingest lock for O(all blocks) on every pass — a write stall per
+/// pass on a multi-million-block trade table. Fully overridden blocks are
+/// deleted without being read, so they do not count as sources.
 pub(crate) fn compact_table_blocks(
     db: &Arc<DB>,
     table: &str,
@@ -852,33 +887,40 @@ pub(crate) fn compact_table_blocks(
     target_rows: usize,
 ) -> Result<u64> {
     const MAX_SOURCE_BLOCKS: usize = 32;
+    const COMPACT_WINDOW: usize = 1024;
     let hash = calculate_table_hash(table);
     let cache = table_meta_cache(db, hash);
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let ordered = cache.in_time_range(i64::MIN, i64::MAX);
-    let mut selected = Vec::new();
+    let window = cache.window_from(cache.compact_cursor, COMPACT_WINDOW);
+    let Some(window_last) = window.last().copied() else {
+        cache.compact_cursor = (i64::MIN, 0);
+        return Ok(0);
+    };
+    let states = refs::load_override_states(&db.snapshot(), hash, &window)?;
+    let mut resume = (window_last.min_ts, window_last.block + 1);
+    let mut selected: Vec<refs::BlockMeta> = Vec::new();
+    let mut sources = 0usize;
     let mut live_rows = 0usize;
     let mut has_dead = false;
-    for meta in ordered {
-        let dead = db
-            .get(refs::override_key(hash, meta.block))?
-            .map(|data| refs::decode_override_positions(&data))
-            .unwrap_or_default();
-        let live = (meta.rows as usize)
-            .checked_sub(dead.len())
-            .ok_or_else(|| {
-                PulsoraError::InvalidData("Override count exceeds block rows".to_string())
-            })?;
+    for meta in window {
+        let dead_rows = if states.fully_dead.contains(&meta.block) {
+            meta.rows as usize
+        } else {
+            states.partial.get(&meta.block).map_or(0, |dead| dead.len())
+        };
+        let live = meta.rows as usize - dead_rows;
         if live >= target_rows
             || live_rows + live > target_rows
-            || selected.len() == MAX_SOURCE_BLOCKS
+            || (live > 0 && sources == MAX_SOURCE_BLOCKS)
         {
             if selected.len() > 1 || has_dead {
+                resume = (meta.min_ts, meta.block);
                 break;
             }
             selected.clear();
+            sources = 0;
             live_rows = 0;
             has_dead = false;
             if live >= target_rows {
@@ -886,22 +928,25 @@ pub(crate) fn compact_table_blocks(
             }
         }
         live_rows += live;
-        has_dead |= !dead.is_empty();
-        selected.push((meta, dead));
+        sources += usize::from(live > 0);
+        has_dead |= dead_rows > 0;
+        selected.push(meta);
     }
+    cache.compact_cursor = resume;
     if selected.is_empty() || (selected.len() == 1 && !has_dead) {
         return Ok(0);
     }
 
     let mut blocks = Vec::new();
-    for (meta, dead) in &selected {
-        if dead.len() == meta.rows as usize {
+    for meta in &selected {
+        if states.fully_dead.contains(&meta.block) {
             continue;
         }
         let block = read_block(db, hash, meta.block)?
             .ok_or_else(|| PulsoraError::InvalidData(format!("Missing block {}", meta.block)))?;
+        let dead = states.partial.get(&meta.block);
         let positions = (0..block.row_count)
-            .filter(|pos| !dead.contains(&(*pos as u32)))
+            .filter(|pos| !dead.is_some_and(|dead| dead.contains(&(*pos as u32))))
             .collect();
         blocks.push((block, positions));
     }
@@ -912,8 +957,8 @@ pub(crate) fn compact_table_blocks(
         let ids = block.get_id_values(schema)?;
         let (min_ts, max_ts) = block.timestamp_bounds(schema)?.unwrap_or_else(|| {
             (
-                selected.iter().map(|(meta, _)| meta.min_ts).min().unwrap(),
-                selected.iter().map(|(meta, _)| meta.max_ts).max().unwrap(),
+                selected.iter().map(|meta| meta.min_ts).min().unwrap(),
+                selected.iter().map(|meta| meta.max_ts).max().unwrap(),
             )
         });
         let meta = refs::BlockMeta {
@@ -931,9 +976,8 @@ pub(crate) fn compact_table_blocks(
         );
         replacement = Some(meta);
     }
-    let retired: std::collections::HashSet<u64> =
-        selected.iter().map(|(meta, _)| meta.block).collect();
-    for (meta, _) in &selected {
+    let retired: std::collections::HashSet<u64> = selected.iter().map(|meta| meta.block).collect();
+    for meta in &selected {
         batch.delete(refs::block_data_key(hash, meta.block));
         batch.delete(refs::block_index_key(hash, meta.min_ts, meta.block));
         batch.delete(refs::override_key(hash, meta.block));

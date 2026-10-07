@@ -347,6 +347,7 @@ fn cache_of(metas: &[refs::BlockMeta]) -> TableMetaCache {
     let mut cache = TableMetaCache {
         metas: Vec::new(),
         prefix_max_id: Vec::new(),
+        compact_cursor: (i64::MIN, 0),
     };
     for m in metas {
         cache.push(*m);
@@ -400,4 +401,28 @@ fn test_meta_cache_containing_id_newest_first() {
     assert_eq!(blocks(400), vec![5]);
     assert!(blocks(401).is_empty());
     assert!(blocks(0).is_empty());
+}
+
+#[test]
+fn test_meta_cache_window_follows_index_order_from_cursor() {
+    let cache = cache_of(&[
+        meta(1, 100, 200, 1, 10),
+        meta(2, 50, 60, 11, 20),
+        meta(3, 300, 400, 21, 30),
+        meta(4, 150, 160, 31, 40),
+        meta(5, 150, 500, 41, 50),
+    ]);
+    let blocks = |from, limit| -> Vec<u64> {
+        cache
+            .window_from(from, limit)
+            .iter()
+            .map(|m| m.block)
+            .collect()
+    };
+    assert_eq!(blocks((i64::MIN, 0), 10), vec![2, 1, 4, 5, 3]);
+    assert_eq!(blocks((i64::MIN, 0), 2), vec![2, 1]);
+    // The cursor is inclusive and orders by (min_ts, block).
+    assert_eq!(blocks((150, 4), 10), vec![4, 5, 3]);
+    assert_eq!(blocks((150, 5), 2), vec![5, 3]);
+    assert!(blocks((301, 0), 10).is_empty());
 }
