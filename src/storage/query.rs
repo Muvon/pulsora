@@ -19,9 +19,9 @@
 
 use arrow::record_batch::RecordBatch;
 use chrono::DateTime;
-use rocksdb::{ReadOptions, DB};
+use rocksdb::{Direction, IteratorMode, ReadOptions, DB};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{PulsoraError, Result};
@@ -119,6 +119,7 @@ pub fn execute_query(
     // (atomic {new block + overrides} batch) transiently hides the row.
     // Blocks ascend by min_ts.
     let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
+    let overrides = load_range_overrides(&snap, table_hash, &metadata)?;
 
     use rayon::prelude::*;
     let ts_col = schema.get_timestamp_column().map(str::to_string);
@@ -208,7 +209,7 @@ pub fn execute_query(
                             schema,
                             table_hash,
                             block_id: meta.block,
-                            block_rows: meta.rows,
+                            overrides: &overrides,
                             block_min_ts: meta.min_ts,
                             block_max_ts: meta.max_ts,
                             start_ts,
@@ -226,7 +227,7 @@ pub fn execute_query(
                         schema,
                         table_hash,
                         block_id: meta.block,
-                        block_rows: meta.rows,
+                        overrides: &overrides,
                         block_min_ts: meta.min_ts,
                         block_max_ts: meta.max_ts,
                         start_ts,
@@ -375,11 +376,66 @@ struct BlockQuery<'a> {
     schema: &'a Schema,
     table_hash: u32,
     block_id: u64,
-    block_rows: u32,
+    overrides: &'a RangeOverrides,
     block_min_ts: i64,
     block_max_ts: i64,
     start_ts: i64,
     end_ts: i64,
+}
+
+/// Dead-row state of the blocks one range query touches.
+#[derive(Default)]
+struct RangeOverrides {
+    fully_dead: HashSet<u64>,
+    partial: HashMap<u64, HashSet<u32>>,
+}
+
+/// Override sets of the query's blocks, read with ONE bounded iterator over
+/// the table's override keys (`[hash]['O'][block]`, ordered by block id).
+///
+/// Override values are merge operands, so a point read per block resolves
+/// operands across LSM levels — 2-3 ms each on a 70 GB store. REPLACE-heavy
+/// tables pay that for every dead copy: metric frames are re-ingested every
+/// minute until they close, ~60 dead single-row blocks per live row, which made
+/// a month of one symbol's frames take minutes to read.
+fn load_range_overrides(
+    snap: &rocksdb::Snapshot<'_>,
+    table_hash: u32,
+    metadata: &[refs::BlockMeta],
+) -> Result<RangeOverrides> {
+    let mut out = RangeOverrides::default();
+    let (Some(first), Some(last)) = (
+        metadata.iter().map(|meta| meta.block).min(),
+        metadata.iter().map(|meta| meta.block).max(),
+    ) else {
+        return Ok(out);
+    };
+    let rows: HashMap<u64, u32> = metadata
+        .iter()
+        .map(|meta| (meta.block, meta.rows))
+        .collect();
+    let mut opts = ReadOptions::default();
+    opts.set_verify_checksums(false);
+    opts.set_iterate_upper_bound(refs::override_key(table_hash, last + 1));
+    let start = refs::override_key(table_hash, first);
+    for item in snap.iterator_opt(IteratorMode::From(&start, Direction::Forward), opts) {
+        let (key, value) = item?;
+        let block = key
+            .get(5..13)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(|| PulsoraError::InvalidData("Malformed override key".to_string()))?;
+        let Some(&block_rows) = rows.get(&block) else {
+            continue;
+        };
+        let positions = refs::decode_override_positions(&value);
+        if positions.len() >= block_rows as usize {
+            out.fully_dead.insert(block);
+        } else {
+            out.partial.insert(block, positions);
+        }
+    }
+    Ok(out)
 }
 
 /// Fetch and deserialize a block by its numeric id.
@@ -398,26 +454,20 @@ fn fetch_block(
 }
 
 /// Fetch a block and its per-row validity, or `None` when the block is gone or
-/// every row is overridden.
-///
-/// A row is live unless its position appears in the block's override set —
-/// the (usually absent) record of positions superseded by later REPLACE
-/// ingests. The override set is read BEFORE the block: a table whose rows are
-/// rewritten in place (metric frames, re-ingested every minute until the frame
-/// closes) is mostly fully-dead single-row blocks, and each one would
-/// otherwise cost a random block read plus a full decode to yield nothing.
+/// every row is overridden — fully dead blocks are never read at all.
 fn fetch_live_block(query: &BlockQuery<'_>) -> Result<Option<(ColumnBlock, Vec<bool>)>> {
-    let overrides = load_overrides(query.snap, query.table_hash, query.block_id)?;
-    if overrides.len() >= query.block_rows as usize {
+    if query.overrides.fully_dead.contains(&query.block_id) {
         return Ok(None);
     }
     let Some(block) = fetch_block(query.snap, query.table_hash, query.block_id)? else {
         return Ok(None);
     };
     let mut valid = vec![true; block.row_count];
-    for pos in overrides {
-        if let Some(slot) = valid.get_mut(pos as usize) {
-            *slot = false;
+    if let Some(positions) = query.overrides.partial.get(&query.block_id) {
+        for &pos in positions {
+            if let Some(slot) = valid.get_mut(pos as usize) {
+                *slot = false;
+            }
         }
     }
     Ok(Some((block, valid)))
@@ -565,6 +615,7 @@ pub fn execute_query_csv(
     let table_hash = calculate_table_hash(table);
     // One snapshot for the whole query — see execute_query for rationale.
     let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
+    let overrides = load_range_overrides(&snap, table_hash, &metadata)?;
 
     use rayon::prelude::*;
     let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
@@ -579,7 +630,7 @@ pub fn execute_query_csv(
                         schema,
                         table_hash,
                         block_id: meta.block,
-                        block_rows: meta.rows,
+                        overrides: &overrides,
                         block_min_ts: meta.min_ts,
                         block_max_ts: meta.max_ts,
                         start_ts,
@@ -597,7 +648,7 @@ pub fn execute_query_csv(
                     schema,
                     table_hash,
                     block_id: meta.block,
-                    block_rows: meta.rows,
+                    overrides: &overrides,
                     block_min_ts: meta.min_ts,
                     block_max_ts: meta.max_ts,
                     start_ts,
@@ -658,6 +709,7 @@ pub fn execute_query_arrow(
     let table_hash = calculate_table_hash(table);
     // One snapshot for the whole query — see execute_query for rationale.
     let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
+    let overrides = load_range_overrides(&snap, table_hash, &metadata)?;
 
     use rayon::prelude::*;
     let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
@@ -672,7 +724,7 @@ pub fn execute_query_arrow(
                         schema,
                         table_hash,
                         block_id: meta.block,
-                        block_rows: meta.rows,
+                        overrides: &overrides,
                         block_min_ts: meta.min_ts,
                         block_max_ts: meta.max_ts,
                         start_ts,
@@ -690,7 +742,7 @@ pub fn execute_query_arrow(
                     schema,
                     table_hash,
                     block_id: meta.block,
-                    block_rows: meta.rows,
+                    overrides: &overrides,
                     block_min_ts: meta.min_ts,
                     block_max_ts: meta.max_ts,
                     start_ts,
