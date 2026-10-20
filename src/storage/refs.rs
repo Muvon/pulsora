@@ -61,127 +61,123 @@ static BLOCK_SEQ: Mutex<u64> = Mutex::new(0);
 /// before the id is handed out, so restarts can never reuse one. One read and
 /// one write per BLOCK (not per row) — negligible against block payload IO.
 pub fn allocate_block_id(db: &DB) -> Result<u64> {
-    let mut guard = BLOCK_SEQ
-        .lock()
-        .map_err(|_| PulsoraError::Internal("block sequence lock poisoned".to_string()))?;
+	let mut guard = BLOCK_SEQ
+		.lock()
+		.map_err(|_| PulsoraError::Internal("block sequence lock poisoned".to_string()))?;
 
-    let persisted = db
-        .get(BLOCK_SEQ_KEY)
-        .map_err(PulsoraError::RocksDb)?
-        .and_then(|v| v.as_slice().try_into().ok().map(u64::from_be_bytes))
-        .unwrap_or(0);
+	let persisted = db
+		.get(BLOCK_SEQ_KEY)
+		.map_err(PulsoraError::RocksDb)?
+		.and_then(|v| v.as_slice().try_into().ok().map(u64::from_be_bytes))
+		.unwrap_or(0);
 
-    let next = (*guard).max(persisted) + 1;
-    db.put(BLOCK_SEQ_KEY, next.to_be_bytes())
-        .map_err(PulsoraError::RocksDb)?;
-    *guard = next;
-    Ok(next)
+	let next = (*guard).max(persisted) + 1;
+	db.put(BLOCK_SEQ_KEY, next.to_be_bytes())
+		.map_err(PulsoraError::RocksDb)?;
+	*guard = next;
+	Ok(next)
 }
 
 /// `[hash: u32 BE]['D'][block: u64 BE]` — where the serialized block lives.
 pub fn block_data_key(table_hash: u32, block: u64) -> [u8; 13] {
-    let mut out = [0u8; 13];
-    out[0..4].copy_from_slice(&table_hash.to_be_bytes());
-    out[4] = b'D';
-    out[5..13].copy_from_slice(&block.to_be_bytes());
-    out
+	let mut out = [0u8; 13];
+	out[0..4].copy_from_slice(&table_hash.to_be_bytes());
+	out[4] = b'D';
+	out[5..13].copy_from_slice(&block.to_be_bytes());
+	out
 }
 
 /// `[hash: u32 BE]['B'][min_ts: i64 BE][block: u64 BE]`
 pub fn block_index_key(table_hash: u32, min_ts: i64, block: u64) -> [u8; 21] {
-    let mut out = [0u8; 21];
-    out[0..4].copy_from_slice(&table_hash.to_be_bytes());
-    out[4] = b'B';
-    out[5..13].copy_from_slice(&min_ts.to_be_bytes());
-    out[13..21].copy_from_slice(&block.to_be_bytes());
-    out
+	let mut out = [0u8; 21];
+	out[0..4].copy_from_slice(&table_hash.to_be_bytes());
+	out[4] = b'B';
+	out[5..13].copy_from_slice(&min_ts.to_be_bytes());
+	out[13..21].copy_from_slice(&block.to_be_bytes());
+	out
 }
 
 /// Block index metadata: time range, row count and id range of one block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockMeta {
-    pub block: u64,
-    pub min_ts: i64,
-    pub max_ts: i64,
-    pub rows: u32,
-    pub min_id: u64,
-    pub max_id: u64,
+	pub block: u64,
+	pub min_ts: i64,
+	pub max_ts: i64,
+	pub rows: u32,
+	pub min_id: u64,
+	pub max_id: u64,
 }
 
 /// `[block u64][min_ts i64][max_ts i64][rows u32][min_id u64][max_id u64]` LE
 pub fn encode_block_index_value(meta: &BlockMeta) -> [u8; BLOCK_INDEX_VALUE_LEN] {
-    let mut out = [0u8; BLOCK_INDEX_VALUE_LEN];
-    out[0..8].copy_from_slice(&meta.block.to_le_bytes());
-    out[8..16].copy_from_slice(&meta.min_ts.to_le_bytes());
-    out[16..24].copy_from_slice(&meta.max_ts.to_le_bytes());
-    out[24..28].copy_from_slice(&meta.rows.to_le_bytes());
-    out[28..36].copy_from_slice(&meta.min_id.to_le_bytes());
-    out[36..44].copy_from_slice(&meta.max_id.to_le_bytes());
-    out
+	let mut out = [0u8; BLOCK_INDEX_VALUE_LEN];
+	out[0..8].copy_from_slice(&meta.block.to_le_bytes());
+	out[8..16].copy_from_slice(&meta.min_ts.to_le_bytes());
+	out[16..24].copy_from_slice(&meta.max_ts.to_le_bytes());
+	out[24..28].copy_from_slice(&meta.rows.to_le_bytes());
+	out[28..36].copy_from_slice(&meta.min_id.to_le_bytes());
+	out[36..44].copy_from_slice(&meta.max_id.to_le_bytes());
+	out
 }
 
 /// Parse a block index value.
 pub fn parse_block_index_value(data: &[u8]) -> Result<BlockMeta> {
-    if data.len() != BLOCK_INDEX_VALUE_LEN {
-        return Err(PulsoraError::Internal(format!(
-            "invalid block index value ({} bytes)",
-            data.len()
-        )));
-    }
-    Ok(BlockMeta {
-        block: u64::from_le_bytes(data[0..8].try_into().unwrap()),
-        min_ts: i64::from_le_bytes(data[8..16].try_into().unwrap()),
-        max_ts: i64::from_le_bytes(data[16..24].try_into().unwrap()),
-        rows: u32::from_le_bytes(data[24..28].try_into().unwrap()),
-        min_id: u64::from_le_bytes(data[28..36].try_into().unwrap()),
-        max_id: u64::from_le_bytes(data[36..44].try_into().unwrap()),
-    })
+	if data.len() != BLOCK_INDEX_VALUE_LEN {
+		return Err(PulsoraError::Internal(format!(
+			"invalid block index value ({} bytes)",
+			data.len()
+		)));
+	}
+	Ok(BlockMeta {
+		block: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+		min_ts: i64::from_le_bytes(data[8..16].try_into().unwrap()),
+		max_ts: i64::from_le_bytes(data[16..24].try_into().unwrap()),
+		rows: u32::from_le_bytes(data[24..28].try_into().unwrap()),
+		min_id: u64::from_le_bytes(data[28..36].try_into().unwrap()),
+		max_id: u64::from_le_bytes(data[36..44].try_into().unwrap()),
+	})
 }
 
 /// `[hash: u32 BE]['O'][block: u64 BE]` — the block's override (dead-row) set.
 pub fn override_key(table_hash: u32, block: u64) -> [u8; 13] {
-    let mut out = [0u8; 13];
-    out[0..4].copy_from_slice(&table_hash.to_be_bytes());
-    out[4] = b'O';
-    out[5..13].copy_from_slice(&block.to_be_bytes());
-    out
+	let mut out = [0u8; 13];
+	out[0..4].copy_from_slice(&table_hash.to_be_bytes());
+	out[4] = b'O';
+	out[5..13].copy_from_slice(&block.to_be_bytes());
+	out
 }
 
 /// Encode row positions as a mergeable override operand (`[row: u32 LE]`*).
 pub fn encode_override_positions(positions: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(positions.len() * 4);
-    for &pos in positions {
-        out.extend_from_slice(&pos.to_le_bytes());
-    }
-    out
+	let mut out = Vec::with_capacity(positions.len() * 4);
+	for &pos in positions {
+		out.extend_from_slice(&pos.to_le_bytes());
+	}
+	out
 }
 
 /// Decode an override value into the set of dead row positions. Tolerates
 /// duplicates (concatenated merge operands) by virtue of returning a set.
 pub fn decode_override_positions(data: &[u8]) -> std::collections::HashSet<u32> {
-    let mut out = std::collections::HashSet::with_capacity(data.len() / 4);
-    for chunk in data.as_chunks::<4>().0 {
-        out.insert(u32::from_le_bytes(*chunk));
-    }
-    out
+	let mut out = std::collections::HashSet::with_capacity(data.len() / 4);
+	for chunk in data.as_chunks::<4>().0 {
+		out.insert(u32::from_le_bytes(*chunk));
+	}
+	out
 }
 
 /// Associative merge for override values: union of dead positions.
 /// Registered as the database-wide merge operator — `merge()` is only ever
 /// issued against `'O'` keys, so the union semantics never touch other data.
 /// Deduplicates on every merge so values stay bounded by the block row count.
-pub fn override_merge(
-    _key: &[u8],
-    existing: Option<&[u8]>,
-    operands: &rocksdb::MergeOperands,
-) -> Option<Vec<u8>> {
-    let mut set = existing.map(decode_override_positions).unwrap_or_default();
-    for op in operands {
-        set.extend(decode_override_positions(op));
-    }
-    let mut positions: Vec<u32> = set.into_iter().collect();
-    positions.sort_unstable();
-    Some(encode_override_positions(&positions))
+pub fn override_merge(_key: &[u8], existing: Option<&[u8]>, operands: &rocksdb::MergeOperands) -> Option<Vec<u8>> {
+	let mut set = existing.map(decode_override_positions).unwrap_or_default();
+	for op in operands {
+		set.extend(decode_override_positions(op));
+	}
+	let mut positions: Vec<u32> = set.into_iter().collect();
+	positions.sort_unstable();
+	Some(encode_override_positions(&positions))
 }
 
 /// Dead-row state of a set of blocks: fully overridden blocks (never worth
@@ -189,8 +185,8 @@ pub fn override_merge(
 /// from both are entirely live.
 #[derive(Debug, Default)]
 pub struct OverrideStates {
-    pub fully_dead: HashSet<u64>,
-    pub partial: HashMap<u64, HashSet<u32>>,
+	pub fully_dead: HashSet<u64>,
+	pub partial: HashMap<u64, HashSet<u32>>,
 }
 
 /// Block ids closer than this share one override scan: reading through the
@@ -206,79 +202,76 @@ const OVERRIDE_SCAN_GAP: u64 = 4096;
 /// they close, leaving ~60 dead single-row blocks per live row, which made one
 /// symbol's 83-day frame read take minutes.
 pub fn load_override_states(
-    snap: &rocksdb::Snapshot<'_>,
-    table_hash: u32,
-    metas: &[BlockMeta],
+	snap: &rocksdb::Snapshot<'_>,
+	table_hash: u32,
+	metas: &[BlockMeta],
 ) -> Result<OverrideStates> {
-    let rows: HashMap<u64, u32> = metas.iter().map(|meta| (meta.block, meta.rows)).collect();
-    let mut blocks: Vec<u64> = rows.keys().copied().collect();
-    blocks.sort_unstable();
-    let mut out = OverrideStates::default();
-    let mut next = 0;
-    while next < blocks.len() {
-        let first = blocks[next];
-        let mut last = first;
-        next += 1;
-        while next < blocks.len() && blocks[next] - last <= OVERRIDE_SCAN_GAP {
-            last = blocks[next];
-            next += 1;
-        }
-        let mut opts = ReadOptions::default();
-        opts.set_verify_checksums(false);
-        opts.set_iterate_upper_bound(override_key(table_hash, last + 1));
-        let start = override_key(table_hash, first);
-        for item in snap.iterator_opt(IteratorMode::From(&start, Direction::Forward), opts) {
-            let (key, value) = item?;
-            let block = key
-                .get(5..13)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u64::from_be_bytes)
-                .ok_or_else(|| PulsoraError::InvalidData("Malformed override key".to_string()))?;
-            let Some(&block_rows) = rows.get(&block) else {
-                continue;
-            };
-            let mut positions = decode_override_positions(&value);
-            positions.retain(|&pos| pos < block_rows);
-            if positions.len() == block_rows as usize {
-                out.fully_dead.insert(block);
-            } else {
-                out.partial.insert(block, positions);
-            }
-        }
-    }
-    Ok(out)
+	let rows: HashMap<u64, u32> = metas.iter().map(|meta| (meta.block, meta.rows)).collect();
+	let mut blocks: Vec<u64> = rows.keys().copied().collect();
+	blocks.sort_unstable();
+	let mut out = OverrideStates::default();
+	let mut next = 0;
+	while next < blocks.len() {
+		let first = blocks[next];
+		let mut last = first;
+		next += 1;
+		while next < blocks.len() && blocks[next] - last <= OVERRIDE_SCAN_GAP {
+			last = blocks[next];
+			next += 1;
+		}
+		let mut opts = ReadOptions::default();
+		opts.set_verify_checksums(false);
+		opts.set_iterate_upper_bound(override_key(table_hash, last + 1));
+		let start = override_key(table_hash, first);
+		for item in snap.iterator_opt(IteratorMode::From(&start, Direction::Forward), opts) {
+			let (key, value) = item?;
+			let block = key
+				.get(5..13)
+				.and_then(|bytes| bytes.try_into().ok())
+				.map(u64::from_be_bytes)
+				.ok_or_else(|| PulsoraError::InvalidData("Malformed override key".to_string()))?;
+			let Some(&block_rows) = rows.get(&block) else {
+				continue;
+			};
+			let mut positions = decode_override_positions(&value);
+			positions.retain(|&pos| pos < block_rows);
+			if positions.len() == block_rows as usize {
+				out.fully_dead.insert(block);
+			} else {
+				out.partial.insert(block, positions);
+			}
+		}
+	}
+	Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    #[test]
-    fn block_index_value_roundtrip() {
-        let meta = BlockMeta {
-            block: 7,
-            min_ts: -5,
-            max_ts: 12345678901234,
-            rows: 999,
-            min_id: 42,
-            max_id: u64::MAX - 1,
-        };
-        assert_eq!(
-            parse_block_index_value(&encode_block_index_value(&meta)).unwrap(),
-            meta
-        );
-    }
+	#[test]
+	fn block_index_value_roundtrip() {
+		let meta = BlockMeta {
+			block: 7,
+			min_ts: -5,
+			max_ts: 12345678901234,
+			rows: 999,
+			min_id: 42,
+			max_id: u64::MAX - 1,
+		};
+		assert_eq!(parse_block_index_value(&encode_block_index_value(&meta)).unwrap(), meta);
+	}
 
-    #[test]
-    fn block_index_value_rejects_old_format() {
-        assert!(parse_block_index_value(&[0u8; 28]).is_err());
-    }
+	#[test]
+	fn block_index_value_rejects_old_format() {
+		assert!(parse_block_index_value(&[0u8; 28]).is_err());
+	}
 
-    #[test]
-    fn override_positions_roundtrip_dedup() {
-        let encoded = encode_override_positions(&[3, 1, 3, 7]);
-        let set = decode_override_positions(&encoded);
-        assert_eq!(set.len(), 3);
-        assert!(set.contains(&1) && set.contains(&3) && set.contains(&7));
-    }
+	#[test]
+	fn override_positions_roundtrip_dedup() {
+		let encoded = encode_override_positions(&[3, 1, 3, 7]);
+		let set = decode_override_positions(&encoded);
+		assert_eq!(set.len(), 3);
+		assert!(set.contains(&1) && set.contains(&3) && set.contains(&7));
+	}
 }

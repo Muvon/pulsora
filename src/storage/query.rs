@@ -38,402 +38,374 @@ use crate::storage::schema::Schema;
 /// checked NEWEST first — block ids are strictly increasing with write time,
 /// so the first non-overridden hit is the live copy. (This used to walk the
 /// table's whole on-disk block index on every call.)
-pub fn get_row_by_id(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    id: u64,
-) -> Result<Option<HashMap<String, String>>> {
-    let table_hash = calculate_table_hash(table);
-    // One snapshot covers the candidate list AND the block/override reads: a
-    // concurrent REPLACE commits {new block + overrides} atomically, and a
-    // mixed view (old candidate set + new overrides) would serve nothing.
-    let (snap, candidates) = ingestion::snapshot_blocks_with_id(db, table_hash, id);
-    for meta in candidates {
-        let Some(block) = fetch_block(&snap, table_hash, meta.block)? else {
-            continue;
-        };
-        let ids = block.get_id_values(schema)?;
-        // rposition: a block can hold the same id more than once (in-batch
-        // duplicates), with every position except the LAST self-overridden —
-        // only the last occurrence can be the live copy.
-        let Some(row_idx) = ids.iter().rposition(|&row_id| row_id == id) else {
-            continue;
-        };
-        let overrides = load_overrides(&snap, table_hash, meta.block)?;
-        if overrides.contains(&(row_idx as u32)) {
-            // Dead copy; any live copy sits in a NEWER block, which this
-            // newest-first scan has already visited — keep going only to
-            // honor older candidates of the same id (also dead) cleanly.
-            continue;
-        }
-        let rows = block.to_rows(schema)?;
-        return Ok(rows.get(row_idx).cloned());
-    }
-    Ok(None)
+pub fn get_row_by_id(db: &Arc<DB>, table: &str, schema: &Schema, id: u64) -> Result<Option<HashMap<String, String>>> {
+	let table_hash = calculate_table_hash(table);
+	// One snapshot covers the candidate list AND the block/override reads: a
+	// concurrent REPLACE commits {new block + overrides} atomically, and a
+	// mixed view (old candidate set + new overrides) would serve nothing.
+	let (snap, candidates) = ingestion::snapshot_blocks_with_id(db, table_hash, id);
+	for meta in candidates {
+		let Some(block) = fetch_block(&snap, table_hash, meta.block)? else {
+			continue;
+		};
+		let ids = block.get_id_values(schema)?;
+		// rposition: a block can hold the same id more than once (in-batch
+		// duplicates), with every position except the LAST self-overridden —
+		// only the last occurrence can be the live copy.
+		let Some(row_idx) = ids.iter().rposition(|&row_id| row_id == id) else {
+			continue;
+		};
+		let overrides = load_overrides(&snap, table_hash, meta.block)?;
+		if overrides.contains(&(row_idx as u32)) {
+			// Dead copy; any live copy sits in a NEWER block, which this
+			// newest-first scan has already visited — keep going only to
+			// honor older candidates of the same id (also dead) cleanly.
+			continue;
+		}
+		let rows = block.to_rows(schema)?;
+		return Ok(rows.get(row_idx).cloned());
+	}
+	Ok(None)
 }
 
 /// Load a block's override set (dead row positions). Absent key = all live.
 fn load_overrides(
-    snap: &rocksdb::Snapshot<'_>,
-    table_hash: u32,
-    block_id: u64,
+	snap: &rocksdb::Snapshot<'_>,
+	table_hash: u32,
+	block_id: u64,
 ) -> Result<std::collections::HashSet<u32>> {
-    let mut opts = ReadOptions::default();
-    opts.set_verify_checksums(false);
-    opts.fill_cache(true);
-    match snap.get_opt(refs::override_key(table_hash, block_id), opts)? {
-        Some(data) => Ok(refs::decode_override_positions(&data)),
-        None => Ok(std::collections::HashSet::new()),
-    }
+	let mut opts = ReadOptions::default();
+	opts.set_verify_checksums(false);
+	opts.fill_cache(true);
+	match snap.get_opt(refs::override_key(table_hash, block_id), opts)? {
+		Some(data) => Ok(refs::decode_override_positions(&data)),
+		None => Ok(std::collections::HashSet::new()),
+	}
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_query(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    start: Option<String>,
-    end: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    pool: &rayon::ThreadPool,
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	start: Option<String>,
+	end: Option<String>,
+	limit: Option<usize>,
+	offset: Option<usize>,
+	pool: &rayon::ThreadPool,
 ) -> Result<Vec<Value>> {
-    let start_ts = start
-        .as_deref()
-        .map(parse_query_timestamp)
-        .transpose()?
-        .unwrap_or(0);
-    let end_ts = end
-        .as_deref()
-        .map(parse_query_timestamp)
-        .transpose()?
-        .unwrap_or(i64::MAX);
-    let limit = limit.unwrap_or(1000);
-    let offset = offset.unwrap_or(0);
-    let needed = offset.saturating_add(limit);
+	let start_ts = start.as_deref().map(parse_query_timestamp).transpose()?.unwrap_or(0);
+	let end_ts = end
+		.as_deref()
+		.map(parse_query_timestamp)
+		.transpose()?
+		.unwrap_or(i64::MAX);
+	let limit = limit.unwrap_or(1000);
+	let offset = offset.unwrap_or(0);
+	let needed = offset.saturating_add(limit);
 
-    let table_hash = calculate_table_hash(table);
-    // One snapshot for the whole query: the block list and every block /
-    // override read must observe the same state, or a concurrent REPLACE
-    // (atomic {new block + overrides} batch) transiently hides the row.
-    // Blocks ascend by min_ts.
-    let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
-    let overrides = refs::load_override_states(&snap, table_hash, &metadata)?;
+	let table_hash = calculate_table_hash(table);
+	// One snapshot for the whole query: the block list and every block /
+	// override read must observe the same state, or a concurrent REPLACE
+	// (atomic {new block + overrides} batch) transiently hides the row.
+	// Blocks ascend by min_ts.
+	let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
+	let overrides = refs::load_override_states(&snap, table_hash, &metadata)?;
 
-    use rayon::prelude::*;
-    let ts_col = schema.get_timestamp_column().map(str::to_string);
+	use rayon::prelude::*;
+	let ts_col = schema.get_timestamp_column().map(str::to_string);
 
-    // Row timestamp in milliseconds for the early-exit bound. Values render
-    // either as epoch numbers or formatted strings depending on column type.
-    let row_ts = |row: &Value| -> i64 {
-        let Some(ts_col) = ts_col.as_deref() else {
-            return 0;
-        };
-        let ts = match row.get(ts_col) {
-            Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
-            Some(Value::String(s)) => crate::storage::ingestion::parse_timestamp(s).unwrap_or(0),
-            _ => 0,
-        };
-        // Normalize plain epoch seconds to milliseconds (block keys are ms)
-        if ts > 0 && ts < 100_000_000_000 {
-            ts * 1000
-        } else {
-            ts
-        }
-    };
+	// Row timestamp in milliseconds for the early-exit bound. Values render
+	// either as epoch numbers or formatted strings depending on column type.
+	let row_ts = |row: &Value| -> i64 {
+		let Some(ts_col) = ts_col.as_deref() else {
+			return 0;
+		};
+		let ts = match row.get(ts_col) {
+			Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+			Some(Value::String(s)) => crate::storage::ingestion::parse_timestamp(s).unwrap_or(0),
+			_ => 0,
+		};
+		// Normalize plain epoch seconds to milliseconds (block keys are ms)
+		if ts > 0 && ts < 100_000_000_000 {
+			ts * 1000
+		} else {
+			ts
+		}
+	};
 
-    // Each in-range block is processed independently — fetch, validity-filter,
-    // serialize the live rows to JSON. Blocks are consumed in chunks with an
-    // EARLY EXIT once enough valid rows are collected AND no unprocessed block
-    // can still contribute to the first `needed` ranks: a `limit=1` probe must
-    // not decompress the whole table. Only valid (non-stale) rows count toward
-    // the exit, so REPLACE-stale rows cannot starve later blocks; overlapping
-    // block time ranges are handled by bounding on collected row timestamps.
-    let pool_threads = pool.current_num_threads();
-    let chunk_size = if pool_threads > 1 {
-        (pool_threads * 2).max(4)
-    } else {
-        4
-    };
+	// Each in-range block is processed independently — fetch, validity-filter,
+	// serialize the live rows to JSON. Blocks are consumed in chunks with an
+	// EARLY EXIT once enough valid rows are collected AND no unprocessed block
+	// can still contribute to the first `needed` ranks: a `limit=1` probe must
+	// not decompress the whole table. Only valid (non-stale) rows count toward
+	// the exit, so REPLACE-stale rows cannot starve later blocks; overlapping
+	// block time ranges are handled by bounding on collected row timestamps.
+	let pool_threads = pool.current_num_threads();
+	let chunk_size = if pool_threads > 1 { (pool_threads * 2).max(4) } else { 4 };
 
-    let mut all: Vec<Value> = Vec::new();
-    // Early-exit bound: the timestamp of the `needed`-th smallest collected
-    // row (a bounded max-heap over the best `needed` candidates). Bounding on
-    // the max of ALL collected rows would never fire on contiguous data —
-    // consecutive blocks share boundary seconds, so the running max always
-    // reaches into the next block. The k-th rank stays anchored instead.
-    let mut top_ts: std::collections::BinaryHeap<i64> = std::collections::BinaryHeap::new();
+	let mut all: Vec<Value> = Vec::new();
+	// Early-exit bound: the timestamp of the `needed`-th smallest collected
+	// row (a bounded max-heap over the best `needed` candidates). Bounding on
+	// the max of ALL collected rows would never fire on contiguous data —
+	// consecutive blocks share boundary seconds, so the running max always
+	// reaches into the next block. The k-th rank stays anchored instead.
+	let mut top_ts: std::collections::BinaryHeap<i64> = std::collections::BinaryHeap::new();
 
-    let mut idx = 0;
-    while idx < metadata.len() {
-        // Adaptive chunk: just enough blocks (by stored row counts — an upper
-        // bound on valid rows) to plausibly satisfy `needed`, capped at
-        // `chunk_size` for memory. A limit=1 probe then touches one block
-        // instead of a full parallel sweep.
-        let mut chunk_end = idx;
-        let mut rows_estimate = 0usize;
-        while chunk_end < metadata.len() && (chunk_end - idx) < chunk_size {
-            rows_estimate += metadata[chunk_end].rows as usize;
-            chunk_end += 1;
-            if rows_estimate >= needed.saturating_mul(2) {
-                break;
-            }
-        }
-        let chunk = &metadata[idx..chunk_end];
-        idx = chunk_end;
+	let mut idx = 0;
+	while idx < metadata.len() {
+		// Adaptive chunk: just enough blocks (by stored row counts — an upper
+		// bound on valid rows) to plausibly satisfy `needed`, capped at
+		// `chunk_size` for memory. A limit=1 probe then touches one block
+		// instead of a full parallel sweep.
+		let mut chunk_end = idx;
+		let mut rows_estimate = 0usize;
+		while chunk_end < metadata.len() && (chunk_end - idx) < chunk_size {
+			rows_estimate += metadata[chunk_end].rows as usize;
+			chunk_end += 1;
+			if rows_estimate >= needed.saturating_mul(2) {
+				break;
+			}
+		}
+		let chunk = &metadata[idx..chunk_end];
+		idx = chunk_end;
 
-        if top_ts.len() >= needed {
-            // Blocks are ordered by min_ts: a block starting strictly past the
-            // needed-th ranked row cannot change the first `needed` rows, and
-            // neither can any block after it.
-            let bound = top_ts.peek().copied().unwrap_or(i64::MAX);
-            let next_can_contribute = ts_col.is_some()
-                && chunk
-                    .first()
-                    .map(|meta| meta.min_ts <= bound)
-                    .unwrap_or(false);
-            if !next_can_contribute {
-                break;
-            }
-        }
+		if top_ts.len() >= needed {
+			// Blocks are ordered by min_ts: a block starting strictly past the
+			// needed-th ranked row cannot change the first `needed` rows, and
+			// neither can any block after it.
+			let bound = top_ts.peek().copied().unwrap_or(i64::MAX);
+			let next_can_contribute =
+				ts_col.is_some() && chunk.first().map(|meta| meta.min_ts <= bound).unwrap_or(false);
+			if !next_can_contribute {
+				break;
+			}
+		}
 
-        let use_parallel = chunk.len() >= 4 && pool_threads > 1;
-        let per_block: Result<Vec<Vec<Value>>> = if use_parallel {
-            pool.install(|| {
-                chunk
-                    .par_iter()
-                    .map(|meta| {
-                        block_to_json(BlockQuery {
-                            snap: &snap,
-                            schema,
-                            table_hash,
-                            block_id: meta.block,
-                            overrides: &overrides,
-                            block_min_ts: meta.min_ts,
-                            block_max_ts: meta.max_ts,
-                            start_ts,
-                            end_ts,
-                        })
-                    })
-                    .collect()
-            })
-        } else {
-            chunk
-                .iter()
-                .map(|meta| {
-                    block_to_json(BlockQuery {
-                        snap: &snap,
-                        schema,
-                        table_hash,
-                        block_id: meta.block,
-                        overrides: &overrides,
-                        block_min_ts: meta.min_ts,
-                        block_max_ts: meta.max_ts,
-                        start_ts,
-                        end_ts,
-                    })
-                })
-                .collect()
-        };
+		let use_parallel = chunk.len() >= 4 && pool_threads > 1;
+		let per_block: Result<Vec<Vec<Value>>> = if use_parallel {
+			pool.install(|| {
+				chunk
+					.par_iter()
+					.map(|meta| {
+						block_to_json(BlockQuery {
+							snap: &snap,
+							schema,
+							table_hash,
+							block_id: meta.block,
+							overrides: &overrides,
+							block_min_ts: meta.min_ts,
+							block_max_ts: meta.max_ts,
+							start_ts,
+							end_ts,
+						})
+					})
+					.collect()
+			})
+		} else {
+			chunk
+				.iter()
+				.map(|meta| {
+					block_to_json(BlockQuery {
+						snap: &snap,
+						schema,
+						table_hash,
+						block_id: meta.block,
+						overrides: &overrides,
+						block_min_ts: meta.min_ts,
+						block_max_ts: meta.max_ts,
+						start_ts,
+						end_ts,
+					})
+				})
+				.collect()
+		};
 
-        for batch in per_block? {
-            for row in batch {
-                let ts = row_ts(&row);
-                if top_ts.len() < needed {
-                    top_ts.push(ts);
-                } else if let Some(mut worst) = top_ts.peek_mut() {
-                    if ts < *worst {
-                        *worst = ts;
-                    }
-                }
-                all.push(row);
-            }
-        }
-    }
+		for batch in per_block? {
+			for row in batch {
+				let ts = row_ts(&row);
+				if top_ts.len() < needed {
+					top_ts.push(ts);
+				} else if let Some(mut worst) = top_ts.peek_mut() {
+					if ts < *worst {
+						*worst = ts;
+					}
+				}
+				all.push(row);
+			}
+		}
+	}
 
-    // Cut to the requested window in TOTAL order (ts, id). Sorting by ts alone
-    // leaves same-second rows in nondeterministic relative order, which makes
-    // offset pagination drop/duplicate tied rows across requests.
-    let id_col = schema.id_column.clone();
-    let row_id = move |row: &Value| -> u64 {
-        match row.get(&id_col) {
-            Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
-            Some(Value::String(s)) => s.parse().unwrap_or(0),
-            _ => 0,
-        }
-    };
-    all.sort_by_cached_key(|row| (row_ts(row), row_id(row)));
+	// Cut to the requested window in TOTAL order (ts, id). Sorting by ts alone
+	// leaves same-second rows in nondeterministic relative order, which makes
+	// offset pagination drop/duplicate tied rows across requests.
+	let id_col = schema.id_column.clone();
+	let row_id = move |row: &Value| -> u64 {
+		match row.get(&id_col) {
+			Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+			Some(Value::String(s)) => s.parse().unwrap_or(0),
+			_ => 0,
+		}
+	};
+	all.sort_by_cached_key(|row| (row_ts(row), row_id(row)));
 
-    Ok(all.into_iter().skip(offset).take(limit).collect())
+	Ok(all.into_iter().skip(offset).take(limit).collect())
 }
 
 pub fn parse_query_timestamp(timestamp: &str) -> Result<i64> {
-    // Try parsing as Unix timestamp first
-    if let Ok(ts) = timestamp.parse::<i64>() {
-        if ts > 1_000_000_000 && ts < 4_000_000_000 {
-            return Ok(ts * 1000); // Convert to milliseconds
-        }
-        // Already in milliseconds
-        if ts > 1_000_000_000_000 {
-            return Ok(ts);
-        }
-    }
+	// Try parsing as Unix timestamp first
+	if let Ok(ts) = timestamp.parse::<i64>() {
+		if ts > 1_000_000_000 && ts < 4_000_000_000 {
+			return Ok(ts * 1000); // Convert to milliseconds
+		}
+		// Already in milliseconds
+		if ts > 1_000_000_000_000 {
+			return Ok(ts);
+		}
+	}
 
-    // Try parsing as ISO datetime
-    if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) {
-        return Ok(dt.timestamp_millis());
-    }
+	// Try parsing as ISO datetime
+	if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) {
+		return Ok(dt.timestamp_millis());
+	}
 
-    // Try common datetime formats (with time component).
-    let datetime_formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"];
+	// Try common datetime formats (with time component).
+	let datetime_formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"];
 
-    for format in &datetime_formats {
-        if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(timestamp, format) {
-            return Ok(naive_dt.and_utc().timestamp_millis());
-        }
-    }
+	for format in &datetime_formats {
+		if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(timestamp, format) {
+			return Ok(naive_dt.and_utc().timestamp_millis());
+		}
+	}
 
-    // Date-only ("%Y-%m-%d") must go through NaiveDate; NaiveDateTime rejects
-    // it because it has no time component. Mirrors ingestion::parse_timestamp
-    // so query-time and ingest-time accept the same surface.
-    if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d") {
-        return Ok(naive_date
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis());
-    }
+	// Date-only ("%Y-%m-%d") must go through NaiveDate; NaiveDateTime rejects
+	// it because it has no time component. Mirrors ingestion::parse_timestamp
+	// so query-time and ingest-time accept the same surface.
+	if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d") {
+		return Ok(naive_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis());
+	}
 
-    Err(PulsoraError::Query(format!(
-        "Invalid timestamp format: {}",
-        timestamp
-    )))
+	Err(PulsoraError::Query(format!("Invalid timestamp format: {}", timestamp)))
 }
 
 // Keep the original function name for compatibility
 pub fn convert_row_to_json(row: &HashMap<String, String>, schema: &Schema) -> Result<Value> {
-    let mut json_obj = serde_json::Map::with_capacity(row.len());
+	let mut json_obj = serde_json::Map::with_capacity(row.len());
 
-    for (key, value) in row {
-        // Linear search is fine for small schemas, binary search doesn't help much
-        let column = schema.columns.iter().find(|c| c.name == *key);
+	for (key, value) in row {
+		// Linear search is fine for small schemas, binary search doesn't help much
+		let column = schema.columns.iter().find(|c| c.name == *key);
 
-        if let Some(column) = column {
-            let json_value = match column.data_type {
-                crate::storage::schema::DataType::Id => {
-                    // Use fast parsing from encoding module
-                    if let Some(id) = crate::storage::encoding::fast_parse_u64(value) {
-                        Value::Number(serde_json::Number::from(id))
-                    } else {
-                        Value::String(value.clone())
-                    }
-                }
-                crate::storage::schema::DataType::Integer => {
-                    // Use fast parsing from encoding module
-                    if let Some(i) = crate::storage::encoding::fast_parse_i64(value) {
-                        Value::Number(serde_json::Number::from(i))
-                    } else {
-                        Value::String(value.clone())
-                    }
-                }
-                crate::storage::schema::DataType::Float => match value.parse::<f64>() {
-                    Ok(f) => Value::Number(
-                        serde_json::Number::from_f64(f)
-                            .unwrap_or_else(|| serde_json::Number::from(0)),
-                    ),
-                    Err(_) => Value::String(value.clone()),
-                },
-                crate::storage::schema::DataType::Boolean => match value.as_bytes() {
-                    b"true" => Value::Bool(true),
-                    b"false" => Value::Bool(false),
-                    _ => Value::String(value.clone()),
-                },
-                crate::storage::schema::DataType::Timestamp => {
-                    if let Some(millis) = crate::storage::encoding::fast_parse_i64(value) {
-                        if let Some(datetime) = chrono::DateTime::from_timestamp_millis(millis) {
-                            Value::String(datetime.to_rfc3339())
-                        } else {
-                            Value::String(value.clone())
-                        }
-                    } else {
-                        Value::String(value.clone())
-                    }
-                }
-                crate::storage::schema::DataType::String => Value::String(value.clone()),
-            };
-            json_obj.insert(key.clone(), json_value);
-        } else {
-            json_obj.insert(key.clone(), Value::String(value.clone()));
-        }
-    }
+		if let Some(column) = column {
+			let json_value = match column.data_type {
+				crate::storage::schema::DataType::Id => {
+					// Use fast parsing from encoding module
+					if let Some(id) = crate::storage::encoding::fast_parse_u64(value) {
+						Value::Number(serde_json::Number::from(id))
+					} else {
+						Value::String(value.clone())
+					}
+				}
+				crate::storage::schema::DataType::Integer => {
+					// Use fast parsing from encoding module
+					if let Some(i) = crate::storage::encoding::fast_parse_i64(value) {
+						Value::Number(serde_json::Number::from(i))
+					} else {
+						Value::String(value.clone())
+					}
+				}
+				crate::storage::schema::DataType::Float => match value.parse::<f64>() {
+					Ok(f) => {
+						Value::Number(serde_json::Number::from_f64(f).unwrap_or_else(|| serde_json::Number::from(0)))
+					}
+					Err(_) => Value::String(value.clone()),
+				},
+				crate::storage::schema::DataType::Boolean => match value.as_bytes() {
+					b"true" => Value::Bool(true),
+					b"false" => Value::Bool(false),
+					_ => Value::String(value.clone()),
+				},
+				crate::storage::schema::DataType::Timestamp => {
+					if let Some(millis) = crate::storage::encoding::fast_parse_i64(value) {
+						if let Some(datetime) = chrono::DateTime::from_timestamp_millis(millis) {
+							Value::String(datetime.to_rfc3339())
+						} else {
+							Value::String(value.clone())
+						}
+					} else {
+						Value::String(value.clone())
+					}
+				}
+				crate::storage::schema::DataType::String => Value::String(value.clone()),
+			};
+			json_obj.insert(key.clone(), json_value);
+		} else {
+			json_obj.insert(key.clone(), Value::String(value.clone()));
+		}
+	}
 
-    Ok(Value::Object(json_obj))
+	Ok(Value::Object(json_obj))
 }
 
 struct BlockQuery<'a> {
-    snap: &'a rocksdb::Snapshot<'a>,
-    schema: &'a Schema,
-    table_hash: u32,
-    block_id: u64,
-    overrides: &'a refs::OverrideStates,
-    block_min_ts: i64,
-    block_max_ts: i64,
-    start_ts: i64,
-    end_ts: i64,
+	snap: &'a rocksdb::Snapshot<'a>,
+	schema: &'a Schema,
+	table_hash: u32,
+	block_id: u64,
+	overrides: &'a refs::OverrideStates,
+	block_min_ts: i64,
+	block_max_ts: i64,
+	start_ts: i64,
+	end_ts: i64,
 }
 
 /// Fetch and deserialize a block by its numeric id.
-fn fetch_block(
-    snap: &rocksdb::Snapshot<'_>,
-    table_hash: u32,
-    block_id: u64,
-) -> Result<Option<ColumnBlock>> {
-    let mut opts = ReadOptions::default();
-    opts.set_verify_checksums(false);
-    opts.fill_cache(true);
-    match snap.get_opt(refs::block_data_key(table_hash, block_id), opts)? {
-        Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),
-        None => Ok(None),
-    }
+fn fetch_block(snap: &rocksdb::Snapshot<'_>, table_hash: u32, block_id: u64) -> Result<Option<ColumnBlock>> {
+	let mut opts = ReadOptions::default();
+	opts.set_verify_checksums(false);
+	opts.fill_cache(true);
+	match snap.get_opt(refs::block_data_key(table_hash, block_id), opts)? {
+		Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),
+		None => Ok(None),
+	}
 }
 
 /// Fetch a block and its per-row validity, or `None` when the block is gone or
 /// every row is overridden — fully dead blocks are never read at all.
 fn fetch_live_block(query: &BlockQuery<'_>) -> Result<Option<(ColumnBlock, Vec<bool>)>> {
-    if query.overrides.fully_dead.contains(&query.block_id) {
-        return Ok(None);
-    }
-    let Some(block) = fetch_block(query.snap, query.table_hash, query.block_id)? else {
-        return Ok(None);
-    };
-    let mut valid = vec![true; block.row_count];
-    if let Some(positions) = query.overrides.partial.get(&query.block_id) {
-        for &pos in positions {
-            if let Some(slot) = valid.get_mut(pos as usize) {
-                *slot = false;
-            }
-        }
-    }
-    Ok(Some((block, valid)))
+	if query.overrides.fully_dead.contains(&query.block_id) {
+		return Ok(None);
+	}
+	let Some(block) = fetch_block(query.snap, query.table_hash, query.block_id)? else {
+		return Ok(None);
+	};
+	let mut valid = vec![true; block.row_count];
+	if let Some(positions) = query.overrides.partial.get(&query.block_id) {
+		for &pos in positions {
+			if let Some(slot) = valid.get_mut(pos as usize) {
+				*slot = false;
+			}
+		}
+	}
+	Ok(Some((block, valid)))
 }
 
 /// Materialize the indices selected by both the timestamp range and the
 /// validity bitmap. Used by paths that need an `&[usize]` (`to_*_filtered`).
 fn intersect_indices(
-    block: &ColumnBlock,
-    schema: &Schema,
-    validity: &[bool],
-    needs_ts_filter: bool,
-    start_ts: i64,
-    end_ts: i64,
+	block: &ColumnBlock,
+	schema: &Schema,
+	validity: &[bool],
+	needs_ts_filter: bool,
+	start_ts: i64,
+	end_ts: i64,
 ) -> Result<Vec<usize>> {
-    if needs_ts_filter {
-        let ts_candidates = block.filter_by_timestamp(schema, start_ts, end_ts)?;
-        Ok(ts_candidates.into_iter().filter(|&i| validity[i]).collect())
-    } else {
-        Ok((0..block.row_count).filter(|&i| validity[i]).collect())
-    }
+	if needs_ts_filter {
+		let ts_candidates = block.filter_by_timestamp(schema, start_ts, end_ts)?;
+		Ok(ts_candidates.into_iter().filter(|&i| validity[i]).collect())
+	} else {
+		Ok((0..block.row_count).filter(|&i| validity[i]).collect())
+	}
 }
 
 /// Per-block JSON serializer used by `execute_query`.
@@ -445,31 +417,31 @@ fn intersect_indices(
 ///   * **filtered path** — anything else; the surviving indices are
 ///     materialized once and passed to `to_json_filtered`.
 fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
-    let Some((block, validity)) = fetch_live_block(&query)? else {
-        return Ok(Vec::new());
-    };
-    let valid_count = validity.iter().filter(|&&v| v).count();
-    if valid_count == 0 {
-        return Ok(Vec::new());
-    }
+	let Some((block, validity)) = fetch_live_block(&query)? else {
+		return Ok(Vec::new());
+	};
+	let valid_count = validity.iter().filter(|&&v| v).count();
+	if valid_count == 0 {
+		return Ok(Vec::new());
+	}
 
-    let needs_ts_filter = query.block_min_ts < query.start_ts || query.block_max_ts > query.end_ts;
-    if !needs_ts_filter && valid_count == block.row_count {
-        return block.to_json_slice(query.schema, 0, block.row_count);
-    }
+	let needs_ts_filter = query.block_min_ts < query.start_ts || query.block_max_ts > query.end_ts;
+	if !needs_ts_filter && valid_count == block.row_count {
+		return block.to_json_slice(query.schema, 0, block.row_count);
+	}
 
-    let indices = intersect_indices(
-        &block,
-        query.schema,
-        &validity,
-        needs_ts_filter,
-        query.start_ts,
-        query.end_ts,
-    )?;
-    if indices.is_empty() {
-        return Ok(Vec::new());
-    }
-    block.to_json_filtered(query.schema, &indices)
+	let indices = intersect_indices(
+		&block,
+		query.schema,
+		&validity,
+		needs_ts_filter,
+		query.start_ts,
+		query.end_ts,
+	)?;
+	if indices.is_empty() {
+		return Ok(Vec::new());
+	}
+	block.to_json_filtered(query.schema, &indices)
 }
 
 /// Per-block CSV serializer used by `execute_query_csv`. Three paths, each
@@ -481,252 +453,244 @@ fn block_to_json(query: BlockQuery<'_>) -> Result<Vec<Value>> {
 ///      walks rows once with inline `validity[i] && ts in [start,end]`
 ///      checks, avoiding a separate `filter_by_timestamp` pre-scan.
 fn block_to_csv(query: BlockQuery<'_>) -> Result<String> {
-    let Some((block, validity)) = fetch_live_block(&query)? else {
-        return Ok(String::new());
-    };
-    let valid_count = validity.iter().filter(|&&v| v).count();
-    if valid_count == 0 {
-        return Ok(String::new());
-    }
+	let Some((block, validity)) = fetch_live_block(&query)? else {
+		return Ok(String::new());
+	};
+	let valid_count = validity.iter().filter(|&&v| v).count();
+	if valid_count == 0 {
+		return Ok(String::new());
+	}
 
-    let needs_ts_filter = query.block_min_ts < query.start_ts || query.block_max_ts > query.end_ts;
+	let needs_ts_filter = query.block_min_ts < query.start_ts || query.block_max_ts > query.end_ts;
 
-    if !needs_ts_filter {
-        if valid_count == block.row_count {
-            return block.to_csv(query.schema, 0, block.row_count);
-        }
-        let indices: Vec<usize> = (0..block.row_count).filter(|&i| validity[i]).collect();
-        return block.to_csv_filtered(query.schema, &indices);
-    }
+	if !needs_ts_filter {
+		if valid_count == block.row_count {
+			return block.to_csv(query.schema, 0, block.row_count);
+		}
+		let indices: Vec<usize> = (0..block.row_count).filter(|&i| validity[i]).collect();
+		return block.to_csv_filtered(query.schema, &indices);
+	}
 
-    block.to_csv_query(query.schema, query.start_ts, query.end_ts, &validity)
+	block.to_csv_query(query.schema, query.start_ts, query.end_ts, &validity)
 }
 
 /// Per-block Arrow serializer used by `execute_query_arrow`. Same
 /// three-path dispatch as `block_to_csv`.
 fn block_to_arrow(query: BlockQuery<'_>) -> Result<Option<RecordBatch>> {
-    let Some((block, validity)) = fetch_live_block(&query)? else {
-        return Ok(None);
-    };
-    let valid_count = validity.iter().filter(|&&v| v).count();
-    if valid_count == 0 {
-        return Ok(None);
-    }
+	let Some((block, validity)) = fetch_live_block(&query)? else {
+		return Ok(None);
+	};
+	let valid_count = validity.iter().filter(|&&v| v).count();
+	if valid_count == 0 {
+		return Ok(None);
+	}
 
-    let needs_ts_filter = query.block_min_ts < query.start_ts || query.block_max_ts > query.end_ts;
+	let needs_ts_filter = query.block_min_ts < query.start_ts || query.block_max_ts > query.end_ts;
 
-    let batch = if !needs_ts_filter {
-        if valid_count == block.row_count {
-            block.to_arrow(query.schema, 0, block.row_count)?
-        } else {
-            let indices: Vec<usize> = (0..block.row_count).filter(|&i| validity[i]).collect();
-            block.to_arrow_filtered(query.schema, &indices)?
-        }
-    } else {
-        block.to_arrow_query(query.schema, query.start_ts, query.end_ts, &validity)?
-    };
+	let batch = if !needs_ts_filter {
+		if valid_count == block.row_count {
+			block.to_arrow(query.schema, 0, block.row_count)?
+		} else {
+			let indices: Vec<usize> = (0..block.row_count).filter(|&i| validity[i]).collect();
+			block.to_arrow_filtered(query.schema, &indices)?
+		}
+	} else {
+		block.to_arrow_query(query.schema, query.start_ts, query.end_ts, &validity)?
+	};
 
-    if batch.num_rows() == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(batch))
-    }
+	if batch.num_rows() == 0 {
+		Ok(None)
+	} else {
+		Ok(Some(batch))
+	}
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_query_csv(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    start: Option<String>,
-    end: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    pool: &rayon::ThreadPool,
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	start: Option<String>,
+	end: Option<String>,
+	limit: Option<usize>,
+	offset: Option<usize>,
+	pool: &rayon::ThreadPool,
 ) -> Result<Vec<String>> {
-    let start_ts = start
-        .as_deref()
-        .map(parse_query_timestamp)
-        .transpose()?
-        .unwrap_or(0);
-    let end_ts = end
-        .as_deref()
-        .map(parse_query_timestamp)
-        .transpose()?
-        .unwrap_or(i64::MAX);
-    let limit = limit.unwrap_or(1000);
-    let offset = offset.unwrap_or(0);
+	let start_ts = start.as_deref().map(parse_query_timestamp).transpose()?.unwrap_or(0);
+	let end_ts = end
+		.as_deref()
+		.map(parse_query_timestamp)
+		.transpose()?
+		.unwrap_or(i64::MAX);
+	let limit = limit.unwrap_or(1000);
+	let offset = offset.unwrap_or(0);
 
-    let table_hash = calculate_table_hash(table);
-    // One snapshot for the whole query — see execute_query for rationale.
-    let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
-    let overrides = refs::load_override_states(&snap, table_hash, &metadata)?;
+	let table_hash = calculate_table_hash(table);
+	// One snapshot for the whole query — see execute_query for rationale.
+	let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
+	let overrides = refs::load_override_states(&snap, table_hash, &metadata)?;
 
-    use rayon::prelude::*;
-    let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
+	use rayon::prelude::*;
+	let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
 
-    let per_block: Result<Vec<String>> = if use_parallel {
-        pool.install(|| {
-            metadata
-                .par_iter()
-                .map(|meta| {
-                    block_to_csv(BlockQuery {
-                        snap: &snap,
-                        schema,
-                        table_hash,
-                        block_id: meta.block,
-                        overrides: &overrides,
-                        block_min_ts: meta.min_ts,
-                        block_max_ts: meta.max_ts,
-                        start_ts,
-                        end_ts,
-                    })
-                })
-                .collect()
-        })
-    } else {
-        metadata
-            .iter()
-            .map(|meta| {
-                block_to_csv(BlockQuery {
-                    snap: &snap,
-                    schema,
-                    table_hash,
-                    block_id: meta.block,
-                    overrides: &overrides,
-                    block_min_ts: meta.min_ts,
-                    block_max_ts: meta.max_ts,
-                    start_ts,
-                    end_ts,
-                })
-            })
-            .collect()
-    };
+	let per_block: Result<Vec<String>> = if use_parallel {
+		pool.install(|| {
+			metadata
+				.par_iter()
+				.map(|meta| {
+					block_to_csv(BlockQuery {
+						snap: &snap,
+						schema,
+						table_hash,
+						block_id: meta.block,
+						overrides: &overrides,
+						block_min_ts: meta.min_ts,
+						block_max_ts: meta.max_ts,
+						start_ts,
+						end_ts,
+					})
+				})
+				.collect()
+		})
+	} else {
+		metadata
+			.iter()
+			.map(|meta| {
+				block_to_csv(BlockQuery {
+					snap: &snap,
+					schema,
+					table_hash,
+					block_id: meta.block,
+					overrides: &overrides,
+					block_min_ts: meta.min_ts,
+					block_max_ts: meta.max_ts,
+					start_ts,
+					end_ts,
+				})
+			})
+			.collect()
+	};
 
-    // Each per-block chunk is rows joined by '\n' (trailing '\n'). For
-    // no-pagination the cheapest thing is to return the chunks unchanged
-    // and let the caller concatenate them with the header. With pagination
-    // we re-emit only the requested row window.
-    let chunks = per_block?;
-    if offset == 0 && limit == usize::MAX {
-        return Ok(chunks);
-    }
+	// Each per-block chunk is rows joined by '\n' (trailing '\n'). For
+	// no-pagination the cheapest thing is to return the chunks unchanged
+	// and let the caller concatenate them with the header. With pagination
+	// we re-emit only the requested row window.
+	let chunks = per_block?;
+	if offset == 0 && limit == usize::MAX {
+		return Ok(chunks);
+	}
 
-    let combined: String = chunks.into_iter().collect();
-    let mut out = String::with_capacity(combined.len());
-    let take_end = offset.saturating_add(limit);
-    for (seen, line) in combined.lines().enumerate() {
-        if seen >= take_end {
-            break;
-        }
-        if seen >= offset {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    Ok(vec![out])
+	let combined: String = chunks.into_iter().collect();
+	let mut out = String::with_capacity(combined.len());
+	let take_end = offset.saturating_add(limit);
+	for (seen, line) in combined.lines().enumerate() {
+		if seen >= take_end {
+			break;
+		}
+		if seen >= offset {
+			out.push_str(line);
+			out.push('\n');
+		}
+	}
+	Ok(vec![out])
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_query_arrow(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    start: Option<String>,
-    end: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    pool: &rayon::ThreadPool,
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	start: Option<String>,
+	end: Option<String>,
+	limit: Option<usize>,
+	offset: Option<usize>,
+	pool: &rayon::ThreadPool,
 ) -> Result<Vec<RecordBatch>> {
-    let start_ts = start
-        .as_deref()
-        .map(parse_query_timestamp)
-        .transpose()?
-        .unwrap_or(0);
-    let end_ts = end
-        .as_deref()
-        .map(parse_query_timestamp)
-        .transpose()?
-        .unwrap_or(i64::MAX);
-    let limit = limit.unwrap_or(1000);
-    let offset = offset.unwrap_or(0);
+	let start_ts = start.as_deref().map(parse_query_timestamp).transpose()?.unwrap_or(0);
+	let end_ts = end
+		.as_deref()
+		.map(parse_query_timestamp)
+		.transpose()?
+		.unwrap_or(i64::MAX);
+	let limit = limit.unwrap_or(1000);
+	let offset = offset.unwrap_or(0);
 
-    let table_hash = calculate_table_hash(table);
-    // One snapshot for the whole query — see execute_query for rationale.
-    let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
-    let overrides = refs::load_override_states(&snap, table_hash, &metadata)?;
+	let table_hash = calculate_table_hash(table);
+	// One snapshot for the whole query — see execute_query for rationale.
+	let (snap, metadata) = ingestion::snapshot_blocks_in_range(db, table_hash, start_ts, end_ts);
+	let overrides = refs::load_override_states(&snap, table_hash, &metadata)?;
 
-    use rayon::prelude::*;
-    let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
+	use rayon::prelude::*;
+	let use_parallel = metadata.len() >= 4 && pool.current_num_threads() > 1;
 
-    let per_block: Result<Vec<Option<RecordBatch>>> = if use_parallel {
-        pool.install(|| {
-            metadata
-                .par_iter()
-                .map(|meta| {
-                    block_to_arrow(BlockQuery {
-                        snap: &snap,
-                        schema,
-                        table_hash,
-                        block_id: meta.block,
-                        overrides: &overrides,
-                        block_min_ts: meta.min_ts,
-                        block_max_ts: meta.max_ts,
-                        start_ts,
-                        end_ts,
-                    })
-                })
-                .collect()
-        })
-    } else {
-        metadata
-            .iter()
-            .map(|meta| {
-                block_to_arrow(BlockQuery {
-                    snap: &snap,
-                    schema,
-                    table_hash,
-                    block_id: meta.block,
-                    overrides: &overrides,
-                    block_min_ts: meta.min_ts,
-                    block_max_ts: meta.max_ts,
-                    start_ts,
-                    end_ts,
-                })
-            })
-            .collect()
-    };
+	let per_block: Result<Vec<Option<RecordBatch>>> = if use_parallel {
+		pool.install(|| {
+			metadata
+				.par_iter()
+				.map(|meta| {
+					block_to_arrow(BlockQuery {
+						snap: &snap,
+						schema,
+						table_hash,
+						block_id: meta.block,
+						overrides: &overrides,
+						block_min_ts: meta.min_ts,
+						block_max_ts: meta.max_ts,
+						start_ts,
+						end_ts,
+					})
+				})
+				.collect()
+		})
+	} else {
+		metadata
+			.iter()
+			.map(|meta| {
+				block_to_arrow(BlockQuery {
+					snap: &snap,
+					schema,
+					table_hash,
+					block_id: meta.block,
+					overrides: &overrides,
+					block_min_ts: meta.min_ts,
+					block_max_ts: meta.max_ts,
+					start_ts,
+					end_ts,
+				})
+			})
+			.collect()
+	};
 
-    let batches: Vec<RecordBatch> = per_block?.into_iter().flatten().collect();
-    if batches.is_empty() || (offset == 0 && limit == usize::MAX) {
-        return Ok(batches);
-    }
+	let batches: Vec<RecordBatch> = per_block?.into_iter().flatten().collect();
+	if batches.is_empty() || (offset == 0 && limit == usize::MAX) {
+		return Ok(batches);
+	}
 
-    // Apply global skip/take across batches. RecordBatch::slice is zero-copy
-    // — it adjusts offsets without copying buffers — so paged Arrow output
-    // stays cheap.
-    let mut out: Vec<RecordBatch> = Vec::new();
-    let mut to_skip = offset;
-    let mut to_take = limit;
-    for batch in batches {
-        if to_take == 0 {
-            break;
-        }
-        let rows = batch.num_rows();
-        if to_skip >= rows {
-            to_skip -= rows;
-            continue;
-        }
-        let take = (rows - to_skip).min(to_take);
-        if to_skip == 0 && take == rows {
-            out.push(batch);
-        } else {
-            out.push(batch.slice(to_skip, take));
-        }
-        to_take -= take;
-        to_skip = 0;
-    }
-    Ok(out)
+	// Apply global skip/take across batches. RecordBatch::slice is zero-copy
+	// — it adjusts offsets without copying buffers — so paged Arrow output
+	// stays cheap.
+	let mut out: Vec<RecordBatch> = Vec::new();
+	let mut to_skip = offset;
+	let mut to_take = limit;
+	for batch in batches {
+		if to_take == 0 {
+			break;
+		}
+		let rows = batch.num_rows();
+		if to_skip >= rows {
+			to_skip -= rows;
+			continue;
+		}
+		let take = (rows - to_skip).min(to_take);
+		if to_skip == 0 && take == rows {
+			out.push(batch);
+		} else {
+			out.push(batch.slice(to_skip, take));
+		}
+		to_take -= take;
+		to_skip = 0;
+	}
+	Ok(out)
 }
 #[cfg(test)]
 #[path = "query_test.rs"]

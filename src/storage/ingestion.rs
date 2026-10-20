@@ -38,433 +38,405 @@ use std::io::Cursor;
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProtoRow {
-    #[prost(map = "string, string", tag = "1")]
-    pub values: HashMap<String, String>,
+	#[prost(map = "string, string", tag = "1")]
+	pub values: HashMap<String, String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProtoBatch {
-    #[prost(message, repeated, tag = "1")]
-    pub rows: Vec<ProtoRow>,
+	#[prost(message, repeated, tag = "1")]
+	pub rows: Vec<ProtoRow>,
 }
 
 pub fn parse_csv(csv_data: &str) -> Result<Vec<HashMap<String, String>>> {
-    let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
-    let headers = reader.headers()?.clone();
-    let header_count = headers.len();
-    let mut rows = Vec::new();
+	let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
+	let headers = reader.headers()?.clone();
+	let header_count = headers.len();
+	let mut rows = Vec::new();
 
-    for result in reader.records() {
-        let record = result?;
-        let mut row = HashMap::with_capacity(header_count); // Pre-allocate capacity
+	for result in reader.records() {
+		let record = result?;
+		let mut row = HashMap::with_capacity(header_count); // Pre-allocate capacity
 
-        for (i, field) in record.iter().enumerate() {
-            if let Some(header) = headers.get(i) {
-                row.insert(header.to_string(), field.to_string());
-            }
-        }
+		for (i, field) in record.iter().enumerate() {
+			if let Some(header) = headers.get(i) {
+				row.insert(header.to_string(), field.to_string());
+			}
+		}
 
-        if !row.is_empty() {
-            rows.push(row);
-        }
-    }
+		if !row.is_empty() {
+			rows.push(row);
+		}
+	}
 
-    Ok(rows)
+	Ok(rows)
 }
 
 fn process_single_row(
-    mut row: HashMap<String, String>,
-    schema: &Schema,
-    id_manager: &Arc<IdManager>,
+	mut row: HashMap<String, String>,
+	schema: &Schema,
+	id_manager: &Arc<IdManager>,
 ) -> Result<(u64, HashMap<String, String>)> {
-    // ID Assignment
-    let row_id = if let Some(id_str) = row.get(&schema.id_column) {
-        if id_str.trim().is_empty() {
-            RowId::Auto
-        } else {
-            let parsed_id = RowId::from_string(id_str)?;
-            if let RowId::User(id) = parsed_id {
-                id_manager.register_user_id(id)?;
-            }
-            parsed_id
-        }
-    } else {
-        RowId::Auto
-    };
+	// ID Assignment
+	let row_id = if let Some(id_str) = row.get(&schema.id_column) {
+		if id_str.trim().is_empty() {
+			RowId::Auto
+		} else {
+			let parsed_id = RowId::from_string(id_str)?;
+			if let RowId::User(id) = parsed_id {
+				id_manager.register_user_id(id)?;
+			}
+			parsed_id
+		}
+	} else {
+		RowId::Auto
+	};
 
-    let actual_id = row_id.resolve(id_manager);
-    row.insert(schema.id_column.clone(), actual_id.to_string());
+	let actual_id = row_id.resolve(id_manager);
+	row.insert(schema.id_column.clone(), actual_id.to_string());
 
-    // Validation
-    schema.validate_row(&row)?;
+	// Validation
+	schema.validate_row(&row)?;
 
-    Ok((actual_id, row))
+	Ok((actual_id, row))
 }
 
 pub fn process_rows_parallel(
-    rows: Vec<HashMap<String, String>>,
-    schema: &Schema,
-    id_manager: &Arc<IdManager>,
+	rows: Vec<HashMap<String, String>>,
+	schema: &Schema,
+	id_manager: &Arc<IdManager>,
 ) -> Result<Vec<(u64, HashMap<String, String>)>> {
-    // ADAPTIVE PARALLELISM: Only use parallel processing when beneficial
-    if rows.len() >= 100 && rayon::current_num_threads() > 1 {
-        rows.into_par_iter()
-            .map(|row| process_single_row(row, schema, id_manager))
-            .collect()
-    } else {
-        // Sequential processing for small batches or single-threaded config
-        rows.into_iter()
-            .map(|row| process_single_row(row, schema, id_manager))
-            .collect()
-    }
+	// ADAPTIVE PARALLELISM: Only use parallel processing when beneficial
+	if rows.len() >= 100 && rayon::current_num_threads() > 1 {
+		rows.into_par_iter()
+			.map(|row| process_single_row(row, schema, id_manager))
+			.collect()
+	} else {
+		// Sequential processing for small batches or single-threaded config
+		rows.into_iter()
+			.map(|row| process_single_row(row, schema, id_manager))
+			.collect()
+	}
 }
 
 pub fn parse_arrow(arrow_data: &[u8]) -> Result<Vec<HashMap<String, String>>> {
-    let cursor = Cursor::new(arrow_data);
-    let reader = StreamReader::try_new(cursor, None).map_err(|e| {
-        PulsoraError::InvalidData(format!("Failed to create Arrow stream reader: {}", e))
-    })?;
+	let cursor = Cursor::new(arrow_data);
+	let reader = StreamReader::try_new(cursor, None)
+		.map_err(|e| PulsoraError::InvalidData(format!("Failed to create Arrow stream reader: {}", e)))?;
 
-    let mut all_rows = Vec::new();
+	let mut all_rows = Vec::new();
 
-    for batch in reader {
-        let batch = batch
-            .map_err(|e| PulsoraError::InvalidData(format!("Failed to read Arrow batch: {}", e)))?;
+	for batch in reader {
+		let batch = batch.map_err(|e| PulsoraError::InvalidData(format!("Failed to read Arrow batch: {}", e)))?;
 
-        let schema_ref = batch.schema();
-        let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
+		let schema_ref = batch.schema();
+		let num_rows = batch.num_rows();
+		let num_cols = batch.num_columns();
 
-        for row_idx in 0..num_rows {
-            let mut row_map = HashMap::with_capacity(num_cols);
+		for row_idx in 0..num_rows {
+			let mut row_map = HashMap::with_capacity(num_cols);
 
-            for col_idx in 0..num_cols {
-                let field = schema_ref.field(col_idx);
-                let col_name = field.name();
-                let column = batch.column(col_idx);
+			for col_idx in 0..num_cols {
+				let field = schema_ref.field(col_idx);
+				let col_name = field.name();
+				let column = batch.column(col_idx);
 
-                if column.is_null(row_idx) {
-                    continue;
-                }
+				if column.is_null(row_idx) {
+					continue;
+				}
 
-                let value_str = match column.data_type() {
-                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
-                        let array = column.as_any().downcast_ref::<StringArray>().unwrap();
-                        array.value(row_idx).to_string()
-                    }
-                    ArrowDataType::Int64 => {
-                        let array = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                        array.value(row_idx).to_string()
-                    }
-                    ArrowDataType::Float64 => {
-                        let array = column.as_any().downcast_ref::<Float64Array>().unwrap();
-                        array.value(row_idx).to_string()
-                    }
-                    ArrowDataType::Boolean => {
-                        let array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
-                        array.value(row_idx).to_string()
-                    }
-                    _ => {
-                        // Fallback for other types: try to cast to string or just skip/error
-                        // For now, let's skip unsupported types or try debug format
-                        // A robust implementation would handle all types
-                        continue;
-                    }
-                };
-                row_map.insert(col_name.clone(), value_str);
-            }
-            if !row_map.is_empty() {
-                all_rows.push(row_map);
-            }
-        }
-    }
-    Ok(all_rows)
+				let value_str = match column.data_type() {
+					ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
+						let array = column.as_any().downcast_ref::<StringArray>().unwrap();
+						array.value(row_idx).to_string()
+					}
+					ArrowDataType::Int64 => {
+						let array = column.as_any().downcast_ref::<Int64Array>().unwrap();
+						array.value(row_idx).to_string()
+					}
+					ArrowDataType::Float64 => {
+						let array = column.as_any().downcast_ref::<Float64Array>().unwrap();
+						array.value(row_idx).to_string()
+					}
+					ArrowDataType::Boolean => {
+						let array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
+						array.value(row_idx).to_string()
+					}
+					_ => {
+						// Fallback for other types: try to cast to string or just skip/error
+						// For now, let's skip unsupported types or try debug format
+						// A robust implementation would handle all types
+						continue;
+					}
+				};
+				row_map.insert(col_name.clone(), value_str);
+			}
+			if !row_map.is_empty() {
+				all_rows.push(row_map);
+			}
+		}
+	}
+	Ok(all_rows)
 }
 
 pub fn parse_protobuf(proto_data: &[u8]) -> Result<Vec<HashMap<String, String>>> {
-    let batch = ProtoBatch::decode(proto_data)
-        .map_err(|e| PulsoraError::InvalidData(format!("Failed to decode Protobuf data: {}", e)))?;
-    Ok(batch.rows.into_iter().map(|r| r.values).collect())
+	let batch = ProtoBatch::decode(proto_data)
+		.map_err(|e| PulsoraError::InvalidData(format!("Failed to decode Protobuf data: {}", e)))?;
+	Ok(batch.rows.into_iter().map(|r| r.values).collect())
 }
 
 #[allow(clippy::type_complexity)]
 pub fn process_csv_bulk(
-    csv_data: &str,
-    schema: &Schema,
-    id_manager: &Arc<IdManager>,
+	csv_data: &str,
+	schema: &Schema,
+	id_manager: &Arc<IdManager>,
 ) -> Result<(ColumnBlock, Vec<u64>, i64, i64)> {
-    let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
-    let headers = reader.headers()?.clone();
+	let mut reader = csv::Reader::from_reader(csv_data.as_bytes());
+	let headers = reader.headers()?.clone();
 
-    // Map Schema Column Name -> CSV Index
-    let mut schema_to_csv_idx = HashMap::with_capacity(schema.columns.len());
-    for (i, header) in headers.iter().enumerate() {
-        schema_to_csv_idx.insert(header, i);
-    }
+	// Map Schema Column Name -> CSV Index
+	let mut schema_to_csv_idx = HashMap::with_capacity(schema.columns.len());
+	for (i, header) in headers.iter().enumerate() {
+		schema_to_csv_idx.insert(header, i);
+	}
 
-    // Initialize column vectors
-    let est_rows = csv_data.len() / 50; // Rough estimate
-    let mut id_col_vals = Vec::with_capacity(est_rows);
-    let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut float_cols: HashMap<String, Vec<f64>> = HashMap::new();
-    let mut string_cols: HashMap<String, Vec<String>> = HashMap::new();
-    let mut bool_cols: HashMap<String, Vec<bool>> = HashMap::new();
-    let mut ts_cols: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut null_bitmaps: HashMap<String, Vec<u8>> = HashMap::new();
+	// Initialize column vectors
+	let est_rows = csv_data.len() / 50; // Rough estimate
+	let mut id_col_vals = Vec::with_capacity(est_rows);
+	let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
+	let mut float_cols: HashMap<String, Vec<f64>> = HashMap::new();
+	let mut string_cols: HashMap<String, Vec<String>> = HashMap::new();
+	let mut bool_cols: HashMap<String, Vec<bool>> = HashMap::new();
+	let mut ts_cols: HashMap<String, Vec<i64>> = HashMap::new();
+	let mut null_bitmaps: HashMap<String, Vec<u8>> = HashMap::new();
 
-    // Initialize vectors for each column in schema
-    for col in &schema.columns {
-        match col.data_type {
-            crate::storage::schema::DataType::Id => {} // Handled separately
-            crate::storage::schema::DataType::Integer => {
-                int_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
-            }
-            crate::storage::schema::DataType::Float => {
-                float_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
-            }
-            crate::storage::schema::DataType::String => {
-                string_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
-            }
-            crate::storage::schema::DataType::Boolean => {
-                bool_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
-            }
-            crate::storage::schema::DataType::Timestamp => {
-                ts_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
-            }
-        }
-        null_bitmaps.insert(col.name.clone(), Vec::new());
-    }
+	// Initialize vectors for each column in schema
+	for col in &schema.columns {
+		match col.data_type {
+			crate::storage::schema::DataType::Id => {} // Handled separately
+			crate::storage::schema::DataType::Integer => {
+				int_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+			}
+			crate::storage::schema::DataType::Float => {
+				float_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+			}
+			crate::storage::schema::DataType::String => {
+				string_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+			}
+			crate::storage::schema::DataType::Boolean => {
+				bool_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+			}
+			crate::storage::schema::DataType::Timestamp => {
+				ts_cols.insert(col.name.clone(), Vec::with_capacity(est_rows));
+			}
+		}
+		null_bitmaps.insert(col.name.clone(), Vec::new());
+	}
 
-    let mut row_count = 0;
-    let mut min_ts = i64::MAX;
-    let mut max_ts = i64::MIN;
-    let ts_col_name = schema.get_timestamp_column();
+	let mut row_count = 0;
+	let mut min_ts = i64::MAX;
+	let mut max_ts = i64::MIN;
+	let ts_col_name = schema.get_timestamp_column();
 
-    for result in reader.records() {
-        let record = result?;
-        row_count += 1;
+	for result in reader.records() {
+		let record = result?;
+		row_count += 1;
 
-        // Handle ID
-        let id = if let Some(&idx) = schema_to_csv_idx.get(schema.id_column.as_str()) {
-            let val = record.get(idx).unwrap_or("");
-            if val.is_empty() {
-                id_manager.next_auto_id()
-            } else if let Ok(uid) = val.parse::<u64>() {
-                id_manager.register_user_id(uid)?;
-                uid
-            } else {
-                id_manager.next_auto_id()
-            }
-        } else {
-            id_manager.next_auto_id()
-        };
-        id_col_vals.push(id);
+		// Handle ID
+		let id = if let Some(&idx) = schema_to_csv_idx.get(schema.id_column.as_str()) {
+			let val = record.get(idx).unwrap_or("");
+			if val.is_empty() {
+				id_manager.next_auto_id()
+			} else if let Ok(uid) = val.parse::<u64>() {
+				id_manager.register_user_id(uid)?;
+				uid
+			} else {
+				id_manager.next_auto_id()
+			}
+		} else {
+			id_manager.next_auto_id()
+		};
+		id_col_vals.push(id);
 
-        // Handle other columns
-        for col in &schema.columns {
-            if col.name == schema.id_column {
-                continue;
-            }
+		// Handle other columns
+		for col in &schema.columns {
+			if col.name == schema.id_column {
+				continue;
+			}
 
-            let val_str = if let Some(&idx) = schema_to_csv_idx.get(col.name.as_str()) {
-                record.get(idx)
-            } else {
-                None
-            };
+			let val_str = if let Some(&idx) = schema_to_csv_idx.get(col.name.as_str()) {
+				record.get(idx)
+			} else {
+				None
+			};
 
-            let is_null = val_str.is_none() || val_str.unwrap().is_empty();
+			let is_null = val_str.is_none() || val_str.unwrap().is_empty();
 
-            // Update null bitmap
-            let byte_idx = (row_count - 1) >> 3;
-            let bit_idx = (row_count - 1) & 7;
-            let bitmap = null_bitmaps.get_mut(&col.name).unwrap();
-            if bitmap.len() <= byte_idx {
-                bitmap.push(0);
-            }
-            if is_null {
-                bitmap[byte_idx] |= 1 << bit_idx;
-            }
+			// Update null bitmap
+			let byte_idx = (row_count - 1) >> 3;
+			let bit_idx = (row_count - 1) & 7;
+			let bitmap = null_bitmaps.get_mut(&col.name).unwrap();
+			if bitmap.len() <= byte_idx {
+				bitmap.push(0);
+			}
+			if is_null {
+				bitmap[byte_idx] |= 1 << bit_idx;
+			}
 
-            match col.data_type {
-                crate::storage::schema::DataType::Id => {} // Already handled
-                crate::storage::schema::DataType::Integer => {
-                    let val = if is_null {
-                        0
-                    } else {
-                        val_str.unwrap().parse::<i64>().unwrap_or(0)
-                    };
-                    int_cols.get_mut(&col.name).unwrap().push(val);
+			match col.data_type {
+				crate::storage::schema::DataType::Id => {} // Already handled
+				crate::storage::schema::DataType::Integer => {
+					let val = if is_null {
+						0
+					} else {
+						val_str.unwrap().parse::<i64>().unwrap_or(0)
+					};
+					int_cols.get_mut(&col.name).unwrap().push(val);
 
-                    if Some(col.name.as_str()) == ts_col_name {
-                        min_ts = min_ts.min(val);
-                        max_ts = max_ts.max(val);
-                    }
-                }
-                crate::storage::schema::DataType::Float => {
-                    let val = if is_null {
-                        0.0
-                    } else {
-                        val_str.unwrap().parse::<f64>().unwrap_or(0.0)
-                    };
-                    float_cols.get_mut(&col.name).unwrap().push(val);
-                }
-                crate::storage::schema::DataType::String => {
-                    let val = if is_null {
-                        String::new()
-                    } else {
-                        val_str.unwrap().to_string()
-                    };
-                    string_cols.get_mut(&col.name).unwrap().push(val);
-                }
-                crate::storage::schema::DataType::Boolean => {
-                    let val = if is_null {
-                        false
-                    } else {
-                        val_str.unwrap().parse::<bool>().unwrap_or(false)
-                    };
-                    bool_cols.get_mut(&col.name).unwrap().push(val);
-                }
-                crate::storage::schema::DataType::Timestamp => {
-                    let val = if is_null {
-                        chrono::Utc::now().timestamp_millis()
-                    } else {
-                        parse_timestamp(val_str.unwrap())
-                            .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
-                    };
-                    ts_cols.get_mut(&col.name).unwrap().push(val);
+					if Some(col.name.as_str()) == ts_col_name {
+						min_ts = min_ts.min(val);
+						max_ts = max_ts.max(val);
+					}
+				}
+				crate::storage::schema::DataType::Float => {
+					let val = if is_null {
+						0.0
+					} else {
+						val_str.unwrap().parse::<f64>().unwrap_or(0.0)
+					};
+					float_cols.get_mut(&col.name).unwrap().push(val);
+				}
+				crate::storage::schema::DataType::String => {
+					let val = if is_null {
+						String::new()
+					} else {
+						val_str.unwrap().to_string()
+					};
+					string_cols.get_mut(&col.name).unwrap().push(val);
+				}
+				crate::storage::schema::DataType::Boolean => {
+					let val = if is_null {
+						false
+					} else {
+						val_str.unwrap().parse::<bool>().unwrap_or(false)
+					};
+					bool_cols.get_mut(&col.name).unwrap().push(val);
+				}
+				crate::storage::schema::DataType::Timestamp => {
+					let val = if is_null {
+						chrono::Utc::now().timestamp_millis()
+					} else {
+						parse_timestamp(val_str.unwrap()).unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+					};
+					ts_cols.get_mut(&col.name).unwrap().push(val);
 
-                    if Some(col.name.as_str()) == ts_col_name {
-                        min_ts = min_ts.min(val);
-                        max_ts = max_ts.max(val);
-                    }
-                }
-            }
-        }
-    }
+					if Some(col.name.as_str()) == ts_col_name {
+						min_ts = min_ts.min(val);
+						max_ts = max_ts.max(val);
+					}
+				}
+			}
+		}
+	}
 
-    if row_count == 0 {
-        return Ok((
-            ColumnBlock {
-                row_count: 0,
-                columns: HashMap::new(),
-                null_bitmaps: HashMap::new(),
-            },
-            Vec::new(),
-            0,
-            0,
-        ));
-    }
+	if row_count == 0 {
+		return Ok((
+			ColumnBlock {
+				row_count: 0,
+				columns: HashMap::new(),
+				null_bitmaps: HashMap::new(),
+			},
+			Vec::new(),
+			0,
+			0,
+		));
+	}
 
-    // Compress columns
-    let mut columns = HashMap::new();
+	// Compress columns
+	let mut columns = HashMap::new();
 
-    // ID Column
-    columns.insert(
-        schema.id_column.clone(),
-        crate::storage::columnar::compress_id_column(&id_col_vals)?,
-    );
+	// ID Column
+	columns.insert(
+		schema.id_column.clone(),
+		crate::storage::columnar::compress_id_column(&id_col_vals)?,
+	);
 
-    for (name, vals) in int_cols {
-        columns.insert(name, crate::storage::columnar::compress_int_column(&vals)?);
-    }
-    for (name, vals) in float_cols {
-        columns.insert(
-            name,
-            crate::storage::columnar::compress_float_column(&vals)?,
-        );
-    }
-    for (name, vals) in string_cols {
-        columns.insert(
-            name,
-            crate::storage::columnar::compress_string_column(&vals)?,
-        );
-    }
-    for (name, vals) in bool_cols {
-        columns.insert(name, crate::storage::columnar::compress_bool_column(&vals)?);
-    }
-    for (name, vals) in &ts_cols {
-        columns.insert(
-            name.clone(),
-            crate::storage::columnar::compress_timestamp_column(vals)?,
-        );
-    }
+	for (name, vals) in int_cols {
+		columns.insert(name, crate::storage::columnar::compress_int_column(&vals)?);
+	}
+	for (name, vals) in float_cols {
+		columns.insert(name, crate::storage::columnar::compress_float_column(&vals)?);
+	}
+	for (name, vals) in string_cols {
+		columns.insert(name, crate::storage::columnar::compress_string_column(&vals)?);
+	}
+	for (name, vals) in bool_cols {
+		columns.insert(name, crate::storage::columnar::compress_bool_column(&vals)?);
+	}
+	for (name, vals) in &ts_cols {
+		columns.insert(name.clone(), crate::storage::columnar::compress_timestamp_column(vals)?);
+	}
 
-    Ok((
-        ColumnBlock {
-            row_count,
-            columns,
-            null_bitmaps,
-        },
-        id_col_vals,
-        min_ts,
-        max_ts,
-    ))
+	Ok((
+		ColumnBlock {
+			row_count,
+			columns,
+			null_bitmaps,
+		},
+		id_col_vals,
+		min_ts,
+		max_ts,
+	))
 }
 
 pub fn write_column_block_to_rocksdb(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    column_block: &ColumnBlock,
-    ids: &[u64],
-    min_timestamp: i64,
-    max_timestamp: i64,
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	column_block: &ColumnBlock,
+	ids: &[u64],
+	min_timestamp: i64,
+	max_timestamp: i64,
 ) -> Result<u64> {
-    let serialized_block = column_block.serialize()?;
-    write_block_core(
-        db,
-        table,
-        schema,
-        &serialized_block,
-        ids,
-        min_timestamp,
-        max_timestamp,
-    )
+	let serialized_block = column_block.serialize()?;
+	write_block_core(db, table, schema, &serialized_block, ids, min_timestamp, max_timestamp)
 }
 
 pub fn write_batch_to_rocksdb(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    rows: &[(u64, HashMap<String, String>)],
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	rows: &[(u64, HashMap<String, String>)],
 ) -> Result<u64> {
-    if rows.is_empty() {
-        return Ok(0);
-    }
+	if rows.is_empty() {
+		return Ok(0);
+	}
 
-    let column_block = ColumnBlock::from_rows(rows, schema)?;
-    let serialized_block = column_block.serialize()?;
-    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+	let column_block = ColumnBlock::from_rows(rows, schema)?;
+	let serialized_block = column_block.serialize()?;
+	let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
 
-    // Min and max timestamps for the block index; current time when the
-    // schema has no timestamp column.
-    let mut min_timestamp = i64::MAX;
-    let mut max_timestamp = i64::MIN;
-    for (_, row) in rows.iter() {
-        if let Some(ts_col) = schema.get_timestamp_column() {
-            if let Some(ts_value) = row.get(ts_col) {
-                if let Ok(ts) = parse_timestamp(ts_value) {
-                    min_timestamp = min_timestamp.min(ts);
-                    max_timestamp = max_timestamp.max(ts);
-                }
-            }
-        }
-    }
-    if min_timestamp == i64::MAX {
-        let now = Utc::now().timestamp_millis();
-        min_timestamp = now;
-        max_timestamp = now;
-    }
+	// Min and max timestamps for the block index; current time when the
+	// schema has no timestamp column.
+	let mut min_timestamp = i64::MAX;
+	let mut max_timestamp = i64::MIN;
+	for (_, row) in rows.iter() {
+		if let Some(ts_col) = schema.get_timestamp_column() {
+			if let Some(ts_value) = row.get(ts_col) {
+				if let Ok(ts) = parse_timestamp(ts_value) {
+					min_timestamp = min_timestamp.min(ts);
+					max_timestamp = max_timestamp.max(ts);
+				}
+			}
+		}
+	}
+	if min_timestamp == i64::MAX {
+		let now = Utc::now().timestamp_millis();
+		min_timestamp = now;
+		max_timestamp = now;
+	}
 
-    write_block_core(
-        db,
-        table,
-        schema,
-        &serialized_block,
-        &ids,
-        min_timestamp,
-        max_timestamp,
-    )
+	write_block_core(db, table, schema, &serialized_block, &ids, min_timestamp, max_timestamp)
 }
 
 /// In-memory block metadata per (DB path, table) — the engine's
@@ -489,124 +461,115 @@ pub fn write_batch_to_rocksdb(
 /// terminates after ~one entry, making REPLACE detection O(1) per write no
 /// matter how many blocks the table has.
 struct TableMetaCache {
-    metas: Vec<refs::BlockMeta>,
-    prefix_max_id: Vec<u64>,
-    /// Block-index key `(min_ts, block)` the next compaction pass starts at.
-    compact_cursor: (i64, u64),
+	metas: Vec<refs::BlockMeta>,
+	prefix_max_id: Vec<u64>,
+	/// Block-index key `(min_ts, block)` the next compaction pass starts at.
+	compact_cursor: (i64, u64),
 }
 
 impl TableMetaCache {
-    fn load(db: &DB, table_hash: u32) -> Self {
-        let metas = scan_table_blocks(db, table_hash);
-        let mut prefix_max_id = Vec::with_capacity(metas.len());
-        let mut running = 0u64;
-        for meta in &metas {
-            running = running.max(meta.max_id);
-            prefix_max_id.push(running);
-        }
-        Self {
-            metas,
-            prefix_max_id,
-            compact_cursor: (i64::MIN, 0),
-        }
-    }
+	fn load(db: &DB, table_hash: u32) -> Self {
+		let metas = scan_table_blocks(db, table_hash);
+		let mut prefix_max_id = Vec::with_capacity(metas.len());
+		let mut running = 0u64;
+		for meta in &metas {
+			running = running.max(meta.max_id);
+			prefix_max_id.push(running);
+		}
+		Self {
+			metas,
+			prefix_max_id,
+			compact_cursor: (i64::MIN, 0),
+		}
+	}
 
-    /// The first `limit` blocks at or after `from` in block-index order
-    /// `(min_ts, block)`, selected in one pass without sorting the table.
-    fn window_from(&self, from: (i64, u64), limit: usize) -> Vec<refs::BlockMeta> {
-        let mut nearest = std::collections::BinaryHeap::with_capacity(limit + 1);
-        for (index, meta) in self.metas.iter().enumerate() {
-            let key = (meta.min_ts, meta.block);
-            // Metas are mostly in index order, so once the window is full nearly
-            // every later key loses to its largest entry on this one comparison.
-            if key < from
-                || (nearest.len() == limit && nearest.peek().is_some_and(|&(top, _)| key >= top))
-            {
-                continue;
-            }
-            nearest.push((key, index));
-            if nearest.len() > limit {
-                nearest.pop();
-            }
-        }
-        nearest
-            .into_sorted_vec()
-            .into_iter()
-            .map(|(_, index)| self.metas[index])
-            .collect()
-    }
+	/// The first `limit` blocks at or after `from` in block-index order
+	/// `(min_ts, block)`, selected in one pass without sorting the table.
+	fn window_from(&self, from: (i64, u64), limit: usize) -> Vec<refs::BlockMeta> {
+		let mut nearest = std::collections::BinaryHeap::with_capacity(limit + 1);
+		for (index, meta) in self.metas.iter().enumerate() {
+			let key = (meta.min_ts, meta.block);
+			// Metas are mostly in index order, so once the window is full nearly
+			// every later key loses to its largest entry on this one comparison.
+			if key < from || (nearest.len() == limit && nearest.peek().is_some_and(|&(top, _)| key >= top)) {
+				continue;
+			}
+			nearest.push((key, index));
+			if nearest.len() > limit {
+				nearest.pop();
+			}
+		}
+		nearest
+			.into_sorted_vec()
+			.into_iter()
+			.map(|(_, index)| self.metas[index])
+			.collect()
+	}
 
-    /// Blocks whose id range overlaps [batch_min_id, batch_max_id].
-    fn overlapping_blocks(&self, batch_min_id: u64, batch_max_id: u64) -> Vec<u64> {
-        let mut out = Vec::new();
-        for i in (0..self.metas.len()).rev() {
-            if self.prefix_max_id[i] < batch_min_id {
-                break;
-            }
-            let meta = &self.metas[i];
-            if meta.min_id <= batch_max_id && meta.max_id >= batch_min_id {
-                out.push(meta.block);
-            }
-        }
-        out
-    }
+	/// Blocks whose id range overlaps [batch_min_id, batch_max_id].
+	fn overlapping_blocks(&self, batch_min_id: u64, batch_max_id: u64) -> Vec<u64> {
+		let mut out = Vec::new();
+		for i in (0..self.metas.len()).rev() {
+			if self.prefix_max_id[i] < batch_min_id {
+				break;
+			}
+			let meta = &self.metas[i];
+			if meta.min_id <= batch_max_id && meta.max_id >= batch_min_id {
+				out.push(meta.block);
+			}
+		}
+		out
+	}
 
-    /// Blocks whose [min_ts, max_ts] overlaps [start_ts, end_ts], in block-index
-    /// key order (min_ts, block) — the order the on-disk index scan returned.
-    fn in_time_range(&self, start_ts: i64, end_ts: i64) -> Vec<refs::BlockMeta> {
-        let mut out: Vec<refs::BlockMeta> = self
-            .metas
-            .iter()
-            .filter(|meta| meta.max_ts >= start_ts && meta.min_ts <= end_ts)
-            .copied()
-            .collect();
-        out.sort_unstable_by_key(|meta| (meta.min_ts, meta.block));
-        out
-    }
+	/// Blocks whose [min_ts, max_ts] overlaps [start_ts, end_ts], in block-index
+	/// key order (min_ts, block) — the order the on-disk index scan returned.
+	fn in_time_range(&self, start_ts: i64, end_ts: i64) -> Vec<refs::BlockMeta> {
+		let mut out: Vec<refs::BlockMeta> = self
+			.metas
+			.iter()
+			.filter(|meta| meta.max_ts >= start_ts && meta.min_ts <= end_ts)
+			.copied()
+			.collect();
+		out.sort_unstable_by_key(|meta| (meta.min_ts, meta.block));
+		out
+	}
 
-    /// Blocks whose id range covers `id`, newest first. Same early stop as
-    /// `overlapping_blocks`: for monotonic ids it touches ~one entry.
-    fn containing_id(&self, id: u64) -> Vec<refs::BlockMeta> {
-        let mut out = Vec::new();
-        for i in (0..self.metas.len()).rev() {
-            if self.prefix_max_id[i] < id {
-                break;
-            }
-            let meta = &self.metas[i];
-            if meta.min_id <= id && id <= meta.max_id {
-                out.push(*meta);
-            }
-        }
-        out.sort_unstable_by_key(|meta| std::cmp::Reverse(meta.block));
-        out
-    }
+	/// Blocks whose id range covers `id`, newest first. Same early stop as
+	/// `overlapping_blocks`: for monotonic ids it touches ~one entry.
+	fn containing_id(&self, id: u64) -> Vec<refs::BlockMeta> {
+		let mut out = Vec::new();
+		for i in (0..self.metas.len()).rev() {
+			if self.prefix_max_id[i] < id {
+				break;
+			}
+			let meta = &self.metas[i];
+			if meta.min_id <= id && id <= meta.max_id {
+				out.push(*meta);
+			}
+		}
+		out.sort_unstable_by_key(|meta| std::cmp::Reverse(meta.block));
+		out
+	}
 
-    fn push(&mut self, meta: refs::BlockMeta) {
-        let running = self
-            .prefix_max_id
-            .last()
-            .copied()
-            .unwrap_or(0)
-            .max(meta.max_id);
-        self.prefix_max_id.push(running);
-        self.metas.push(meta);
-    }
+	fn push(&mut self, meta: refs::BlockMeta) {
+		let running = self.prefix_max_id.last().copied().unwrap_or(0).max(meta.max_id);
+		self.prefix_max_id.push(running);
+		self.metas.push(meta);
+	}
 }
 
 type TableMetas = Arc<std::sync::Mutex<TableMetaCache>>;
 type MetaCacheKey = (std::path::PathBuf, u32);
 static BLOCK_META_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<MetaCacheKey, TableMetas>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+	std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Get (lazily loading from the block index) the table's in-memory metadata.
 fn table_meta_cache(db: &Arc<DB>, table_hash: u32) -> TableMetas {
-    let key = (db.path().to_path_buf(), table_hash);
-    let mut map = BLOCK_META_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    map.entry(key)
-        .or_insert_with(|| Arc::new(std::sync::Mutex::new(TableMetaCache::load(db, table_hash))))
-        .clone()
+	let key = (db.path().to_path_buf(), table_hash);
+	let mut map = BLOCK_META_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+	map.entry(key)
+		.or_insert_with(|| Arc::new(std::sync::Mutex::new(TableMetaCache::load(db, table_hash))))
+		.clone()
 }
 
 /// A read snapshot plus the blocks overlapping [start_ts, end_ts] (block-index
@@ -619,62 +582,58 @@ fn table_meta_cache(db: &Arc<DB>, table_hash: u32) -> TableMetas {
 /// snapshot is in the list; a block published later is simply absent from the
 /// snapshot and reads as missing, exactly as before.
 pub(crate) fn snapshot_blocks_in_range(
-    db: &Arc<DB>,
-    table_hash: u32,
-    start_ts: i64,
-    end_ts: i64,
+	db: &Arc<DB>,
+	table_hash: u32,
+	start_ts: i64,
+	end_ts: i64,
 ) -> (rocksdb::Snapshot<'_>, Vec<refs::BlockMeta>) {
-    let metas = table_meta_cache(db, table_hash);
-    let metas = metas
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    (db.snapshot(), metas.in_time_range(start_ts, end_ts))
+	let metas = table_meta_cache(db, table_hash);
+	let metas = metas.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+	(db.snapshot(), metas.in_time_range(start_ts, end_ts))
 }
 
 /// A read snapshot plus the blocks whose id range covers `id`, newest first —
 /// the point-lookup counterpart of `snapshot_blocks_in_range`, with the same
 /// snapshot/lock guarantee.
 pub(crate) fn snapshot_blocks_with_id(
-    db: &Arc<DB>,
-    table_hash: u32,
-    id: u64,
+	db: &Arc<DB>,
+	table_hash: u32,
+	id: u64,
 ) -> (rocksdb::Snapshot<'_>, Vec<refs::BlockMeta>) {
-    let metas = table_meta_cache(db, table_hash);
-    let metas = metas
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    (db.snapshot(), metas.containing_id(id))
+	let metas = table_meta_cache(db, table_hash);
+	let metas = metas.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+	(db.snapshot(), metas.containing_id(id))
 }
 
 /// Scan the table's block index and return metadata for every block.
 /// Cold-start path only — the write path uses `table_meta_cache`.
 fn scan_table_blocks(db: &DB, table_hash: u32) -> Vec<refs::BlockMeta> {
-    use rocksdb::{Direction, IteratorMode};
-    let mut start_key = Vec::with_capacity(5);
-    start_key.extend_from_slice(&table_hash.to_be_bytes());
-    start_key.push(b'B');
+	use rocksdb::{Direction, IteratorMode};
+	let mut start_key = Vec::with_capacity(5);
+	start_key.extend_from_slice(&table_hash.to_be_bytes());
+	start_key.push(b'B');
 
-    let iter = db.iterator(IteratorMode::From(&start_key, Direction::Forward));
-    let mut out = Vec::new();
-    for item in iter {
-        let Ok((key, value)) = item else { break };
-        if key.len() < 4 {
-            continue;
-        }
-        if u32::from_be_bytes([key[0], key[1], key[2], key[3]]) != table_hash {
-            break;
-        }
-        // Markers sort 'B' < 'D' < 'O' and the scan starts at the 'B' range:
-        // the first non-'B' key ends it. `continue` here would walk the whole
-        // 'D' range, materializing every serialized block along the way.
-        if key.len() < 5 || key[4] != b'B' {
-            break;
-        }
-        if let Ok(meta) = refs::parse_block_index_value(&value) {
-            out.push(meta);
-        }
-    }
-    out
+	let iter = db.iterator(IteratorMode::From(&start_key, Direction::Forward));
+	let mut out = Vec::new();
+	for item in iter {
+		let Ok((key, value)) = item else { break };
+		if key.len() < 4 {
+			continue;
+		}
+		if u32::from_be_bytes([key[0], key[1], key[2], key[3]]) != table_hash {
+			break;
+		}
+		// Markers sort 'B' < 'D' < 'O' and the scan starts at the 'B' range:
+		// the first non-'B' key ends it. `continue` here would walk the whole
+		// 'D' range, materializing every serialized block along the way.
+		if key.len() < 5 || key[4] != b'B' {
+			break;
+		}
+		if let Ok(meta) = refs::parse_block_index_value(&value) {
+			out.push(meta);
+		}
+	}
+	out
 }
 
 /// Write one immutable block plus the bookkeeping that keeps REPLACE
@@ -692,182 +651,172 @@ fn scan_table_blocks(db: &DB, table_hash: u32) -> Vec<refs::BlockMeta> {
 /// lose each other's updates; callers serialize ingests per table so the
 /// duplicate DETECTION itself is race-free.
 fn write_block_core(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    serialized_block: &[u8],
-    ids: &[u64],
-    min_timestamp: i64,
-    max_timestamp: i64,
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	serialized_block: &[u8],
+	ids: &[u64],
+	min_timestamp: i64,
+	max_timestamp: i64,
 ) -> Result<u64> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let table_hash = calculate_table_hash(table);
+	if ids.is_empty() {
+		return Ok(0);
+	}
+	let table_hash = calculate_table_hash(table);
 
-    // In-batch duplicate ids: keep the last occurrence, override the rest.
-    let mut last_pos: HashMap<u64, u32> = HashMap::with_capacity(ids.len());
-    for (pos, &id) in ids.iter().enumerate() {
-        last_pos.insert(id, pos as u32);
-    }
-    let mut self_overrides: Vec<u32> = Vec::new();
-    if last_pos.len() != ids.len() {
-        for (pos, &id) in ids.iter().enumerate() {
-            if last_pos[&id] != pos as u32 {
-                self_overrides.push(pos as u32);
-            }
-        }
-    }
+	// In-batch duplicate ids: keep the last occurrence, override the rest.
+	let mut last_pos: HashMap<u64, u32> = HashMap::with_capacity(ids.len());
+	for (pos, &id) in ids.iter().enumerate() {
+		last_pos.insert(id, pos as u32);
+	}
+	let mut self_overrides: Vec<u32> = Vec::new();
+	if last_pos.len() != ids.len() {
+		for (pos, &id) in ids.iter().enumerate() {
+			if last_pos[&id] != pos as u32 {
+				self_overrides.push(pos as u32);
+			}
+		}
+	}
 
-    let batch_min_id = *ids.iter().min().unwrap();
-    let batch_max_id = *ids.iter().max().unwrap();
+	let batch_min_id = *ids.iter().min().unwrap();
+	let batch_max_id = *ids.iter().max().unwrap();
 
-    // Cross-block REPLACE detection: only blocks whose id range overlaps the
-    // batch can hold previous copies. Append-style workloads (monotonic ids)
-    // overlap at most the newest block; REPLACE-heavy tables stay small.
-    // Candidates come from the in-memory metadata (O(blocks) memory pass,
-    // ~100x cheaper than the RocksDB index scan and flat in practice); the
-    // per-table lock is held through the write so the new block's metadata
-    // is appended atomically with respect to the next ingest.
-    let metas = table_meta_cache(db, table_hash);
-    let mut metas = metas
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let candidates = metas.overlapping_blocks(batch_min_id, batch_max_id);
-    let mut old_overrides: Vec<(u64, Vec<u32>)> = Vec::new();
-    for block in candidates {
-        let Some(old_block) = read_block(db, table_hash, block)? else {
-            continue;
-        };
-        let old_ids = old_block.get_id_values(schema)?;
-        let dead: Vec<u32> = old_ids
-            .iter()
-            .enumerate()
-            .filter(|(_, oid)| last_pos.contains_key(oid))
-            .map(|(pos, _)| pos as u32)
-            .collect();
-        if !dead.is_empty() {
-            old_overrides.push((block, dead));
-        }
-    }
+	// Cross-block REPLACE detection: only blocks whose id range overlaps the
+	// batch can hold previous copies. Append-style workloads (monotonic ids)
+	// overlap at most the newest block; REPLACE-heavy tables stay small.
+	// Candidates come from the in-memory metadata (O(blocks) memory pass,
+	// ~100x cheaper than the RocksDB index scan and flat in practice); the
+	// per-table lock is held through the write so the new block's metadata
+	// is appended atomically with respect to the next ingest.
+	let metas = table_meta_cache(db, table_hash);
+	let mut metas = metas.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+	let candidates = metas.overlapping_blocks(batch_min_id, batch_max_id);
+	let mut old_overrides: Vec<(u64, Vec<u32>)> = Vec::new();
+	for block in candidates {
+		let Some(old_block) = read_block(db, table_hash, block)? else {
+			continue;
+		};
+		let old_ids = old_block.get_id_values(schema)?;
+		let dead: Vec<u32> = old_ids
+			.iter()
+			.enumerate()
+			.filter(|(_, oid)| last_pos.contains_key(oid))
+			.map(|(pos, _)| pos as u32)
+			.collect();
+		if !dead.is_empty() {
+			old_overrides.push((block, dead));
+		}
+	}
 
-    let block_id = refs::allocate_block_id(db)?;
-    let new_meta = refs::BlockMeta {
-        block: block_id,
-        min_ts: min_timestamp,
-        max_ts: max_timestamp,
-        rows: ids.len() as u32,
-        min_id: batch_min_id,
-        max_id: batch_max_id,
-    };
-    let mut batch = WriteBatch::default();
-    batch.put(refs::block_data_key(table_hash, block_id), serialized_block);
-    batch.put(
-        refs::block_index_key(table_hash, min_timestamp, block_id),
-        refs::encode_block_index_value(&new_meta),
-    );
-    if !self_overrides.is_empty() {
-        batch.merge(
-            refs::override_key(table_hash, block_id),
-            refs::encode_override_positions(&self_overrides),
-        );
-    }
-    for (old_block, dead) in &old_overrides {
-        batch.merge(
-            refs::override_key(table_hash, *old_block),
-            refs::encode_override_positions(dead),
-        );
-    }
+	let block_id = refs::allocate_block_id(db)?;
+	let new_meta = refs::BlockMeta {
+		block: block_id,
+		min_ts: min_timestamp,
+		max_ts: max_timestamp,
+		rows: ids.len() as u32,
+		min_id: batch_min_id,
+		max_id: batch_max_id,
+	};
+	let mut batch = WriteBatch::default();
+	batch.put(refs::block_data_key(table_hash, block_id), serialized_block);
+	batch.put(
+		refs::block_index_key(table_hash, min_timestamp, block_id),
+		refs::encode_block_index_value(&new_meta),
+	);
+	if !self_overrides.is_empty() {
+		batch.merge(
+			refs::override_key(table_hash, block_id),
+			refs::encode_override_positions(&self_overrides),
+		);
+	}
+	for (old_block, dead) in &old_overrides {
+		batch.merge(
+			refs::override_key(table_hash, *old_block),
+			refs::encode_override_positions(dead),
+		);
+	}
 
-    // Synced write: callers truncate the application-level buffer WAL right
-    // after this returns, so the RocksDB WAL must be on disk first — an
-    // unsynced write would open a crash window where BOTH logs lose the
-    // batch. One fsync per block (not per row) is negligible against the
-    // block payload itself.
-    let mut write_opts = rocksdb::WriteOptions::default();
-    write_opts.set_sync(true);
-    db.write_opt(batch, &write_opts)?;
-    // Disk write succeeded — publish the new block to the in-memory metadata
-    // (still under the per-table lock taken before candidate selection).
-    metas.push(new_meta);
-    debug!("Wrote column block with {} rows", ids.len());
-    Ok(ids.len() as u64)
+	// Synced write: callers truncate the application-level buffer WAL right
+	// after this returns, so the RocksDB WAL must be on disk first — an
+	// unsynced write would open a crash window where BOTH logs lose the
+	// batch. One fsync per block (not per row) is negligible against the
+	// block payload itself.
+	let mut write_opts = rocksdb::WriteOptions::default();
+	write_opts.set_sync(true);
+	db.write_opt(batch, &write_opts)?;
+	// Disk write succeeded — publish the new block to the in-memory metadata
+	// (still under the per-table lock taken before candidate selection).
+	metas.push(new_meta);
+	debug!("Wrote column block with {} rows", ids.len());
+	Ok(ids.len() as u64)
 }
 
 /// Metadata-only disk count, decoding ids only for possible buffered replacements.
 pub(crate) fn table_stats(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    rows: &HashMap<u64, HashMap<String, String>>,
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	rows: &HashMap<u64, HashMap<String, String>>,
 ) -> Result<super::TableStats> {
-    let hash = calculate_table_hash(table);
-    let (snap, metas) = snapshot_blocks_in_range(db, hash, i64::MIN, i64::MAX);
-    let mut total: u64 = metas.iter().map(|meta| meta.rows as u64).sum();
-    let mut prefix = hash.to_be_bytes().to_vec();
-    prefix.push(b'O');
-    for entry in snap.iterator(rocksdb::IteratorMode::From(
-        &prefix,
-        rocksdb::Direction::Forward,
-    )) {
-        let (key, value) = entry?;
-        if !key.starts_with(&prefix) {
-            break;
-        }
-        total = total
-            .checked_sub(refs::decode_override_positions(&value).len() as u64)
-            .ok_or_else(|| {
-                PulsoraError::InvalidData("Override count exceeds block rows".to_string())
-            })?;
-    }
-    let mut new_ids: std::collections::HashSet<u64> = rows.keys().copied().collect();
-    for meta in &metas {
-        if !new_ids
-            .iter()
-            .any(|id| meta.min_id <= *id && *id <= meta.max_id)
-        {
-            continue;
-        }
-        // A range is only a candidate: sparse ids and dead copies must not
-        // suppress genuinely new buffered rows.
-        let data = snap
-            .get(refs::block_data_key(hash, meta.block))?
-            .ok_or_else(|| PulsoraError::InvalidData(format!("Missing block {}", meta.block)))?;
-        let block = ColumnBlock::deserialize(&data)?;
-        let dead = snap
-            .get(refs::override_key(hash, meta.block))?
-            .map(|data| refs::decode_override_positions(&data))
-            .unwrap_or_default();
-        for (pos, id) in block.get_id_values(schema)?.into_iter().enumerate() {
-            if !dead.contains(&(pos as u32)) {
-                new_ids.remove(&id);
-            }
-        }
-    }
-    total += new_ids.len() as u64;
-    let mut min_ts = metas.iter().map(|meta| meta.min_ts).min();
-    let mut max_ts = metas.iter().map(|meta| meta.max_ts).max();
-    if let Some(column) = schema.get_timestamp_column() {
-        for row in rows.values() {
-            if let Some(value) = row.get(column) {
-                // Match block-index ingestion: integer timestamp columns can
-                // contain values outside the timestamp parser's supported range.
-                if let Ok(ts) = parse_timestamp(value) {
-                    min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
-                    max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
-                }
-            }
-        }
-    }
-    if total == 0 || schema.get_timestamp_column().is_none() {
-        min_ts = None;
-        max_ts = None;
-    }
-    Ok(super::TableStats {
-        count: total,
-        min_ts,
-        max_ts,
-    })
+	let hash = calculate_table_hash(table);
+	let (snap, metas) = snapshot_blocks_in_range(db, hash, i64::MIN, i64::MAX);
+	let mut total: u64 = metas.iter().map(|meta| meta.rows as u64).sum();
+	let mut prefix = hash.to_be_bytes().to_vec();
+	prefix.push(b'O');
+	for entry in snap.iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward)) {
+		let (key, value) = entry?;
+		if !key.starts_with(&prefix) {
+			break;
+		}
+		total = total
+			.checked_sub(refs::decode_override_positions(&value).len() as u64)
+			.ok_or_else(|| PulsoraError::InvalidData("Override count exceeds block rows".to_string()))?;
+	}
+	let mut new_ids: std::collections::HashSet<u64> = rows.keys().copied().collect();
+	for meta in &metas {
+		if !new_ids.iter().any(|id| meta.min_id <= *id && *id <= meta.max_id) {
+			continue;
+		}
+		// A range is only a candidate: sparse ids and dead copies must not
+		// suppress genuinely new buffered rows.
+		let data = snap
+			.get(refs::block_data_key(hash, meta.block))?
+			.ok_or_else(|| PulsoraError::InvalidData(format!("Missing block {}", meta.block)))?;
+		let block = ColumnBlock::deserialize(&data)?;
+		let dead = snap
+			.get(refs::override_key(hash, meta.block))?
+			.map(|data| refs::decode_override_positions(&data))
+			.unwrap_or_default();
+		for (pos, id) in block.get_id_values(schema)?.into_iter().enumerate() {
+			if !dead.contains(&(pos as u32)) {
+				new_ids.remove(&id);
+			}
+		}
+	}
+	total += new_ids.len() as u64;
+	let mut min_ts = metas.iter().map(|meta| meta.min_ts).min();
+	let mut max_ts = metas.iter().map(|meta| meta.max_ts).max();
+	if let Some(column) = schema.get_timestamp_column() {
+		for row in rows.values() {
+			if let Some(value) = row.get(column) {
+				// Match block-index ingestion: integer timestamp columns can
+				// contain values outside the timestamp parser's supported range.
+				if let Ok(ts) = parse_timestamp(value) {
+					min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
+					max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
+				}
+			}
+		}
+	}
+	if total == 0 || schema.get_timestamp_column().is_none() {
+		min_ts = None;
+		max_ts = None;
+	}
+	Ok(super::TableStats {
+		count: total,
+		min_ts,
+		max_ts,
+	})
 }
 
 /// Rewrite at most one run per call, bounding live output to `target_rows` and
@@ -880,252 +829,238 @@ pub(crate) fn table_stats(
 /// held the ingest lock for O(all blocks) on every pass — a write stall per
 /// pass on a multi-million-block trade table. Fully overridden blocks are
 /// deleted without being read, so they do not count as sources.
-pub(crate) fn compact_table_blocks(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    target_rows: usize,
-) -> Result<u64> {
-    const MAX_SOURCE_BLOCKS: usize = 32;
-    const COMPACT_WINDOW: usize = 1024;
-    let hash = calculate_table_hash(table);
-    let cache = table_meta_cache(db, hash);
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let window = cache.window_from(cache.compact_cursor, COMPACT_WINDOW);
-    let Some(window_last) = window.last().copied() else {
-        cache.compact_cursor = (i64::MIN, 0);
-        return Ok(0);
-    };
-    let states = refs::load_override_states(&db.snapshot(), hash, &window)?;
-    let mut resume = (window_last.min_ts, window_last.block + 1);
-    let mut selected: Vec<refs::BlockMeta> = Vec::new();
-    let mut sources = 0usize;
-    let mut live_rows = 0usize;
-    let mut has_dead = false;
-    for meta in window {
-        let dead_rows = if states.fully_dead.contains(&meta.block) {
-            meta.rows as usize
-        } else {
-            states.partial.get(&meta.block).map_or(0, |dead| dead.len())
-        };
-        let live = meta.rows as usize - dead_rows;
-        if live >= target_rows
-            || live_rows + live > target_rows
-            || (live > 0 && sources == MAX_SOURCE_BLOCKS)
-        {
-            if selected.len() > 1 || has_dead {
-                resume = (meta.min_ts, meta.block);
-                break;
-            }
-            selected.clear();
-            sources = 0;
-            live_rows = 0;
-            has_dead = false;
-            if live >= target_rows {
-                continue;
-            }
-        }
-        live_rows += live;
-        sources += usize::from(live > 0);
-        has_dead |= dead_rows > 0;
-        selected.push(meta);
-    }
-    cache.compact_cursor = resume;
-    if selected.is_empty() || (selected.len() == 1 && !has_dead) {
-        return Ok(0);
-    }
+pub(crate) fn compact_table_blocks(db: &Arc<DB>, table: &str, schema: &Schema, target_rows: usize) -> Result<u64> {
+	const MAX_SOURCE_BLOCKS: usize = 32;
+	const COMPACT_WINDOW: usize = 1024;
+	let hash = calculate_table_hash(table);
+	let cache = table_meta_cache(db, hash);
+	let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+	let window = cache.window_from(cache.compact_cursor, COMPACT_WINDOW);
+	let Some(window_last) = window.last().copied() else {
+		cache.compact_cursor = (i64::MIN, 0);
+		return Ok(0);
+	};
+	let states = refs::load_override_states(&db.snapshot(), hash, &window)?;
+	let mut resume = (window_last.min_ts, window_last.block + 1);
+	let mut selected: Vec<refs::BlockMeta> = Vec::new();
+	let mut sources = 0usize;
+	let mut live_rows = 0usize;
+	let mut has_dead = false;
+	for meta in window {
+		let dead_rows = if states.fully_dead.contains(&meta.block) {
+			meta.rows as usize
+		} else {
+			states.partial.get(&meta.block).map_or(0, |dead| dead.len())
+		};
+		let live = meta.rows as usize - dead_rows;
+		if live >= target_rows || live_rows + live > target_rows || (live > 0 && sources == MAX_SOURCE_BLOCKS) {
+			if selected.len() > 1 || has_dead {
+				resume = (meta.min_ts, meta.block);
+				break;
+			}
+			selected.clear();
+			sources = 0;
+			live_rows = 0;
+			has_dead = false;
+			if live >= target_rows {
+				continue;
+			}
+		}
+		live_rows += live;
+		sources += usize::from(live > 0);
+		has_dead |= dead_rows > 0;
+		selected.push(meta);
+	}
+	cache.compact_cursor = resume;
+	if selected.is_empty() || (selected.len() == 1 && !has_dead) {
+		return Ok(0);
+	}
 
-    let mut blocks = Vec::new();
-    for meta in &selected {
-        if states.fully_dead.contains(&meta.block) {
-            continue;
-        }
-        let block = read_block(db, hash, meta.block)?
-            .ok_or_else(|| PulsoraError::InvalidData(format!("Missing block {}", meta.block)))?;
-        let dead = states.partial.get(&meta.block);
-        let positions = (0..block.row_count)
-            .filter(|pos| !dead.is_some_and(|dead| dead.contains(&(*pos as u32))))
-            .collect();
-        blocks.push((block, positions));
-    }
-    let mut batch = WriteBatch::default();
-    let mut replacement = None;
-    if live_rows > 0 {
-        let block = ColumnBlock::compact(&blocks, schema)?;
-        let ids = block.get_id_values(schema)?;
-        let (min_ts, max_ts) = block.timestamp_bounds(schema)?.unwrap_or_else(|| {
-            (
-                selected.iter().map(|meta| meta.min_ts).min().unwrap(),
-                selected.iter().map(|meta| meta.max_ts).max().unwrap(),
-            )
-        });
-        let meta = refs::BlockMeta {
-            block: refs::allocate_block_id(db)?,
-            min_ts,
-            max_ts,
-            rows: block.row_count as u32,
-            min_id: *ids.iter().min().unwrap(),
-            max_id: *ids.iter().max().unwrap(),
-        };
-        batch.put(refs::block_data_key(hash, meta.block), block.serialize()?);
-        batch.put(
-            refs::block_index_key(hash, min_ts, meta.block),
-            refs::encode_block_index_value(&meta),
-        );
-        replacement = Some(meta);
-    }
-    let retired: std::collections::HashSet<u64> = selected.iter().map(|meta| meta.block).collect();
-    for meta in &selected {
-        batch.delete(refs::block_data_key(hash, meta.block));
-        batch.delete(refs::block_index_key(hash, meta.min_ts, meta.block));
-        batch.delete(refs::override_key(hash, meta.block));
-    }
-    let mut options = rocksdb::WriteOptions::default();
-    options.set_sync(true);
-    db.write_opt(batch, &options)?;
-    cache.metas.retain(|meta| !retired.contains(&meta.block));
-    let mut running = 0;
-    cache.prefix_max_id = cache
-        .metas
-        .iter()
-        .map(|meta| {
-            running = running.max(meta.max_id);
-            running
-        })
-        .collect();
-    if let Some(meta) = replacement {
-        cache.push(meta);
-    }
-    Ok(retired.len() as u64)
+	let mut blocks = Vec::new();
+	for meta in &selected {
+		if states.fully_dead.contains(&meta.block) {
+			continue;
+		}
+		let block = read_block(db, hash, meta.block)?
+			.ok_or_else(|| PulsoraError::InvalidData(format!("Missing block {}", meta.block)))?;
+		let dead = states.partial.get(&meta.block);
+		let positions = (0..block.row_count)
+			.filter(|pos| !dead.is_some_and(|dead| dead.contains(&(*pos as u32))))
+			.collect();
+		blocks.push((block, positions));
+	}
+	let mut batch = WriteBatch::default();
+	let mut replacement = None;
+	if live_rows > 0 {
+		let block = ColumnBlock::compact(&blocks, schema)?;
+		let ids = block.get_id_values(schema)?;
+		let (min_ts, max_ts) = block.timestamp_bounds(schema)?.unwrap_or_else(|| {
+			(
+				selected.iter().map(|meta| meta.min_ts).min().unwrap(),
+				selected.iter().map(|meta| meta.max_ts).max().unwrap(),
+			)
+		});
+		let meta = refs::BlockMeta {
+			block: refs::allocate_block_id(db)?,
+			min_ts,
+			max_ts,
+			rows: block.row_count as u32,
+			min_id: *ids.iter().min().unwrap(),
+			max_id: *ids.iter().max().unwrap(),
+		};
+		batch.put(refs::block_data_key(hash, meta.block), block.serialize()?);
+		batch.put(
+			refs::block_index_key(hash, min_ts, meta.block),
+			refs::encode_block_index_value(&meta),
+		);
+		replacement = Some(meta);
+	}
+	let retired: std::collections::HashSet<u64> = selected.iter().map(|meta| meta.block).collect();
+	for meta in &selected {
+		batch.delete(refs::block_data_key(hash, meta.block));
+		batch.delete(refs::block_index_key(hash, meta.min_ts, meta.block));
+		batch.delete(refs::override_key(hash, meta.block));
+	}
+	let mut options = rocksdb::WriteOptions::default();
+	options.set_sync(true);
+	db.write_opt(batch, &options)?;
+	cache.metas.retain(|meta| !retired.contains(&meta.block));
+	let mut running = 0;
+	cache.prefix_max_id = cache
+		.metas
+		.iter()
+		.map(|meta| {
+			running = running.max(meta.max_id);
+			running
+		})
+		.collect();
+	if let Some(meta) = replacement {
+		cache.push(meta);
+	}
+	Ok(retired.len() as u64)
 }
 
 /// Read one stored column block.
 fn read_block(db: &DB, table_hash: u32, block_id: u64) -> Result<Option<ColumnBlock>> {
-    match db.get(refs::block_data_key(table_hash, block_id))? {
-        Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),
-        None => Ok(None),
-    }
+	match db.get(refs::block_data_key(table_hash, block_id))? {
+		Some(data) => Ok(Some(ColumnBlock::deserialize(&data)?)),
+		None => Ok(None),
+	}
 }
 
 #[allow(dead_code)]
 pub fn insert_rows(
-    db: &Arc<DB>,
-    table: &str,
-    schema: &Schema,
-    id_managers: &mut IdManagerRegistry,
-    rows: Vec<HashMap<String, String>>,
-    batch_size: usize,
+	db: &Arc<DB>,
+	table: &str,
+	schema: &Schema,
+	id_managers: &mut IdManagerRegistry,
+	rows: Vec<HashMap<String, String>>,
+	batch_size: usize,
 ) -> Result<u64> {
-    if rows.is_empty() {
-        return Ok(0);
-    }
+	if rows.is_empty() {
+		return Ok(0);
+	}
 
-    // Get ID manager for this table
-    let id_manager = id_managers.get_or_create(table)?;
+	// Get ID manager for this table
+	let id_manager = id_managers.get_or_create(table)?;
 
-    // Process rows and assign IDs with pre-allocation
-    let mut processed_rows = Vec::with_capacity(rows.len());
-    for mut row in rows {
-        // Handle ID assignment
-        let row_id = if let Some(id_str) = row.get(&schema.id_column) {
-            if id_str.trim().is_empty() {
-                // Empty ID - auto assign
-                RowId::Auto
-            } else {
-                // Parse user-provided ID
-                let parsed_id = RowId::from_string(id_str)?;
-                if let RowId::User(id) = parsed_id {
-                    id_manager.register_user_id(id)?;
-                }
-                parsed_id
-            }
-        } else {
-            // Missing ID column - auto assign
-            RowId::Auto
-        };
+	// Process rows and assign IDs with pre-allocation
+	let mut processed_rows = Vec::with_capacity(rows.len());
+	for mut row in rows {
+		// Handle ID assignment
+		let row_id = if let Some(id_str) = row.get(&schema.id_column) {
+			if id_str.trim().is_empty() {
+				// Empty ID - auto assign
+				RowId::Auto
+			} else {
+				// Parse user-provided ID
+				let parsed_id = RowId::from_string(id_str)?;
+				if let RowId::User(id) = parsed_id {
+					id_manager.register_user_id(id)?;
+				}
+				parsed_id
+			}
+		} else {
+			// Missing ID column - auto assign
+			RowId::Auto
+		};
 
-        // Resolve ID to actual value
-        let actual_id = row_id.resolve(&id_manager);
+		// Resolve ID to actual value
+		let actual_id = row_id.resolve(&id_manager);
 
-        // Set the ID in the row data
-        row.insert(schema.id_column.clone(), actual_id.to_string());
+		// Set the ID in the row data
+		row.insert(schema.id_column.clone(), actual_id.to_string());
 
-        // Validate the complete row
-        schema.validate_row(&row)?;
+		// Validate the complete row
+		schema.validate_row(&row)?;
 
-        processed_rows.push((actual_id, row));
-    }
+		processed_rows.push((actual_id, row));
+	}
 
-    // Duplicate ids must not straddle chunk boundaries: chunks are written in
-    // parallel and cross-chunk copies of one id would race REPLACE detection.
-    // Keep the LAST occurrence (REPLACE semantics), preserving arrival order.
-    let mut keep_pos: HashMap<u64, usize> = HashMap::with_capacity(processed_rows.len());
-    for (pos, (id, _)) in processed_rows.iter().enumerate() {
-        keep_pos.insert(*id, pos);
-    }
-    if keep_pos.len() != processed_rows.len() {
-        let mut deduped = Vec::with_capacity(keep_pos.len());
-        for (pos, pair) in processed_rows.into_iter().enumerate() {
-            if keep_pos[&pair.0] == pos {
-                deduped.push(pair);
-            }
-        }
-        processed_rows = deduped;
-    }
+	// Duplicate ids must not straddle chunk boundaries: chunks are written in
+	// parallel and cross-chunk copies of one id would race REPLACE detection.
+	// Keep the LAST occurrence (REPLACE semantics), preserving arrival order.
+	let mut keep_pos: HashMap<u64, usize> = HashMap::with_capacity(processed_rows.len());
+	for (pos, (id, _)) in processed_rows.iter().enumerate() {
+		keep_pos.insert(*id, pos);
+	}
+	if keep_pos.len() != processed_rows.len() {
+		let mut deduped = Vec::with_capacity(keep_pos.len());
+		for (pos, pair) in processed_rows.into_iter().enumerate() {
+			if keep_pos[&pair.0] == pos {
+				deduped.push(pair);
+			}
+		}
+		processed_rows = deduped;
+	}
 
-    // Process rows in chunks for columnar storage
-    let chunks: Vec<_> = processed_rows.chunks(batch_size).collect();
+	// Process rows in chunks for columnar storage
+	let chunks: Vec<_> = processed_rows.chunks(batch_size).collect();
 
-    // Chunks are written SEQUENTIALLY: block writes run REPLACE detection
-    // against the blocks already on disk, and parallel chunk writes would
-    // race that detection (a chunk cannot see a sibling's in-flight block).
-    let mut total_inserted = 0u64;
-    for chunk in chunks {
-        total_inserted += write_batch_to_rocksdb(db, table, schema, chunk)?;
-    }
+	// Chunks are written SEQUENTIALLY: block writes run REPLACE detection
+	// against the blocks already on disk, and parallel chunk writes would
+	// race that detection (a chunk cannot see a sibling's in-flight block).
+	let mut total_inserted = 0u64;
+	for chunk in chunks {
+		total_inserted += write_batch_to_rocksdb(db, table, schema, chunk)?;
+	}
 
-    Ok(total_inserted)
+	Ok(total_inserted)
 }
 
 pub fn parse_timestamp(value: &str) -> Result<i64> {
-    // Try parsing as Unix timestamp
-    if let Ok(timestamp) = value.parse::<i64>() {
-        // Check if it's in seconds (10 digits) or milliseconds (13 digits)
-        if timestamp > 1_000_000_000 && timestamp < 10_000_000_000 {
-            return Ok(timestamp * 1000); // Convert seconds to milliseconds
-        } else if timestamp > 1_000_000_000_000 && timestamp < 10_000_000_000_000 {
-            return Ok(timestamp); // Already in milliseconds
-        }
-    }
+	// Try parsing as Unix timestamp
+	if let Ok(timestamp) = value.parse::<i64>() {
+		// Check if it's in seconds (10 digits) or milliseconds (13 digits)
+		if timestamp > 1_000_000_000 && timestamp < 10_000_000_000 {
+			return Ok(timestamp * 1000); // Convert seconds to milliseconds
+		} else if timestamp > 1_000_000_000_000 && timestamp < 10_000_000_000_000 {
+			return Ok(timestamp); // Already in milliseconds
+		}
+	}
 
-    // Try parsing as RFC3339 first (handles Z suffix)
-    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
-        return Ok(dt.timestamp_millis());
-    }
+	// Try parsing as RFC3339 first (handles Z suffix)
+	if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+		return Ok(dt.timestamp_millis());
+	}
 
-    // Try parsing as naive datetime and assume UTC
-    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S") {
-        return Ok(naive_dt.and_utc().timestamp_millis());
-    }
+	// Try parsing as naive datetime and assume UTC
+	if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S") {
+		return Ok(naive_dt.and_utc().timestamp_millis());
+	}
 
-    if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-        return Ok(naive_dt.and_utc().timestamp_millis());
-    }
+	if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+		return Ok(naive_dt.and_utc().timestamp_millis());
+	}
 
-    if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        return Ok(naive_date
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis());
-    }
+	if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+		return Ok(naive_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis());
+	}
 
-    Err(PulsoraError::InvalidData(format!(
-        "Invalid timestamp format: {}",
-        value
-    )))
+	Err(PulsoraError::InvalidData(format!(
+		"Invalid timestamp format: {}",
+		value
+	)))
 }
 
 #[cfg(test)]

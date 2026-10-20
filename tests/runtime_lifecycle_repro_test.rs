@@ -78,128 +78,120 @@ const THREADS: usize = 8;
 const ROWS: usize = 1000;
 
 fn build_csv(rows: usize) -> String {
-    let mut csv = String::from("timestamp,symbol,price,volume\n");
-    for i in 0..rows {
-        let total = i;
-        let hours = (10 + (total / 3600)) % 24;
-        let minutes = (total % 3600) / 60;
-        let seconds = total % 60;
-        csv.push_str(&format!(
-            "2024-01-01 {:02}:{:02}:{:02},AAPL,{:.2},{}\n",
-            hours,
-            minutes,
-            seconds,
-            150.0 + (i as f64 * 0.01),
-            1000 + i
-        ));
-    }
-    csv
+	let mut csv = String::from("timestamp,symbol,price,volume\n");
+	for i in 0..rows {
+		let total = i;
+		let hours = (10 + (total / 3600)) % 24;
+		let minutes = (total % 3600) / 60;
+		let seconds = total % 60;
+		csv.push_str(&format!(
+			"2024-01-01 {:02}:{:02}:{:02},AAPL,{:.2},{}\n",
+			hours,
+			minutes,
+			seconds,
+			150.0 + (i as f64 * 0.01),
+			1000 + i
+		));
+	}
+	csv
 }
 
 /// Byte-for-byte equivalent of `create_test_storage_with_data` in
 /// `benches/query.rs`: build a runtime, `block_on` the engine creation +
 /// ingest, then **drop** the runtime while returning the engine.
 fn create_test_storage_with_data(rows: usize) -> (StorageEngine, TempDir) {
-    let temp_dir = TempDir::new().unwrap();
-    let mut config = Config::default();
-    config.storage.data_dir = temp_dir.path().to_string_lossy().to_string();
+	let temp_dir = TempDir::new().unwrap();
+	let mut config = Config::default();
+	config.storage.data_dir = temp_dir.path().to_string_lossy().to_string();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let storage = rt.block_on(async {
-        let storage = StorageEngine::new(&config).await.unwrap();
-        storage
-            .ingest_csv("benchmark_table", build_csv(rows))
-            .await
-            .unwrap();
-        storage
-    });
-    // rt drops here — background flush task + per-table WAL writer task
-    // were spawned on this rt and now get aborted while the StorageEngine
-    // (which holds the Arc<DB> they reference) lives on.
-    (storage, temp_dir)
+	let rt = tokio::runtime::Runtime::new().unwrap();
+	let storage = rt.block_on(async {
+		let storage = StorageEngine::new(&config).await.unwrap();
+		storage.ingest_csv("benchmark_table", build_csv(rows)).await.unwrap();
+		storage
+	});
+	// rt drops here — background flush task + per-table WAL writer task
+	// were spawned on this rt and now get aborted while the StorageEngine
+	// (which holds the Arc<DB> they reference) lives on.
+	(storage, temp_dir)
 }
 
 /// One bench iteration's worth of work, structured exactly like the
 /// failing bench's `iter_batched` setup + iter closure.
 fn one_iteration() {
-    // SETUP — mirrors the bench's `iter_batched` setup closure verbatim.
-    let (storage, _temp_dir) = create_test_storage_with_data(ROWS);
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let schema = rt.block_on(async {
-        let schemas = storage.schemas.read().await;
-        schemas.get_schema("benchmark_table").unwrap().clone()
-    });
-    // `rt` drops here (end of setup closure scope).
-    drop(rt);
-    // `_temp_dir` drops here in the bench too — same shape.
-    // In the bench, only `(storage, schema)` is returned and criterion
-    // then runs the iter closure with that tuple. We do the same below.
+	// SETUP — mirrors the bench's `iter_batched` setup closure verbatim.
+	let (storage, _temp_dir) = create_test_storage_with_data(ROWS);
+	let rt = tokio::runtime::Runtime::new().unwrap();
+	let schema = rt.block_on(async {
+		let schemas = storage.schemas.read().await;
+		schemas.get_schema("benchmark_table").unwrap().clone()
+	});
+	// `rt` drops here (end of setup closure scope).
+	drop(rt);
+	// `_temp_dir` drops here in the bench too — same shape.
+	// In the bench, only `(storage, schema)` is returned and criterion
+	// then runs the iter closure with that tuple. We do the same below.
 
-    // ITER — fan out THREADS sync queries.
-    let pool = std::sync::Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap(),
-    );
-    let handles: Vec<_> = (0..THREADS)
-        .map(|_| {
-            let storage = storage.clone();
-            let schema = schema.clone();
-            let pool = pool.clone();
-            std::thread::spawn(move || {
-                query::execute_query(
-                    &storage.db,
-                    "benchmark_table",
-                    &schema,
-                    None,
-                    None,
-                    Some(100),
-                    None,
-                    &pool,
-                )
-                .unwrap()
-            })
-        })
-        .collect();
+	// ITER — fan out THREADS sync queries.
+	let pool = std::sync::Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+	let handles: Vec<_> = (0..THREADS)
+		.map(|_| {
+			let storage = storage.clone();
+			let schema = schema.clone();
+			let pool = pool.clone();
+			std::thread::spawn(move || {
+				query::execute_query(
+					&storage.db,
+					"benchmark_table",
+					&schema,
+					None,
+					None,
+					Some(100),
+					None,
+					&pool,
+				)
+				.unwrap()
+			})
+		})
+		.collect();
 
-    for h in handles {
-        let _ = h.join();
-    }
+	for h in handles {
+		let _ = h.join();
+	}
 
-    // (storage, schema) drop at end of one_iteration scope. _temp_dir
-    // already dropped above.
+	// (storage, schema) drop at end of one_iteration scope. _temp_dir
+	// already dropped above.
 }
 
 /// Hold a long-lived OUTER runtime for the duration of the loop — exactly
 /// what `bench_concurrent_queries` does at the function level around its
 /// per-iteration drop/recreate cycle.
 fn run_with_outer_runtime(iterations: usize) {
-    let outer_rt = tokio::runtime::Runtime::new().unwrap();
+	let outer_rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Use the outer runtime once for symmetry with the bench's initial
-    // `rt.block_on` (which fetches the schema for the bench setup).
-    outer_rt.block_on(async { tokio::task::yield_now().await });
+	// Use the outer runtime once for symmetry with the bench's initial
+	// `rt.block_on` (which fetches the schema for the bench setup).
+	outer_rt.block_on(async { tokio::task::yield_now().await });
 
-    for i in 0..iterations {
-        if i % 50 == 0 {
-            eprintln!("  iter {}/{}", i + 1, iterations);
-        }
-        one_iteration();
-    }
+	for i in 0..iterations {
+		if i % 50 == 0 {
+			eprintln!("  iter {}/{}", i + 1, iterations);
+		}
+		one_iteration();
+	}
 
-    drop(outer_rt);
+	drop(outer_rt);
 }
 
 #[test]
 fn repro_short() {
-    eprintln!("short reproducer ({} iterations)", ITERATIONS_SHORT);
-    run_with_outer_runtime(ITERATIONS_SHORT);
+	eprintln!("short reproducer ({} iterations)", ITERATIONS_SHORT);
+	run_with_outer_runtime(ITERATIONS_SHORT);
 }
 
 #[test]
 #[ignore = "long-running reproducer; run explicitly with `--ignored`"]
 fn repro_long() {
-    eprintln!("long reproducer ({} iterations)", ITERATIONS_LONG);
-    run_with_outer_runtime(ITERATIONS_LONG);
+	eprintln!("long reproducer ({} iterations)", ITERATIONS_LONG);
+	run_with_outer_runtime(ITERATIONS_LONG);
 }

@@ -4,73 +4,69 @@ use tempfile::NamedTempFile;
 
 #[test]
 fn test_default_config() {
-    let config = Config::default();
-    assert_eq!(config.server.host, "0.0.0.0");
-    assert_eq!(config.server.port, 8080);
-    assert_eq!(config.storage.write_buffer_size_mb, 64);
-    assert_eq!(config.performance.compression, "lz4");
-    assert_eq!(config.logging.level, "info");
+	let config = Config::default();
+	assert_eq!(config.server.host, "0.0.0.0");
+	assert_eq!(config.server.port, 8080);
+	assert_eq!(config.storage.write_buffer_size_mb, 64);
+	assert_eq!(config.performance.compression, "lz4");
+	assert_eq!(config.logging.level, "info");
 }
 
 #[test]
 fn test_validate_valid_config() {
-    let config = Config::default();
-    assert!(config.validate().is_ok());
+	let config = Config::default();
+	assert!(config.validate().is_ok());
 }
 
 #[test]
 fn test_validate_invalid_port() {
-    let mut config = Config::default();
-    config.server.port = 0;
-    assert!(config.validate().is_err());
+	let mut config = Config::default();
+	config.server.port = 0;
+	assert!(config.validate().is_err());
 }
 
 #[test]
 fn test_validate_invalid_buffer_size() {
-    let mut config = Config::default();
-    config.storage.write_buffer_size_mb = 0;
-    assert!(config.validate().is_err());
+	let mut config = Config::default();
+	config.storage.write_buffer_size_mb = 0;
+	assert!(config.validate().is_err());
 }
 
 #[test]
 fn test_validate_invalid_batch_size() {
-    let mut config = Config::default();
-    config.ingestion.batch_size = 0;
-    assert!(config.validate().is_err());
+	let mut config = Config::default();
+	config.ingestion.batch_size = 0;
+	assert!(config.validate().is_err());
 }
 
 #[test]
 fn test_validate_invalid_compression() {
-    let mut config = Config::default();
-    config.performance.compression = "invalid".to_string();
-    assert!(config.validate().is_err());
+	let mut config = Config::default();
+	config.performance.compression = "invalid".to_string();
+	assert!(config.validate().is_err());
 }
 
 #[test]
 fn test_validate_valid_compressions() {
-    let valid = ["none", "snappy", "lz4", "zstd"];
-    for comp in valid {
-        let mut config = Config::default();
-        config.performance.compression = comp.to_string();
-        assert!(
-            config.validate().is_ok(),
-            "Compression {} should be valid",
-            comp
-        );
-    }
+	let valid = ["none", "snappy", "lz4", "zstd"];
+	for comp in valid {
+		let mut config = Config::default();
+		config.performance.compression = comp.to_string();
+		assert!(config.validate().is_ok(), "Compression {} should be valid", comp);
+	}
 }
 
 #[test]
 fn test_validate_invalid_log_level() {
-    let mut config = Config::default();
-    config.logging.level = "invalid".to_string();
-    assert!(config.validate().is_err());
+	let mut config = Config::default();
+	config.logging.level = "invalid".to_string();
+	assert!(config.validate().is_err());
 }
 
 #[test]
 fn test_from_file() {
-    let mut file = NamedTempFile::new().unwrap();
-    let config_str = r#"
+	let mut file = NamedTempFile::new().unwrap();
+	let config_str = r#"
 [server]
 host = "127.0.0.1"
 port = 9090
@@ -102,29 +98,29 @@ format = "json"
 enable_access_logs = false
 enable_performance_logs = false
 "#;
-    write!(file, "{}", config_str).unwrap();
+	write!(file, "{}", config_str).unwrap();
 
-    let config = Config::from_file(file.path().to_path_buf()).unwrap();
+	let config = Config::from_file(file.path().to_path_buf()).unwrap();
 
-    assert_eq!(config.server.host, "127.0.0.1");
-    assert_eq!(config.server.port, 9090);
-    assert_eq!(config.storage.write_buffer_size_mb, 128);
-    assert_eq!(config.performance.compression, "zstd");
-    assert_eq!(config.logging.level, "debug");
-    assert!(!config.logging.enable_access_logs);
+	assert_eq!(config.server.host, "127.0.0.1");
+	assert_eq!(config.server.port, 9090);
+	assert_eq!(config.storage.write_buffer_size_mb, 128);
+	assert_eq!(config.performance.compression, "zstd");
+	assert_eq!(config.logging.level, "debug");
+	assert!(!config.logging.enable_access_logs);
 }
 
 #[test]
 fn test_compaction_config_defaults_and_roundtrip() {
-    let mut config = Config::default();
-    assert_eq!(config.storage.compaction_interval_ms, 0);
-    let old_toml = toml::to_string(&config)
-        .unwrap()
-        .replace("compaction_interval_ms = 0\n", "");
-    let old_config: Config = toml::from_str(&old_toml).unwrap();
-    assert_eq!(old_config.storage.compaction_interval_ms, 0);
-    config.storage.compaction_interval_ms = 60000;
-    let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-    assert_eq!(restored.storage.compaction_interval_ms, 60000);
-    assert!(restored.validate().is_ok());
+	let mut config = Config::default();
+	assert_eq!(config.storage.compaction_interval_ms, 0);
+	let old_toml = toml::to_string(&config)
+		.unwrap()
+		.replace("compaction_interval_ms = 0\n", "");
+	let old_config: Config = toml::from_str(&old_toml).unwrap();
+	assert_eq!(old_config.storage.compaction_interval_ms, 0);
+	config.storage.compaction_interval_ms = 60000;
+	let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+	assert_eq!(restored.storage.compaction_interval_ms, 60000);
+	assert!(restored.validate().is_ok());
 }

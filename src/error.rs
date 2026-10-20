@@ -18,56 +18,56 @@ pub type Result<T> = std::result::Result<T, PulsoraError>;
 
 #[derive(Error, Debug)]
 pub enum PulsoraError {
-    #[error("Configuration error: {0}")]
-    Config(String),
+	#[error("Configuration error: {0}")]
+	Config(String),
 
-    #[error("Ingestion error: {0}")]
-    Ingestion(String),
+	#[error("Ingestion error: {0}")]
+	Ingestion(String),
 
-    #[error("Query error: {0}")]
-    Query(String),
+	#[error("Query error: {0}")]
+	Query(String),
 
-    #[error("Table '{0}' not found")]
-    TableNotFound(String),
+	#[error("Table '{0}' not found")]
+	TableNotFound(String),
 
-    #[error("Schema error: {0}")]
-    Schema(String),
+	#[error("Schema error: {0}")]
+	Schema(String),
 
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+	#[error("IO error: {0}")]
+	Io(#[from] std::io::Error),
 
-    #[error("RocksDB error: {0}")]
-    RocksDb(#[from] rocksdb::Error),
+	#[error("RocksDB error: {0}")]
+	RocksDb(#[from] rocksdb::Error),
 
-    #[error("Serialization error: {0}")]
-    Serialization(String),
+	#[error("Serialization error: {0}")]
+	Serialization(String),
 
-    #[error("Invalid data: {0}")]
-    InvalidData(String),
-    #[error("Internal error: {0}")]
-    Internal(String),
+	#[error("Invalid data: {0}")]
+	InvalidData(String),
+	#[error("Internal error: {0}")]
+	Internal(String),
 }
 
 impl From<serde_json::Error> for PulsoraError {
-    fn from(err: serde_json::Error) -> Self {
-        PulsoraError::Serialization(err.to_string())
-    }
+	fn from(err: serde_json::Error) -> Self {
+		PulsoraError::Serialization(err.to_string())
+	}
 }
 
 impl From<anyhow::Error> for PulsoraError {
-    fn from(err: anyhow::Error) -> Self {
-        PulsoraError::Serialization(err.to_string())
-    }
+	fn from(err: anyhow::Error) -> Self {
+		PulsoraError::Serialization(err.to_string())
+	}
 }
 
 impl From<std::string::FromUtf8Error> for PulsoraError {
-    fn from(err: std::string::FromUtf8Error) -> Self {
-        PulsoraError::InvalidData(err.to_string())
-    }
+	fn from(err: std::string::FromUtf8Error) -> Self {
+		PulsoraError::InvalidData(err.to_string())
+	}
 }
 
 impl From<csv::Error> for PulsoraError {
-    fn from(err: csv::Error) -> Self {
-        PulsoraError::Ingestion(err.to_string())
-    }
+	fn from(err: csv::Error) -> Self {
+		PulsoraError::Ingestion(err.to_string())
+	}
 }

@@ -22,8 +22,8 @@ use tokio::sync::oneshot;
 
 #[derive(Debug)]
 enum WalOp {
-    Write(Vec<u8>, oneshot::Sender<std::io::Result<()>>),
-    Truncate,
+	Write(Vec<u8>, oneshot::Sender<std::io::Result<()>>),
+	Truncate,
 }
 
 /// Completion of one `append_batch`: resolves once the batch is fsynced.
@@ -35,15 +35,15 @@ enum WalOp {
 pub struct WalDurable(Option<oneshot::Receiver<std::io::Result<()>>>);
 
 impl WalDurable {
-    pub async fn wait(self) -> Result<()> {
-        let Some(durable) = self.0 else {
-            return Ok(());
-        };
-        durable
-            .await
-            .map_err(|_| PulsoraError::Ingestion("WAL writer thread is dead".to_string()))?
-            .map_err(|e| PulsoraError::Ingestion(format!("WAL write failed: {}", e)))
-    }
+	pub async fn wait(self) -> Result<()> {
+		let Some(durable) = self.0 else {
+			return Ok(());
+		};
+		durable
+			.await
+			.map_err(|_| PulsoraError::Ingestion("WAL writer thread is dead".to_string()))?
+			.map_err(|e| PulsoraError::Ingestion(format!("WAL write failed: {}", e)))
+	}
 }
 
 /// Write-Ahead Log writer.
@@ -76,245 +76,229 @@ impl WalDurable {
 /// channel send itself.
 #[derive(Debug)]
 pub struct WriteAheadLog {
-    sender: Mutex<mpsc::Sender<WalOp>>,
-    path: PathBuf,
+	sender: Mutex<mpsc::Sender<WalOp>>,
+	path: PathBuf,
 }
 
 impl WriteAheadLog {
-    pub fn new(data_dir: &str, table: &str) -> Result<Self> {
-        let wal_dir = PathBuf::from(data_dir).join("wal");
-        std::fs::create_dir_all(&wal_dir)?;
+	pub fn new(data_dir: &str, table: &str) -> Result<Self> {
+		let wal_dir = PathBuf::from(data_dir).join("wal");
+		std::fs::create_dir_all(&wal_dir)?;
 
-        let table_hash = crate::storage::calculate_table_hash(table);
-        let path = wal_dir.join(format!("{}.wal", table_hash));
-        let path_clone = path.clone();
+		let table_hash = crate::storage::calculate_table_hash(table);
+		let path = wal_dir.join(format!("{}.wal", table_hash));
+		let path_clone = path.clone();
 
-        let (sender, receiver) = mpsc::channel::<WalOp>();
+		let (sender, receiver) = mpsc::channel::<WalOp>();
 
-        std::thread::Builder::new()
-            .name(format!("wal-writer-{}", table_hash))
-            .spawn(move || {
-                let mut file = match OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path_clone)
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!(
-                            "WAL writer for {} failed to open file: {}",
-                            path_clone.display(),
-                            e
-                        );
-                        return;
-                    }
-                };
+		std::thread::Builder::new()
+			.name(format!("wal-writer-{}", table_hash))
+			.spawn(move || {
+				let mut file = match OpenOptions::new().create(true).append(true).open(&path_clone) {
+					Ok(f) => f,
+					Err(e) => {
+						tracing::error!("WAL writer for {} failed to open file: {}", path_clone.display(), e);
+						return;
+					}
+				};
 
-                // recv() returns Err(_) exactly when every Sender has dropped.
-                // The WriteAheadLog owns the only Sender — when it goes out
-                // of scope (engine teardown), this loop exits naturally.
-                while let Ok(op) = receiver.recv() {
-                    match op {
-                        WalOp::Write(data, done) => {
-                            // sync_data fsyncs file contents (not metadata)
-                            // — durability guarantee for crash recovery.
-                            let result = file.write_all(&data).and_then(|()| file.sync_data());
-                            if let Err(e) = &result {
-                                tracing::error!("Failed to write WAL: {}", e);
-                            }
-                            // A closed receiver means the ingest was cancelled;
-                            // there is no one left to acknowledge.
-                            let _ = done.send(result);
-                        }
-                        WalOp::Truncate => {
-                            if let Err(e) = file.set_len(0) {
-                                tracing::error!("Failed to truncate WAL: {}", e);
-                            }
-                            if let Err(e) = file.sync_all() {
-                                tracing::error!("Failed to sync WAL after truncate: {}", e);
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(|e| {
-                PulsoraError::Ingestion(format!("Failed to spawn WAL writer thread: {}", e))
-            })?;
+				// recv() returns Err(_) exactly when every Sender has dropped.
+				// The WriteAheadLog owns the only Sender — when it goes out
+				// of scope (engine teardown), this loop exits naturally.
+				while let Ok(op) = receiver.recv() {
+					match op {
+						WalOp::Write(data, done) => {
+							// sync_data fsyncs file contents (not metadata)
+							// — durability guarantee for crash recovery.
+							let result = file.write_all(&data).and_then(|()| file.sync_data());
+							if let Err(e) = &result {
+								tracing::error!("Failed to write WAL: {}", e);
+							}
+							// A closed receiver means the ingest was cancelled;
+							// there is no one left to acknowledge.
+							let _ = done.send(result);
+						}
+						WalOp::Truncate => {
+							if let Err(e) = file.set_len(0) {
+								tracing::error!("Failed to truncate WAL: {}", e);
+							}
+							if let Err(e) = file.sync_all() {
+								tracing::error!("Failed to sync WAL after truncate: {}", e);
+							}
+						}
+					}
+				}
+			})
+			.map_err(|e| PulsoraError::Ingestion(format!("Failed to spawn WAL writer thread: {}", e)))?;
 
-        Ok(Self {
-            sender: Mutex::new(sender),
-            path,
-        })
-    }
+		Ok(Self {
+			sender: Mutex::new(sender),
+			path,
+		})
+	}
 
-    fn send(&self, op: WalOp) -> Result<()> {
-        // Mutex acquire is uncontended in practice — the engine's buffers
-        // write-lock already serializes WAL access — but exists so that the
-        // Sender's !Sync bound doesn't poison TableBuffer's Sync.
-        let guard = self
-            .sender
-            .lock()
-            .map_err(|_| PulsoraError::Ingestion("WAL sender mutex poisoned".to_string()))?;
-        guard
-            .send(op)
-            .map_err(|_| PulsoraError::Ingestion("WAL writer thread is dead".to_string()))
-    }
+	fn send(&self, op: WalOp) -> Result<()> {
+		// Mutex acquire is uncontended in practice — the engine's buffers
+		// write-lock already serializes WAL access — but exists so that the
+		// Sender's !Sync bound doesn't poison TableBuffer's Sync.
+		let guard = self
+			.sender
+			.lock()
+			.map_err(|_| PulsoraError::Ingestion("WAL sender mutex poisoned".to_string()))?;
+		guard
+			.send(op)
+			.map_err(|_| PulsoraError::Ingestion("WAL writer thread is dead".to_string()))
+	}
 
-    pub fn append_batch(&self, rows: &[(u64, HashMap<String, String>)]) -> Result<WalDurable> {
-        if rows.is_empty() {
-            return Ok(WalDurable::default());
-        }
+	pub fn append_batch(&self, rows: &[(u64, HashMap<String, String>)]) -> Result<WalDurable> {
+		if rows.is_empty() {
+			return Ok(WalDurable::default());
+		}
 
-        let mut buffer = Vec::new();
-        for (id, row) in rows {
-            let json = serde_json::to_vec(&(id, row)).map_err(|e| {
-                PulsoraError::Ingestion(format!("Failed to serialize WAL entry: {}", e))
-            })?;
-            let len = json.len() as u32;
-            buffer.extend_from_slice(&len.to_le_bytes());
-            buffer.extend_from_slice(&json);
-        }
+		let mut buffer = Vec::new();
+		for (id, row) in rows {
+			let json = serde_json::to_vec(&(id, row))
+				.map_err(|e| PulsoraError::Ingestion(format!("Failed to serialize WAL entry: {}", e)))?;
+			let len = json.len() as u32;
+			buffer.extend_from_slice(&len.to_le_bytes());
+			buffer.extend_from_slice(&json);
+		}
 
-        let (done, durable) = oneshot::channel();
-        self.send(WalOp::Write(buffer, done))?;
-        Ok(WalDurable(Some(durable)))
-    }
+		let (done, durable) = oneshot::channel();
+		self.send(WalOp::Write(buffer, done))?;
+		Ok(WalDurable(Some(durable)))
+	}
 
-    pub fn replay(&self) -> Result<Vec<(u64, HashMap<String, String>)>> {
-        // Re-open file for reading from start
-        // Note: This might race if background writer is writing, but replay is usually done at startup.
-        let mut reader = BufReader::new(File::open(&self.path)?);
-        let mut rows = Vec::new();
-        let mut len_buf = [0u8; 4];
+	pub fn replay(&self) -> Result<Vec<(u64, HashMap<String, String>)>> {
+		// Re-open file for reading from start
+		// Note: This might race if background writer is writing, but replay is usually done at startup.
+		let mut reader = BufReader::new(File::open(&self.path)?);
+		let mut rows = Vec::new();
+		let mut len_buf = [0u8; 4];
 
-        loop {
-            match reader.read_exact(&mut len_buf) {
-                Ok(_) => {
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    // A torn tail record (crash mid-append) is normal WAL
-                    // wear, not corruption of the recovered prefix: records
-                    // are length-prefixed and appended sequentially, so every
-                    // complete record before it is intact. Recover those and
-                    // stop — aborting startup here would take the whole
-                    // engine down over an expected crash artifact.
-                    let mut data_buf = vec![0u8; len];
-                    if let Err(e) = reader.read_exact(&mut data_buf) {
-                        tracing::warn!(
-                            "WAL {}: torn tail record ({}), recovering {} complete rows",
-                            self.path.display(),
-                            e,
-                            rows.len()
-                        );
-                        break;
-                    }
-                    match serde_json::from_slice::<(u64, HashMap<String, String>)>(&data_buf) {
-                        Ok(entry) => rows.push(entry),
-                        Err(e) => {
-                            tracing::warn!(
-                                "WAL {}: undecodable tail record ({}), recovering {} complete rows",
-                                self.path.display(),
-                                e,
-                                rows.len()
-                            );
-                            break;
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => {
-                    return Err(PulsoraError::Ingestion(format!(
-                        "Failed to read WAL: {}",
-                        e
-                    )))
-                }
-            }
-        }
+		loop {
+			match reader.read_exact(&mut len_buf) {
+				Ok(_) => {
+					let len = u32::from_le_bytes(len_buf) as usize;
+					// A torn tail record (crash mid-append) is normal WAL
+					// wear, not corruption of the recovered prefix: records
+					// are length-prefixed and appended sequentially, so every
+					// complete record before it is intact. Recover those and
+					// stop — aborting startup here would take the whole
+					// engine down over an expected crash artifact.
+					let mut data_buf = vec![0u8; len];
+					if let Err(e) = reader.read_exact(&mut data_buf) {
+						tracing::warn!(
+							"WAL {}: torn tail record ({}), recovering {} complete rows",
+							self.path.display(),
+							e,
+							rows.len()
+						);
+						break;
+					}
+					match serde_json::from_slice::<(u64, HashMap<String, String>)>(&data_buf) {
+						Ok(entry) => rows.push(entry),
+						Err(e) => {
+							tracing::warn!(
+								"WAL {}: undecodable tail record ({}), recovering {} complete rows",
+								self.path.display(),
+								e,
+								rows.len()
+							);
+							break;
+						}
+					}
+				}
+				Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+				Err(e) => return Err(PulsoraError::Ingestion(format!("Failed to read WAL: {}", e))),
+			}
+		}
 
-        Ok(rows)
-    }
+		Ok(rows)
+	}
 
-    pub fn truncate(&self) -> Result<()> {
-        self.send(WalOp::Truncate)
-    }
+	pub fn truncate(&self) -> Result<()> {
+		self.send(WalOp::Truncate)
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
+	use super::*;
+	use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_wal_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let data_dir = temp_dir.path().to_str().unwrap();
-        let table = "test_wal_creation";
+	#[tokio::test]
+	async fn test_wal_creation() {
+		let temp_dir = TempDir::new().unwrap();
+		let data_dir = temp_dir.path().to_str().unwrap();
+		let table = "test_wal_creation";
 
-        let wal = WriteAheadLog::new(data_dir, table);
-        assert!(wal.is_ok());
+		let wal = WriteAheadLog::new(data_dir, table);
+		assert!(wal.is_ok());
 
-        let wal_path = temp_dir.path().join("wal").join(format!(
-            "{}.wal",
-            crate::storage::calculate_table_hash(table)
-        ));
+		let wal_path = temp_dir
+			.path()
+			.join("wal")
+			.join(format!("{}.wal", crate::storage::calculate_table_hash(table)));
 
-        // Wait for async file creation
-        let mut exists = false;
-        for _ in 0..10 {
-            if wal_path.exists() {
-                exists = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(exists, "WAL file was not created");
-    }
+		// Wait for async file creation
+		let mut exists = false;
+		for _ in 0..10 {
+			if wal_path.exists() {
+				exists = true;
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+		}
+		assert!(exists, "WAL file was not created");
+	}
 
-    #[tokio::test]
-    async fn test_wal_append_and_replay() {
-        let temp_dir = TempDir::new().unwrap();
-        let data_dir = temp_dir.path().to_str().unwrap();
-        let table = "test_wal_append";
+	#[tokio::test]
+	async fn test_wal_append_and_replay() {
+		let temp_dir = TempDir::new().unwrap();
+		let data_dir = temp_dir.path().to_str().unwrap();
+		let table = "test_wal_append";
 
-        let wal = WriteAheadLog::new(data_dir, table).unwrap();
+		let wal = WriteAheadLog::new(data_dir, table).unwrap();
 
-        let mut row1 = HashMap::new();
-        row1.insert("col1".to_string(), "val1".to_string());
+		let mut row1 = HashMap::new();
+		row1.insert("col1".to_string(), "val1".to_string());
 
-        let mut row2 = HashMap::new();
-        row2.insert("col1".to_string(), "val2".to_string());
+		let mut row2 = HashMap::new();
+		row2.insert("col1".to_string(), "val2".to_string());
 
-        let rows = vec![(1, row1.clone()), (2, row2.clone())];
+		let rows = vec![(1, row1.clone()), (2, row2.clone())];
 
-        wal.append_batch(&rows).unwrap().wait().await.unwrap();
+		wal.append_batch(&rows).unwrap().wait().await.unwrap();
 
-        // Replay
-        let replayed = wal.replay().unwrap();
-        assert_eq!(replayed.len(), 2);
-        assert_eq!(replayed[0].0, 1);
-        assert_eq!(replayed[0].1, row1);
-        assert_eq!(replayed[1].0, 2);
-        assert_eq!(replayed[1].1, row2);
-    }
+		// Replay
+		let replayed = wal.replay().unwrap();
+		assert_eq!(replayed.len(), 2);
+		assert_eq!(replayed[0].0, 1);
+		assert_eq!(replayed[0].1, row1);
+		assert_eq!(replayed[1].0, 2);
+		assert_eq!(replayed[1].1, row2);
+	}
 
-    #[tokio::test]
-    async fn test_wal_truncate() {
-        let temp_dir = TempDir::new().unwrap();
-        let data_dir = temp_dir.path().to_str().unwrap();
-        let table = "test_wal_truncate";
+	#[tokio::test]
+	async fn test_wal_truncate() {
+		let temp_dir = TempDir::new().unwrap();
+		let data_dir = temp_dir.path().to_str().unwrap();
+		let table = "test_wal_truncate";
 
-        let wal = WriteAheadLog::new(data_dir, table).unwrap();
+		let wal = WriteAheadLog::new(data_dir, table).unwrap();
 
-        let mut row = HashMap::new();
-        row.insert("col".to_string(), "val".to_string());
-        wal.append_batch(&[(1, row)]).unwrap().wait().await.unwrap();
+		let mut row = HashMap::new();
+		row.insert("col".to_string(), "val".to_string());
+		wal.append_batch(&[(1, row)]).unwrap().wait().await.unwrap();
 
-        let replayed = wal.replay().unwrap();
-        assert_eq!(replayed.len(), 1);
+		let replayed = wal.replay().unwrap();
+		assert_eq!(replayed.len(), 1);
 
-        wal.truncate().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		wal.truncate().unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let replayed_after = wal.replay().unwrap();
-        assert_eq!(replayed_after.len(), 0);
-    }
+		let replayed_after = wal.replay().unwrap();
+		assert_eq!(replayed_after.len(), 0);
+	}
 }
