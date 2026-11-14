@@ -71,6 +71,11 @@ pub struct Schema {
 	pub created_at: DateTime<Utc>,
 }
 
+/// RocksDB key of a table's persisted schema.
+pub(crate) fn schema_key(table: &str) -> String {
+	format!("_schema_{}", table)
+}
+
 #[derive(Debug)]
 pub struct SchemaManager {
 	schemas: HashMap<String, Schema>,
@@ -143,7 +148,7 @@ impl SchemaManager {
 
 	/// Save schema to RocksDB
 	fn save_schema_to_db(&self, table: &str, schema: &Schema) -> Result<()> {
-		let key = format!("_schema_{}", table);
+		let key = schema_key(table);
 		let value = serde_json::to_vec(schema)
 			.map_err(|e| PulsoraError::Schema(format!("Failed to serialize schema: {}", e)))?;
 
@@ -159,6 +164,12 @@ impl SchemaManager {
 
 	pub fn list_tables(&self) -> Vec<String> {
 		self.schemas.keys().cloned().collect()
+	}
+
+	/// Forget a dropped table. The persisted schema key is deleted by the
+	/// drop's own write batch, together with the table's data.
+	pub fn remove_schema(&mut self, table: &str) {
+		self.schemas.remove(table);
 	}
 
 	pub fn get_or_create_schema(&mut self, table: &str, sample_rows: &[HashMap<String, String>]) -> Result<Schema> {

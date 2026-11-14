@@ -268,6 +268,27 @@ Returns the schema information for the specified table, including column definit
 }
 ```
 
+### Drop Table
+
+**DELETE** `/tables/{table_name}`
+
+Removes the table: its rows, schema, id state and write-ahead log. This cannot be undone. A later ingest under the same name creates a new table and infers its schema again, so this is also the way to change a table's schema.
+
+An ingest that started before the drop and finishes after it fails instead of writing into the dropped table. A query that runs while the table is dropped and recreated with a different schema can fail once.
+
+There is no partial delete. To replace rows, ingest them again with the same ids.
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": "market_data",
+  "error": null
+}
+```
+
+Returns `404` if the table does not exist.
+
 ## Data Types
 
 Pulsora automatically infers and validates these data types from CSV data:

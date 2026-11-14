@@ -18,7 +18,7 @@ use axum::{
 	http::{HeaderMap, Request, StatusCode},
 	middleware::{self, Next},
 	response::{IntoResponse, Json, Response},
-	routing::{get, post},
+	routing::{delete, get, post},
 	Router,
 };
 use futures::StreamExt;
@@ -100,6 +100,7 @@ pub async fn create_app(config: Config) -> Result<Router> {
 	Ok(Router::new()
 		.route("/health", get(health_check))
 		.route("/tables", get(list_tables))
+		.route("/tables/{table}", delete(drop_table))
 		.route("/tables/{table}/ingest", post(ingest_data))
 		.route("/tables/{table}/query", get(query_data))
 		.route("/tables/{table}/schema", get(get_schema))
@@ -520,6 +521,19 @@ async fn get_table_count(
 		Err(e) => {
 			error!("Failed to get table count: {}", e);
 			Json(ApiResponse::error(e.to_string()))
+		}
+	}
+}
+
+async fn drop_table(
+	State(state): State<AppState>,
+	Path(table): Path<String>,
+) -> std::result::Result<Json<ApiResponse<String>>, StatusCode> {
+	match state.storage.drop_table(&table).await {
+		Ok(()) => Ok(Json(ApiResponse::success(table))),
+		Err(e) => {
+			error!("Drop table error: {}", e);
+			Err(storage_error_status(&e))
 		}
 	}
 }

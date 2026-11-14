@@ -28,7 +28,7 @@ use crate::storage::calculate_table_hash;
 use crate::storage::columnar::ColumnBlock;
 use crate::storage::id_manager::{IdManager, IdManagerRegistry, RowId};
 use crate::storage::refs;
-use crate::storage::schema::Schema;
+use crate::storage::schema::{schema_key, Schema};
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::ipc::reader::StreamReader;
@@ -938,6 +938,30 @@ pub(crate) fn compact_table_blocks(db: &Arc<DB>, table: &str, schema: &Schema, t
 		cache.push(meta);
 	}
 	Ok(retired.len() as u64)
+}
+
+/// Delete everything stored for a table in one synced batch: blocks, block
+/// index, override sets, schema and id state. The per-table metadata lock is
+/// held across the write, so no compaction pass or query snapshot can observe
+/// a half-dropped table, and the in-memory block list is emptied before the
+/// lock is released.
+pub(crate) fn drop_table_data(db: &Arc<DB>, table: &str) -> Result<()> {
+	let hash = calculate_table_hash(table);
+	let cache = table_meta_cache(db, hash);
+	let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+	let mut batch = WriteBatch::default();
+	for (start, end) in refs::table_key_ranges(hash) {
+		batch.delete_range(start, end);
+	}
+	batch.delete(schema_key(table));
+	batch.delete(IdManager::id_state_key(hash));
+	let mut options = rocksdb::WriteOptions::default();
+	options.set_sync(true);
+	db.write_opt(batch, &options)?;
+	cache.metas.clear();
+	cache.prefix_max_id.clear();
+	cache.compact_cursor = (i64::MIN, 0);
+	Ok(())
 }
 
 /// Read one stored column block.

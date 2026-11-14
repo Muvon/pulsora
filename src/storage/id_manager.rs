@@ -261,7 +261,7 @@ impl IdManager {
 	}
 
 	/// Generate key for storing ID state
-	fn id_state_key(table_hash: u32) -> Vec<u8> {
+	pub(crate) fn id_state_key(table_hash: u32) -> Vec<u8> {
 		let mut key = Vec::with_capacity(12);
 		key.extend_from_slice(b"_id_state_");
 		key.extend_from_slice(&table_hash.to_be_bytes());
@@ -294,6 +294,13 @@ impl IdManagerRegistry {
 		let manager = Arc::new(IdManager::new(table_name.to_string(), self.db.clone())?);
 		self.managers.insert(table_name.to_string(), manager.clone());
 		Ok(manager)
+	}
+
+	/// Forget a dropped table's manager. An ingest that raced the drop may
+	/// still persist its id state afterwards; a recreated table then only
+	/// starts its auto ids higher.
+	pub fn remove(&mut self, table_name: &str) {
+		self.managers.remove(table_name);
 	}
 
 	/// List all managed tables (used by tests)

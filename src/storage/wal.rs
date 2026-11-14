@@ -81,12 +81,17 @@ pub struct WriteAheadLog {
 }
 
 impl WriteAheadLog {
+	/// File that holds a table's unflushed rows.
+	pub fn file_path(data_dir: &str, table: &str) -> PathBuf {
+		let table_hash = crate::storage::calculate_table_hash(table);
+		PathBuf::from(data_dir).join("wal").join(format!("{}.wal", table_hash))
+	}
+
 	pub fn new(data_dir: &str, table: &str) -> Result<Self> {
-		let wal_dir = PathBuf::from(data_dir).join("wal");
-		std::fs::create_dir_all(&wal_dir)?;
+		std::fs::create_dir_all(PathBuf::from(data_dir).join("wal"))?;
 
 		let table_hash = crate::storage::calculate_table_hash(table);
-		let path = wal_dir.join(format!("{}.wal", table_hash));
+		let path = Self::file_path(data_dir, table);
 		let path_clone = path.clone();
 
 		let (sender, receiver) = mpsc::channel::<WalOp>();

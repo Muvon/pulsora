@@ -375,21 +375,19 @@ impl StorageEngine {
 					let (Some(db), Some(schemas)) = (db_weak.upgrade(), schemas_weak.upgrade()) else {
 						break;
 					};
-					let tables: Vec<Schema> = {
-						let guard = schemas.read().await;
-						guard
-							.list_tables()
-							.iter()
-							.filter_map(|table| guard.get_schema(table).cloned())
-							.collect()
-					};
-					drop(schemas);
+					let tables = schemas.read().await.list_tables();
 					let result = tokio::task::spawn_blocking(move || {
-						for schema in tables {
-							if let Err(error) =
-								ingestion::compact_table_blocks(&db, &schema.table_name, &schema, target_rows)
-							{
-								tracing::error!(table = %schema.table_name, %error, "background block compaction failed");
+						for table in tables {
+							// The schema lock is held for the table's whole pass:
+							// `drop_table` needs it for writing, so the blocks
+							// cannot be dropped and recreated under another schema
+							// while this pass decodes them.
+							let guard = schemas.blocking_read();
+							let Some(schema) = guard.get_schema(&table) else {
+								continue;
+							};
+							if let Err(error) = ingestion::compact_table_blocks(&db, &table, schema, target_rows) {
+								tracing::error!(%table, %error, "background block compaction failed");
 							}
 						}
 					})
@@ -403,6 +401,53 @@ impl StorageEngine {
 		}
 
 		Ok(engine)
+	}
+
+	/// Remove a table: its rows, schema, id state and write-ahead log. A later
+	/// ingest under the same name creates a new table with a newly inferred
+	/// schema.
+	pub async fn drop_table(&self, table: &str) -> Result<()> {
+		// Lock order is buffers, then schemas — the order ingest uses in
+		// `ensure_schema_current`. Holding both for the whole drop keeps every
+		// block write and every schema change out until the table is gone.
+		let mut buffers = self.buffers.write().await;
+		let mut schemas = self.schemas.write().await;
+		if schemas.get_schema(table).is_none() {
+			return Err(PulsoraError::TableNotFound(table.to_string()));
+		}
+
+		// The write-ahead log goes first. A crash after this point leaves the
+		// table in place without its unflushed rows, and repeating the drop
+		// finishes it. The other order could leave a log file without a
+		// table, and a later table of the same name would replay it.
+		buffers.remove(table);
+		match std::fs::remove_file(wal::WriteAheadLog::file_path(&self.config.storage.data_dir, table)) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => return Err(error.into()),
+		}
+
+		let db = Arc::clone(&self.db);
+		let table_owned = table.to_string();
+		tokio::task::spawn_blocking(move || ingestion::drop_table_data(&db, &table_owned))
+			.await
+			.map_err(|e| PulsoraError::Internal(format!("drop task failed: {e}")))??;
+
+		schemas.remove_schema(table);
+		self.id_managers.write().await.remove(table);
+		info!("Dropped table '{}'", table);
+		Ok(())
+	}
+
+	/// Reject a write prepared under a schema that is no longer the table's:
+	/// the table was dropped, or dropped and recreated, after the caller read
+	/// it. Call with the buffers write lock held — `drop_table` holds that
+	/// lock, so the answer stays true until the caller's write is done.
+	async fn ensure_schema_current(&self, table: &str, schema: &Schema) -> Result<()> {
+		match self.schemas.read().await.get_schema(table) {
+			Some(current) if current.created_at == schema.created_at => Ok(()),
+			_ => Err(PulsoraError::TableNotFound(table.to_string())),
+		}
 	}
 
 	pub async fn flush_table(&self, table: &str) -> Result<u64> {
@@ -433,6 +478,7 @@ impl StorageEngine {
 		// Push to buffer (Batch)
 		let durable = {
 			let mut buffers = self.buffers.write().await;
+			self.ensure_schema_current(table, &schema).await?;
 
 			// Get or create buffer for this table
 			if !buffers.contains_key(table) {
@@ -551,6 +597,7 @@ impl StorageEngine {
 				// Flush existing buffer first to maintain order
 				{
 					let mut buffers = self.buffers.write().await;
+					self.ensure_schema_current(table, &schema).await?;
 					if let Some(buffer) = buffers.get_mut(table) {
 						if !buffer.is_empty() {
 							let rows_to_write = buffer.get_rows();
@@ -670,6 +717,7 @@ impl StorageEngine {
 				// serialized (same lock every buffer-flush path holds).
 				{
 					let _guard = self.buffers.write().await;
+					self.ensure_schema_current(table, &schema).await?;
 					ingestion::write_column_block_to_rocksdb(
 						&self.db,
 						table,
@@ -769,6 +817,7 @@ impl StorageEngine {
 				// detection against existing blocks, so ingests must be
 				// serialized (same lock every buffer-flush path holds).
 				let _guard = self.buffers.write().await;
+				self.ensure_schema_current(table, &schema).await?;
 				ingestion::write_column_block_to_rocksdb(
 					&self.db,
 					&table_owned,
@@ -1135,10 +1184,10 @@ impl StorageEngine {
 
 	/// Compact one bounded run of adjacent blocks; return the number retired.
 	pub async fn compact_table(&self, table: &str) -> Result<u64> {
-		let schema = self
-			.schemas
-			.read()
-			.await
+		// Held until the pass ends, for the same reason as in the background
+		// compaction task.
+		let schemas = self.schemas.read().await;
+		let schema = schemas
 			.get_schema(table)
 			.cloned()
 			.ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
@@ -1159,10 +1208,17 @@ impl StorageEngine {
 	}
 
 	pub async fn get_row_by_id_json(&self, table: &str, id: u64) -> Result<Option<serde_json::Value>> {
-		let schemas = self.schemas.read().await;
-		let schema = schemas
+		// Cloned, not borrowed: holding the schema lock while taking the
+		// buffers lock is the reverse of `drop_table`'s order and would
+		// deadlock against it.
+		let schema = self
+			.schemas
+			.read()
+			.await
 			.get_schema(table)
+			.cloned()
 			.ok_or_else(|| PulsoraError::TableNotFound(table.to_string()))?;
+		let schema = &schema;
 
 		// Latest-write-wins: a row in the in-memory buffer is newer than (or
 		// equal to) any DB-resident copy. Check the buffer first so freshly

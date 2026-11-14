@@ -147,6 +147,22 @@ pub fn override_key(table_hash: u32, block: u64) -> [u8; 13] {
 	out
 }
 
+/// Key ranges `[start, end)` that together hold every block index, block data
+/// and override key of one table. Three ranges instead of the whole
+/// `[hash]..[hash + 1]` span: engine keys such as `_schema_*` are plain bytes,
+/// and a table hash equal to their first four bytes would otherwise put them
+/// inside the table's range.
+pub fn table_key_ranges(table_hash: u32) -> [([u8; 5], [u8; 5]); 3] {
+	(*b"BDO").map(|marker| {
+		let mut start = [0u8; 5];
+		start[0..4].copy_from_slice(&table_hash.to_be_bytes());
+		start[4] = marker;
+		let mut end = start;
+		end[4] = marker + 1;
+		(start, end)
+	})
+}
+
 /// Encode row positions as a mergeable override operand (`[row: u32 LE]`*).
 pub fn encode_override_positions(positions: &[u32]) -> Vec<u8> {
 	let mut out = Vec::with_capacity(positions.len() * 4);
