@@ -466,6 +466,16 @@ impl StorageEngine {
 		}
 	}
 
+	/// Write out the buffered rows of every table. Returns the number of rows written.
+	pub async fn flush_all(&self) -> Result<u64> {
+		let tables: Vec<String> = self.buffers.read().await.keys().cloned().collect();
+		let mut flushed = 0;
+		for table in tables {
+			flushed += self.flush_table(&table).await?;
+		}
+		Ok(flushed)
+	}
+
 	async fn ingest_processed_rows(
 		&self,
 		table: &str,

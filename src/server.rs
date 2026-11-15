@@ -87,17 +87,23 @@ impl<T> ApiResponse<T> {
 }
 
 pub async fn create_app(config: Config) -> Result<Router> {
+	Ok(create_app_with_storage(config).await?.0)
+}
+
+/// The router together with the storage engine it serves, for a caller that
+/// has to act on the engine after the server stopped.
+async fn create_app_with_storage(config: Config) -> Result<(Router, Arc<StorageEngine>)> {
 	// Initialize storage engine
 	let storage = Arc::new(StorageEngine::new(&config).await?);
 	let config = Arc::new(config);
 
 	let state = AppState {
-		storage,
+		storage: storage.clone(),
 		config: config.clone(),
 	};
 
 	// Build router with middleware
-	Ok(Router::new()
+	let app = Router::new()
 		.route("/health", get(health_check))
 		.route("/tables", get(list_tables))
 		.route("/tables/{table}", delete(drop_table))
@@ -108,11 +114,12 @@ pub async fn create_app(config: Config) -> Result<Router> {
 		.route("/tables/{table}/row/{id}", get(get_row_by_id))
 		.layer(middleware::from_fn_with_state(state.clone(), access_logging_middleware))
 		.layer(CorsLayer::permissive())
-		.with_state(state))
+		.with_state(state);
+	Ok((app, storage))
 }
 
 pub async fn start(config: Config) -> Result<()> {
-	let app = create_app(config.clone()).await?;
+	let (app, storage) = create_app_with_storage(config.clone()).await?;
 
 	// Start server
 	let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -122,9 +129,40 @@ pub async fn start(config: Config) -> Result<()> {
 	info!("📡 Ready to accept connections");
 	info!("🔗 Health check: http://{}/health", addr);
 
-	axum::serve(listener, app).await?;
+	axum::serve(listener, app)
+		.with_graceful_shutdown(shutdown_signal())
+		.await?;
+
+	// No request is running any more: write out the rows still buffered.
+	let flushed = storage.flush_all().await?;
+	info!("Pulsora server stopped, {} buffered rows flushed", flushed);
 
 	Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl+C elsewhere).
+///
+/// A process running as PID 1 in a container has no default signal action, so
+/// without a handler `docker stop` waited its whole timeout and then killed
+/// the server. On the signal the server stops accepting connections, lets
+/// the requests in flight finish and returns to `start`, which flushes the
+/// buffered rows.
+async fn shutdown_signal() {
+	#[cfg(unix)]
+	{
+		use tokio::signal::unix::{signal, SignalKind};
+		let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+		let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+		tokio::select! {
+			_ = terminate.recv() => info!("SIGTERM received, shutting down"),
+			_ = interrupt.recv() => info!("SIGINT received, shutting down"),
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		tokio::signal::ctrl_c().await.expect("install Ctrl+C handler");
+		info!("Ctrl+C received, shutting down");
+	}
 }
 
 async fn list_tables(State(state): State<AppState>) -> Json<ApiResponse<Vec<String>>> {

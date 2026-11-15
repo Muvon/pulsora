@@ -39,85 +39,52 @@ pub fn fast_parse_u64(s: &str) -> Option<u64> {
 	Some(result)
 }
 
-/// Fast float parsing using fast-float crate
-/// This is 3-5x faster than standard parse::<f64>()
+/// Most decimal digits (integer and fractional together) the fast path of
+/// `fast_parse_f64` takes: any 15-digit integer is below 2^53, so it is an
+/// exact f64.
+const FAST_FLOAT_MAX_DIGITS: u32 = 15;
+
+/// Float parsing with a fast path for plain decimals such as "123", "-0.5"
+/// or "62938.01".
+///
+/// The fast path reads all digits as one integer and divides it once by the
+/// power of ten of the fractional digits. Both operands are exact f64 values
+/// (at most `FAST_FLOAT_MAX_DIGITS` digits), so the single division is
+/// correctly rounded and the result equals `str::parse::<f64>()`. The earlier
+/// form `int_part + frac_part / 10^n` rounded twice and stored "1.761" as
+/// 1.7610000000000001. Everything else (exponents, more digits, "inf", "nan",
+/// malformed text) goes to the std parser.
 #[inline(always)]
 pub fn fast_parse_f64(s: &str) -> Option<f64> {
 	let bytes = s.as_bytes();
-	if bytes.is_empty() {
-		return None;
-	}
+	let negative = bytes.first() == Some(&b'-');
+	let unsigned = match bytes.first() {
+		Some(b'-' | b'+') => &bytes[1..],
+		_ => bytes,
+	};
 
-	// Fast path for common integer-like floats (e.g., "123.0", "456")
-	// These are very common in data and can be parsed much faster
-	let mut i = 0;
-	let mut negative = false;
-
-	// Handle sign
-	if bytes[0] == b'-' {
-		negative = true;
-		i = 1;
-	} else if bytes[0] == b'+' {
-		i = 1;
-	}
-
-	// Try fast integer parsing first (very common case)
-	let mut int_part = 0i64;
-	let start = i;
-	while i < bytes.len() && bytes[i] >= b'0' && bytes[i] <= b'9' {
-		int_part = int_part * 10 + (bytes[i] - b'0') as i64;
-		i += 1;
-	}
-
-	// If we consumed the entire string, it's an integer
-	if i == bytes.len() && i > start {
-		// Negate AFTER casting to f64 so `-0` round-trips to `-0.0`. The
-		// integer expression `-int_part` collapses `-0` to `0`, losing the
-		// sign before it can reach the float's sign bit.
-		let val = int_part as f64;
-		return Some(if negative { -val } else { val });
-	}
-
-	// If there's a decimal point, parse fractional part
-	if i < bytes.len() && bytes[i] == b'.' {
-		i += 1;
-		let mut frac_part = 0i64;
-		let mut frac_digits = 0;
-		// The fast path reconstructs the value as
-		//   int_part + frac_part / 10^frac_digits
-		// which is correctly rounded only while every operand stays exact:
-		// frac_part ≤ 2^53 (i.e. ≤ 15 decimal digits) and 10^frac_digits is
-		// exactly representable (also ≤ 22 decimal digits). Any input with
-		// more than 15 fractional digits — e.g. f64::MIN_POSITIVE whose
-		// Display form is "0.000…022250738585072014" with 300+ leading
-		// zeros — would silently drop precision and round down to 0.0.
-		// Track that condition and defer to the std parser, which is
-		// correctly rounded for every IEEE 754 input.
-		let mut precision_lost = false;
-
-		while i < bytes.len() && bytes[i] >= b'0' && bytes[i] <= b'9' {
-			if frac_digits < 15 {
-				frac_part = frac_part * 10 + (bytes[i] - b'0') as i64;
-				frac_digits += 1;
-			} else {
-				precision_lost = true;
+	let mut mantissa = 0u64;
+	let mut digits = 0u32;
+	let mut frac_digits = 0u32;
+	let mut seen_point = false;
+	for &byte in unsigned {
+		match byte {
+			b'0'..=b'9' if digits < FAST_FLOAT_MAX_DIGITS => {
+				mantissa = mantissa * 10 + u64::from(byte - b'0');
+				digits += 1;
+				frac_digits += u32::from(seen_point);
 			}
-			i += 1;
-		}
-
-		// If we consumed everything and the fast path is provably exact,
-		// build the float here. Otherwise drop through to s.parse().
-		if i == bytes.len() && !precision_lost {
-			let mut result = int_part as f64;
-			if frac_digits > 0 {
-				result += frac_part as f64 / (10_i64.pow(frac_digits as u32) as f64);
-			}
-			return Some(if negative { -result } else { result });
+			b'.' if !seen_point => seen_point = true,
+			_ => return s.parse::<f64>().ok(),
 		}
 	}
+	if digits == 0 {
+		return s.parse::<f64>().ok();
+	}
 
-	// Fall back to standard parsing for scientific notation or other complex formats
-	s.parse::<f64>().ok()
+	let value = mantissa as f64 / 10u64.pow(frac_digits) as f64;
+	// Negate the float, not the integer, so "-0" keeps its sign bit.
+	Some(if negative { -value } else { value })
 }
 
 /// Fast signed integer parsing without error overhead

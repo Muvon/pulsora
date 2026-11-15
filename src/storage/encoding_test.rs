@@ -123,3 +123,59 @@ fn test_encoding_efficiency() {
 	encode_varint(128, &mut encoded);
 	assert_eq!(encoded.len(), 2, "128 should use 2 bytes");
 }
+
+#[test]
+fn test_fast_parse_f64_matches_std_parser() {
+	let cases = [
+		"1.761",
+		"62938.01",
+		"0.1",
+		"0.3",
+		"-0.7",
+		"+2.5",
+		"123",
+		"123.",
+		"-0",
+		"-0.0",
+		"0.000001",
+		"999999999999999",
+		"1234567.12345678",
+		"9007199254740993",
+		"123456789012345678901234567890",
+		"0.1234567890123456789",
+		"1e-7",
+		"2.5E3",
+		"inf",
+	];
+	for case in cases {
+		let expected: f64 = case.parse().unwrap();
+		let parsed = fast_parse_f64(case).unwrap();
+		assert_eq!(parsed.to_bits(), expected.to_bits(), "{case}");
+	}
+}
+
+#[test]
+fn test_fast_parse_f64_matches_std_parser_on_generated_decimals() {
+	// Deterministic generator: every integer/fraction split of 1..=15 digits.
+	let mut state = 0x9E37_79B9_7F4A_7C15u64;
+	for _ in 0..200_000 {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		let digits = 1 + (state % 15) as u32;
+		let mantissa = (state >> 8) % 10u64.pow(digits);
+		let frac_digits = ((state >> 40) % u64::from(digits + 1)) as usize;
+		let text = format!("{mantissa:0width$}", width = digits as usize);
+		let (int_part, frac_part) = text.split_at(text.len() - frac_digits);
+		let case = format!("{int_part}.{frac_part}");
+		let expected: f64 = case.parse().unwrap();
+		assert_eq!(fast_parse_f64(&case).unwrap().to_bits(), expected.to_bits(), "{case}");
+	}
+}
+
+#[test]
+fn test_fast_parse_f64_rejects_malformed_text() {
+	for case in ["", "-", "+", ".", "1.2.3", "12a", "--1"] {
+		assert_eq!(fast_parse_f64(case), None, "{case:?}");
+	}
+}
